@@ -348,9 +348,9 @@ content contract; the new product assets do not expand the authored-document ass
 
 ## Licence and trademarks
 
-The software is MIT-licensed; see [`LICENSE`](LICENSE) for the exclusions (brand artwork, the
-product logo and favicon, fonts and the design-kit CSS). The WS Agency and Artefacts67 marks are
-covered by [`TRADEMARKS.md`](TRADEMARKS.md).
+The software is MIT-licensed ([`LICENSE`](LICENSE)). [`TRADEMARKS.md`](TRADEMARKS.md) lists the
+exclusions (brand artwork, the product logo and favicon, fonts and the design-kit CSS) and covers
+the WS Agency and Artefacts67 marks.
 
 **Rebranding:** replace `assets/ws-design-kit/products/` and `assets/favicon.ico`, drop the credit
 (`frontend/src/auth.tsx`, `worker/src/instructions.ts`), and run `git grep -n Artefacts67` to find

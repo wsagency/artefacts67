@@ -12,3 +12,4 @@ All notable changes to this project are documented in this file. The format is b
 ### Changed
 - WS Agency design kit, Artefacts67 logo and favicon.
 - The Cloudflare Web Analytics beacon loads only when `WEB_ANALYTICS_TOKEN` is set.
+- `LICENSE` is the plain MIT text; the exclusions moved to `TRADEMARKS.md` ("Licence scope").
