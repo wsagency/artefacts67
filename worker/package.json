@@ -1,0 +1,26 @@
+{
+  "name": "artefacts67-worker",
+  "private": true,
+  "type": "module",
+  "description": "Artefacts67 2.0 Cloudflare Worker — ADRs 0012-0015.",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "sync-contract": "tsx scripts/sync-contract.ts",
+    "typecheck": "tsc --noEmit",
+    "test": "tsx --test"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "5.20261005.1",
+    "@types/css-tree": "3.2.0",
+    "@types/node": "22.18.6",
+    "tsx": "4.20.6",
+    "typescript": "5.9.3",
+    "wrangler": "4.131.2"
+  },
+  "dependencies": {
+    "css-tree": "3.2.1",
+    "effect": "4.0.1",
+    "parse5": "8.0.1"
+  }
+}

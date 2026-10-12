@@ -1,0 +1,19 @@
+name: CI
+on: [push, pull_request]
+permissions:
+  contents: read
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Leak check
+        if: github.event_name == 'push' && github.repository == 'wsagency/artefacts67'
+        env:
+          LEAK_PATTERNS: ${{ secrets.LEAK_PATTERNS }}
+        run: f=$(mktemp) && printf '%s' "$LEAK_PATTERNS" > "$f" && sh scripts/leak-check.sh "$f"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm --prefix worker ci && npm --prefix frontend ci
+      - run: npm run build && npm run typecheck && npm test

@@ -1,0 +1,35 @@
+/* Opt-in tokens. Import fonts/fonts.css separately when self-hosting. */
+.wsa-brand { --wsa-font-mono: "IBM Plex Mono", monospace;
+  --wsa-space-4: 4px;
+  --wsa-space-8: 8px;
+  --wsa-space-12: 12px;
+  --wsa-space-16: 16px;
+  --wsa-space-24: 24px;
+  --wsa-space-32: 32px;
+  --wsa-space-48: 48px;
+  --wsa-space-64: 64px;
+  --wsa-space-96: 96px;
+  --wsa-type-label: 12px;
+  --wsa-type-body: 16px;
+  --wsa-type-lead: 20px;
+  --wsa-type-heading: 32px;
+  --wsa-type-display: 64px;
+  --wsa-radius-small: 6px;
+  --wsa-radius-card: 16px;
+  --wsa-radius-pill: 999px;
+}
+.wsa-brand[data-identity="original"] { --wsa-font: "Manrope", sans-serif; --wsa-font-mono: "IBM Plex Mono", monospace; }
+.wsa-brand[data-identity="original"] { color-scheme: light; --wsa-background: #faf8f3; --wsa-surface: #ffffff; --wsa-foreground: #273238; --wsa-muted: #566066; --wsa-border: #b5b9b8; --wsa-accent: #ea9423; --wsa-accent-text: #825006; --wsa-focus: #825006; }
+.wsa-brand[data-identity="original"][data-appearance="light"] { color-scheme: light; --wsa-background: #faf8f3; --wsa-surface: #ffffff; --wsa-foreground: #273238; --wsa-muted: #566066; --wsa-border: #b5b9b8; --wsa-accent: #ea9423; --wsa-accent-text: #825006; --wsa-focus: #825006; }
+.wsa-brand[data-identity="original"][data-appearance="dark"] { color-scheme: dark; --wsa-background: #182126; --wsa-surface: #273238; --wsa-foreground: #faf8f3; --wsa-muted: #c3c9cb; --wsa-border: #748087; --wsa-accent: #ea9423; --wsa-accent-text: #f4b963; --wsa-focus: #f4b963; }
+@media (prefers-color-scheme: dark) { .wsa-brand[data-identity="original"]:not([data-appearance]), .wsa-brand[data-identity="original"][data-appearance="auto"] { color-scheme: dark; --wsa-background: #182126; --wsa-surface: #273238; --wsa-foreground: #faf8f3; --wsa-muted: #c3c9cb; --wsa-border: #748087; --wsa-accent: #ea9423; --wsa-accent-text: #f4b963; --wsa-focus: #f4b963; } }
+.wsa-brand[data-identity="red"] { --wsa-font: "Manrope", sans-serif; --wsa-font-mono: "IBM Plex Mono", monospace; }
+.wsa-brand[data-identity="red"] { color-scheme: light; --wsa-background: #f7f4ee; --wsa-foreground: #201a16; --wsa-surface: #fffdf8; --wsa-muted: #665e56; --wsa-border: #b8afa4; --wsa-accent: #b73718; --wsa-focus: #9b2f16; --wsa-accent-text: #b73718; }
+.wsa-brand[data-identity="red"][data-appearance="light"] { color-scheme: light; --wsa-background: #f7f4ee; --wsa-foreground: #201a16; --wsa-surface: #fffdf8; --wsa-muted: #665e56; --wsa-border: #b8afa4; --wsa-accent: #b73718; --wsa-focus: #9b2f16; --wsa-accent-text: #b73718; }
+.wsa-brand[data-identity="red"][data-appearance="dark"] { color-scheme: dark; --wsa-background: #090909; --wsa-foreground: #f1f0eb; --wsa-surface: #111111; --wsa-muted: #999b99; --wsa-border: #2a2b29; --wsa-accent: #ff6038; --wsa-focus: #ff805b; --wsa-accent-text: #ff6038; }
+@media (prefers-color-scheme: dark) { .wsa-brand[data-identity="red"]:not([data-appearance]), .wsa-brand[data-identity="red"][data-appearance="auto"] { color-scheme: dark; --wsa-background: #090909; --wsa-foreground: #f1f0eb; --wsa-surface: #111111; --wsa-muted: #999b99; --wsa-border: #2a2b29; --wsa-accent: #ff6038; --wsa-focus: #ff805b; --wsa-accent-text: #ff6038; } }
+.wsa-brand[data-identity="blue"] { --wsa-font: "Inter", sans-serif; --wsa-font-mono: "JetBrains Mono", monospace; }
+.wsa-brand[data-identity="blue"] { color-scheme: light; --wsa-background: #edf2fa; --wsa-foreground: #111c35; --wsa-surface: #fff; --wsa-muted: #485974; --wsa-border: #aab6cc; --wsa-accent: #2454d8; --wsa-focus: #173faf; --wsa-accent-text: #2454d8; }
+.wsa-brand[data-identity="blue"][data-appearance="light"] { color-scheme: light; --wsa-background: #edf2fa; --wsa-foreground: #111c35; --wsa-surface: #fff; --wsa-muted: #485974; --wsa-border: #aab6cc; --wsa-accent: #2454d8; --wsa-focus: #173faf; --wsa-accent-text: #2454d8; }
+.wsa-brand[data-identity="blue"][data-appearance="dark"] { color-scheme: dark; --wsa-background: #08090b; --wsa-foreground: #f1f1ee; --wsa-surface: #111316; --wsa-muted: #979aa4; --wsa-border: #2a2b29; --wsa-accent: #3864ff; --wsa-focus: #93aaff; --wsa-accent-text: #a8bbff; }
+@media (prefers-color-scheme: dark) { .wsa-brand[data-identity="blue"]:not([data-appearance]), .wsa-brand[data-identity="blue"][data-appearance="auto"] { color-scheme: dark; --wsa-background: #08090b; --wsa-foreground: #f1f1ee; --wsa-surface: #111316; --wsa-muted: #979aa4; --wsa-border: #2a2b29; --wsa-accent: #3864ff; --wsa-focus: #93aaff; --wsa-accent-text: #a8bbff; } }

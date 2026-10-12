@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Artefact fragment navigation check</title>
+<style>
+body{font:16px system-ui;margin:1rem}section{margin-top:110vh}footer{height:110vh}
+[data-result="fail"]{color:#a40020}[data-result="pass"]{color:#087342}
+</style>
+</head>
+<body>
+<h1>Native fragment navigation</h1>
+<p>Publish this document as an artefact and open its preview. The check must show PASS below.</p>
+<label>Edited price <input id="price" type="number" value="19"></label>
+<p><a id="jump" href="#cost"><span>Jump to the charging section</span></a></p>
+<p id="navigation-result" data-result="fail" role="status">FAIL: the section jump has not completed.</p>
+<section id="cost"><h2>Charging section</h2><p>The edited input and this document must survive the jump.</p></section>
+<footer></footer>
+<script>
+addEventListener('load',()=>{
+  const price=document.getElementById('price'),result=document.getElementById('navigation-result');
+  price.value='22';
+  addEventListener('hashchange',()=>{
+    const target=document.getElementById('cost'),top=target.getBoundingClientRect().top;
+    if(location.hash!=='#cost'||price.value!=='22'||top<0||top>=innerHeight){
+      result.textContent='FAIL: navigation lost the edited state or did not show the target.';
+      return;
+    }
+    result.dataset.result='pass';
+    result.textContent='PASS: the section jump kept the edited price and displayed the target.';
+  },{once:true});
+  document.querySelector('#jump span').click();
+},{once:true});
+</script>
+</body>
+</html>

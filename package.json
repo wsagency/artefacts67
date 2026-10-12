@@ -1,0 +1,17 @@
+{
+  "name": "artefacts67",
+  "version": "2.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Publishing private-by-default self-contained HTML artefacts, with deliberate visitor sharing and optional password gates — a Cloudflare Worker with D1, R2 and one Durable Object.",
+  "engines": { "node": ">=22.12.0" },
+  "scripts": {
+    "build": "npm --prefix worker run sync-contract && npm --prefix frontend run build",
+    "typecheck": "npm --prefix worker run typecheck && npm --prefix frontend run typecheck",
+    "dev": "npm --prefix worker run dev",
+    "test": "npm --prefix worker test",
+    "deploy": "npm --prefix worker run deploy",
+    "migrate": "npm --prefix worker exec -- wrangler -c worker/wrangler.jsonc d1 migrations apply DB --remote",
+    "migrate:local": "npm --prefix worker exec -- wrangler -c worker/wrangler.jsonc d1 migrations apply DB --local"
+  }
+}

@@ -1,0 +1,18 @@
+/* Requires ../tokens/tokens.css; optional self-hosted ../assets/fonts/fonts.css. */
+.wsa-credit { display: inline-flex; align-items: center; flex-wrap: wrap; gap: 8px; min-height: 44px; padding: 8px 12px; color: var(--wsa-foreground); background: var(--wsa-background); border-radius: var(--wsa-radius-small); font: 500 14px/1.5 var(--wsa-font); text-decoration: none; }
+.wsa-credit:focus-visible { outline: 3px solid var(--wsa-focus); outline-offset: 4px; }
+.wsa-credit:hover .wsa-credit-name { text-decoration: underline; text-underline-offset: 4px; }
+.wsa-credit-symbols { display: inline-flex; align-items: center; gap: 12px; flex: none; }
+.wsa-credit img { width: auto; height: 20px; object-fit: contain; flex: none; }
+.wsa-credit .wsa-heart { width: 20.48px; height: 20px; color: var(--wsa-accent); flex: none; }
+.wsa-credit .wsa-on-dark { display: none; }
+.wsa-credit[data-appearance="dark"] .wsa-on-dark { display: inline; }
+.wsa-credit[data-appearance="dark"] .wsa-on-light { display: none; }
+@media (prefers-color-scheme: dark) {
+  .wsa-credit:not([data-appearance]) .wsa-on-dark, .wsa-credit[data-appearance="auto"] .wsa-on-dark { display: inline; }
+  .wsa-credit:not([data-appearance]) .wsa-on-light, .wsa-credit[data-appearance="auto"] .wsa-on-light { display: none; }
+}
+.wsa-credit.wsa-credit-footer { display: flex; flex-direction: column; align-items: flex-start; gap: 16px; padding: 32px; border-top: 1px solid var(--wsa-border); border-radius: 0; }
+.wsa-credit-footer img { width: 124px; height: 67px; }
+
+.wsa-credit .sr-only { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }

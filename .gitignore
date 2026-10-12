@@ -1,0 +1,21 @@
+node_modules/
+.DS_Store
+._*
+*.log
+
+# Local agent memory (Mnemopi) — never repository content.
+banks/
+
+# The ignored clone of the public repository (private/publish.sh).
+/public-repo/
+
+# Local Wrangler state and secrets must never be committed.
+worker/.wrangler/
+.wrangler/
+worker/.dev.vars*
+
+# Vite emits the console bundle and copies the existing static brand assets.
+frontend/dist/
+
+# Plaintext sources for archived pre-encrypted artefacts must NEVER be committed.
+*.plain.html

@@ -1,0 +1,66 @@
+// Artefacts67 Worker. Secrets are configured outside source control (`wrangler secret put`):
+// `ARTEFACTS_MASTER_KEY` is required for every platform route (64 hex chars); `SMTP_HOST`,
+// `SMTP_PORT`, `SMTP_USER` and `SMTP_PASS` are optional and enable invitation and share e-mail.
+// Optional vars: `PUBLIC_ORIGIN` and `WEBAUTHN_RP_ID` (set both for a custom domain; otherwise
+// they derive from the request), `WEBAUTHN_RP_NAME`, `OPERATOR_NAME` ("Hosted by …" line),
+// `DESIGN_TEMPLATE_URL` (fallback design named in the documentation), `LEGACY_HOSTS` (hosts that
+// 308 to PUBLIC_ORIGIN), `GATE_THRESHOLD` (wrong passwords before the pair locks, default 4),
+// `GATE_LOCK_SECONDS` (how long it stays locked, default 3600) and `SMTP_FROM` (the mail sender
+// fallback; the platform owner sets the real From address in /admin/settings).
+// D1 and R2 bind by name: `wrangler deploy` connects to or creates `artefacts67` (README).
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "artefacts67",
+  "main": "src/index.ts",
+  "build": {
+    "command": "npm --prefix .. run build",
+    "watch_dir": ["src", "../assets", "../frontend/src", "../frontend/vite.config.ts", "../dev-docs/artefact-contract.md"]
+  },
+  "assets": {
+    "directory": "../frontend/dist",
+    "binding": "ASSETS",
+    "html_handling": "none",
+    "run_worker_first": true
+  },
+  "compatibility_date": "2026-08-01",
+  // request.signal aborts when a client disconnects: a project file download frees its transfer
+  // slot then (ADR 0035 § Limits); workerd never cancels the disconnected response stream.
+  "compatibility_flags": ["enable_request_signal"],
+  "observability": {
+    "enabled": true
+  },
+  "triggers": {
+    "crons": [
+      "17 3 * * *"
+    ]
+  },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "artefacts67",
+      "migrations_dir": "migrations"
+    }
+  ],
+  "r2_buckets": [
+    {
+      "binding": "ARTIFACTS",
+      "bucket_name": "artefacts67"
+    }
+  ],
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "RATELIMIT",
+        "class_name": "RateLimit"
+      }
+    ]
+  },
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": [
+        "RateLimit"
+      ]
+    }
+  ]
+}
