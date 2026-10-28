@@ -206,14 +206,14 @@ and blocked scripts or forwarded links mean these are usage estimates, not proof
 
 ## Operating it
 
-Use Node.js 22.12+ (or a newer supported release). Install each package's locked
+Use Node.js 24 LTS for CI parity (Node.js 22.12+ is supported). Install each package's locked
 dependencies with `npm ci`, `npm ci --prefix worker` and `npm ci --prefix frontend`.
 `npm run build` generates the API contract module and builds the Solid 2 RC / owned
-SolidUI / Tailwind assets into `frontend/dist`. `npm run typecheck` checks both strict
-TypeScript packages; `npm test` runs the Worker suites. Wrangler's custom build runs
-the same frontend build for development and deployment. Development watches Worker,
-frontend, static asset and contract sources; unchanged generated contracts are not
-rewritten, avoiding rebuild loops.
+SolidUI / Tailwind assets into `frontend/dist`. The strict TypeScript packages use TypeScript 7;
+`frontend/src/vite-env.d.ts` declares CSS imports. `npm run typecheck` checks both packages;
+`npm test` runs the Worker suites. Wrangler's custom build runs the same frontend build for
+development and deployment. Development watches Worker, frontend, static asset and contract
+sources; unchanged generated contracts are not rewritten, avoiding rebuild loops.
 
 Console/auth navigation and form mutations reuse authorized HTML bootstraps without
 a full document reload. Reader metadata, sidebar moves/subfolders, and Preview/Code
