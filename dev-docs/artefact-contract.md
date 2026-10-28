@@ -21,8 +21,9 @@ An artefact is **one HTML document**, with its presentation and optional applica
   do not load the console URL inside the isolated frame.
 - `<head>` stays minimal: `charset`, `viewport`, `title`, `<meta name="color-scheme" content="light dark">`
   unless the design is explicitly single-scheme (§6 Light and dark), plus supported font declarations.
-  Do NOT add your own `robots`, `favicon`, or other platform boilerplate — the platform injects
-  its own head entries (which is why exactly one `</head>` is required).
+  Do NOT add your own `robots`, `favicon`, or other platform boilerplate. The robots meta tag
+  and favicon belong to the viewer page; nothing is injected into the authored document's
+  `<head>`. The one-`</head>` requirement describes a complete, unambiguous document.
 - The only permitted absolute paths are `/assets/favicon.ico` and `/assets/ws-logo.svg`
   (platform-provided; a deployment that does not ship `/assets/ws-logo.svg` answers 404 for it).
   No other absolute paths.
@@ -153,7 +154,7 @@ can run at parse time or use normal `DOMContentLoaded` and `load` events.
 | Code | Meaning |
 |---|---|
 | `template-braces` | `{{…}}` sequences found — an unrendered template was probably left in. |
-| `multiple-head` | More than one `</head>`; platform head injection becomes ambiguous. |
+| `multiple-head` | More than one `</head>`; the authored document's head boundary is ambiguous. |
 
 ## 4. Write API
 
@@ -794,8 +795,9 @@ fileId)` to save the file instead.
   `project-data`); delete its collections first. Moving a folder without collections, any
   subfolder, or a folder to the top level stays allowed (the latter starts an empty project).
 - Project data lives as long as its folder. Only the folder's owner can delete it, in the
-  console and only once it is empty (no subfolders, no artefacts); its collections and records
-  are then deleted with it, atomically. There is no API or MCP folder deletion (ADR 0033).
+  console, together with everything in it (subfolders, artefacts, their collections and
+  records), atomically; at most 200 artefacts and 100 folders per deletion. There is no API or MCP
+  folder deletion (ADR 0038).
 - Deleting a record, a collection or a folder deletes its files (a collection or folder also its
   open uploads); the bytes are removed by the next daily sweep. An update that drops a file from a
   field deletes it. Unattached uploads expire 24 h after their start (open) or completion

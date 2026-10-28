@@ -209,7 +209,7 @@ Publish a retained source version as a new current version. History is not rewou
 _Avoid_: rollback (which could imply application data or history is rewound)
 
 **Delete**:
-Withdraw an artefact and remove its content and application data. Its paths remain reserved as tombstones rather than becoming available for another artefact. Only an empty folder (no subfolders, no artefacts) can be deleted, by its owner; its project data goes with it, its visitor shares are revoked, and its paths stay reserved the same way (ADR 0033).
+Withdraw an artefact and remove its content and application data. Its paths remain reserved as tombstones rather than becoming available for another artefact. Only its owner deletes a folder, together with everything in it (subfolders, artefacts, project data), after typing its name; its visitor shares are revoked, its paths stay reserved the same way, and the daily cleanup removes the bytes (ADR 0038).
 _Avoid_: rename, revoke share, unpublish
 
 **State**:

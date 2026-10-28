@@ -261,8 +261,12 @@ export interface PageProps {
   shares?: Share[];
   shareStats?: Record<string, ShareStats>;
   grants?: Grant[];
-  /** Owner only: what blocks deletion (subfolders, artefacts, unpublished) and the project data it would delete. */
-  folderContents?: { subfolders: number; artefacts: number; unpublished: number; collections: number; records: number; responses: number };
+  /** Owner only: everything deleting this folder removes (ADR 0038), the snapshot the deletion confirms, and the refusal when over the cap. */
+  folderContents?: {
+    folders: number; subfolders: number; artefacts: number; unpublished: number; versions: number;
+    collections: number; records: number; responses: number; files: number; shares: number;
+    snapshot: string; tooLarge: string | null;
+  };
   expiryDefault?: string;
   expiryMax?: string;
   counts?: { users?: number; active?: number; suspended?: number };

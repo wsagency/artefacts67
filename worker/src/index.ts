@@ -204,6 +204,8 @@ export default {
     execution.waitUntil(Effect.runPromise(runtime.runtimeState.pruneExpired()));
     // Deleted and expired project files: R2 objects first, then their rows, in bounded batches.
     execution.waitUntil(Effect.runPromise(runtime.projectFiles.sweep()));
+    // Withdrawn artefacts past an hour's grace: R2 objects first, then their versions and runtime state.
+    execution.waitUntil(Effect.runPromise(runtime.artifacts.sweep()));
   },
 
   async fetch(request: Request, env: WorkerEnv): Promise<Response> {

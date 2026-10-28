@@ -59,7 +59,7 @@ export function validateArtefactHtml(html: unknown, { checkReferences = true, ma
     warnings.push({ code: "template-braces", message: "{{…}} sequences found — an unrendered template was probably left in" });
 
   if ((doc.match(/<\/head>/gi) ?? []).length > 1)
-    warnings.push({ code: "multiple-head", message: "more than one </head>; platform head injection becomes ambiguous" });
+    warnings.push({ code: "multiple-head", message: "more than one </head>; the authored document's head boundary is ambiguous" });
 
   return { errors, warnings };
 }

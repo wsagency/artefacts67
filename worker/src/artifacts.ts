@@ -39,6 +39,9 @@ import { FONT_LIMITS, openArtifactService, prepareArtifactHtml } from "./fonts.j
 const enc = new TextEncoder();
 const nowIso = () => new Date().toISOString();
 const KEY_BYTES = 32;
+/** The daily purge of withdrawn artefacts (ADR 0038): `batches` rounds of `batch` per run, each
+ *  artefact withdrawn at least `graceMs` ago so an in-flight publication finishes first. */
+export const PURGE_LIMITS = { batch: 10, batches: 10, graceMs: 3_600_000 } as const;
 
 const coded = (code: string, message: string): CodeError => Object.assign(new Error(message), { code });
 const io = <A>(run: () => Awaitable<A>): Effect.Effect<A, CodeError> =>
@@ -116,6 +119,8 @@ export interface Artifacts {
   duplicate(input: DuplicateArtifact): Effect.Effect<Artifact, CodeError>;
   restore(input: RestoreArtifact): Effect.Effect<PublishedVersion, CodeError>;
   remove(artifactId: string, options?: { authorId?: string }): Effect.Effect<Artifact, CodeError>;
+  /** Purges withdrawn artefacts past their grace; returns how many. A storage failure ends the run. */
+  sweep(): Effect.Effect<number, CodeError>;
   document(artifact: Artifact | null | undefined, version?: unknown): Effect.Effect<string, CodeError>;
   gatePayload(artifact: Artifact | null | undefined): Effect.Effect<GatePayload, CodeError>;
   ciphertext(artifact: Artifact): Effect.Effect<ArtifactCiphertext, CodeError>;
@@ -210,6 +215,25 @@ export function openArtifacts({ db, bucket, masterKeyHex, settings, iterations =
     for (const version of stale) yield* io(() => bucket.delete(version.r2Key));
   }).pipe(Effect.catch(() => Effect.void));
 
+  /** The physical half of a withdrawal, for a withdrawn artefact only: every object under art/<id>/
+   *  (one delete per list page), then the version and runtime rows, then purged_at. A failure leaves
+   *  purged_at NULL for the sweep. Withdrawal is terminal (0010), so one check up front covers it all. */
+  const purge = Effect.fn(function* (artifactId: string) {
+    const withdrawn = yield* io(() => db.prepare("SELECT 1 AS withdrawn FROM artifacts WHERE id = ? AND deleted_at IS NOT NULL").bind(artifactId).first());
+    if (!withdrawn) return yield* Effect.fail(coded("not-withdrawn", "only a withdrawn artefact is purged"));
+    let cursor: string | undefined;
+    do {
+      const page = yield* io(() => bucket.list({ prefix: `art/${artifactId}/`, ...(cursor ? { cursor } : {}) }));
+      if (page.objects.length) yield* io(() => bucket.delete(page.objects.map(object => object.key)));
+      cursor = page.truncated ? page.cursor : undefined;
+    } while (cursor);
+    yield* io(() => db.batch([
+      db.prepare("DELETE FROM artifact_versions WHERE artifact_id = ?").bind(artifactId),
+      db.prepare("DELETE FROM artifact_runtime_state WHERE artifact_id = ?").bind(artifactId),
+      db.prepare("UPDATE artifacts SET purged_at = ? WHERE id = ? AND deleted_at IS NOT NULL").bind(nowIso(), artifactId),
+    ]));
+  });
+
   /** R2 first, then the atomic rows/trigger that decide the winning publication. */
   const writeVersion = Effect.fn(function* (artifact: Artifact, html: unknown,
     { keyHex, authorType, authorId, note, captured, provenance = null, changes = [] }: WriteVersion) {
@@ -238,7 +262,7 @@ export function openArtifacts({ db, bucket, masterKeyHex, settings, iterations =
       // A failed attempt owns only its unique object; never delete the winning version.
       yield* io(() => bucket.delete(key)).pipe(Effect.catch(() => Effect.gen(function* () {
         yield* io(() => db.prepare("UPDATE artifacts SET purged_at = NULL WHERE id = ? AND deleted_at IS NOT NULL").bind(artifact.id).run());
-        return yield* Effect.fail(coded("purge-failed", "Unpublished content cleanup failed; a withdrawn artefact needs deletion retried"));
+        return yield* Effect.fail(coded("purge-failed", "Publication failed and its content could not be removed; if the artefact is withdrawn, the daily cleanup removes it"));
       })));
       if (error.message.includes("publish-conflict:")) return yield* Effect.fail(coded("publish-conflict", "artefact withdrawn or version changed"));
       return yield* Effect.fail(error);
@@ -451,19 +475,28 @@ export function openArtifacts({ db, bucket, masterKeyHex, settings, iterations =
         db.prepare("DELETE FROM share_keys WHERE artifact_id = ?").bind(artifact.id),
         db.prepare("DELETE FROM artifact_runtime_state WHERE artifact_id = ?").bind(artifact.id),
       ]));
-      yield* Effect.gen(function* () {
-        let cursor: string | undefined;
-        do {
-          const page = yield* io(() => bucket.list({ prefix: `art/${artifact.id}/`, ...(cursor ? { cursor } : {}) }));
-          for (const object of page.objects) yield* io(() => bucket.delete(object.key));
-          cursor = page.truncated ? page.cursor : undefined;
-        } while (cursor);
-        yield* io(() => db.batch([
-          db.prepare("DELETE FROM artifact_versions WHERE artifact_id = ?").bind(artifact.id),
-          db.prepare("UPDATE artifacts SET purged_at = ? WHERE id = ?").bind(nowIso(), artifact.id),
-        ]));
-      }).pipe(Effect.catch(() => Effect.fail(coded("purge-failed", "Artefact withdrawn, but content purge failed; retry deletion to finish cleanup"))));
+      yield* purge(artifact.id).pipe(Effect.catch(() =>
+        Effect.fail(coded("purge-failed", "Artefact withdrawn; removing its content failed, and the daily cleanup will finish it"))));
       return yield* required(artifact.id);
+    }),
+    sweep: Effect.fn(function* () {
+      const cutoff = new Date(Date.now() - PURGE_LIMITS.graceMs).toISOString();
+      let purged = 0;
+      const failed: string[] = [];
+      for (let round = 0; round < PURGE_LIMITS.batches; round++) {
+        // ponytail: full scan of artifacts; add a partial index on deleted_at WHERE purged_at IS NULL past ~10^5 rows.
+        const { results } = yield* io(() => db.prepare("SELECT id FROM artifacts WHERE deleted_at IS NOT NULL AND purged_at IS NULL" +
+          ` AND deleted_at <= ? AND id NOT IN (SELECT value FROM json_each(?)) ORDER BY deleted_at, id LIMIT ${PURGE_LIMITS.batch}`)
+          .bind(cutoff, JSON.stringify(failed)).all<{ id: string }>());
+        for (const { id } of results) {
+          if (yield* purge(id).pipe(Effect.as(true), Effect.catch(() => Effect.succeed(false)))) { purged++; continue; }
+          // One stuck artefact must not hold back the rest: log its id (nothing else) and go on; the next run retries it.
+          console.error("artefacts67 purge failed", id);
+          failed.push(id);
+        }
+        if (results.length < PURGE_LIMITS.batch) break;
+      }
+      return purged;
     }),
     document: Effect.fn(function* (artifact: Artifact | null | undefined, version: unknown = artifact?.currentVersion) {
       const current = (yield* retained(artifact, version)).artifact;

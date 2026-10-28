@@ -24,10 +24,10 @@ agent skill) was named the failure mode to avoid.
   `@import`, `url(http…)`, remote fonts/CDN); `too-large` (over 1.5 MiB); `invalid-name`
   (name not kebab-case); `invalid-slug` (malformed client slug); `weak-password`
   (password under 8 characters).
-- **WARNINGs — advisory, non-blocking:** `template-braces` (`{{…}}` sequences — an unrendered
-  template left in); `deferred-scripts` (inline scripts on `DOMContentLoaded`/`load` — gated
-  pages decrypt and inject after those events have fired, so such scripts may never run);
-  `multiple-head` (more than one `</head>` — head injection becomes ambiguous).
+- **WARNINGs — advisory, non-blocking:** `template-braces` (`{{…}}` sequences — an unrendered template left in);
+  `deferred-scripts` (inline scripts on `DOMContentLoaded`/`load` — gated pages decrypt and
+  inject after those events have fired, so such scripts may never run);
+  `multiple-head` (more than one `</head>` — the authored document's head boundary is ambiguous).
 - **Contract home:** the repo file `dev-docs/artefact-contract.md` is the single canonical
   contract, served publicly at `GET /_api/contract` — fetchable without an auth dance,
   versioned with the code that enforces it, one HTTP hop for any agent.

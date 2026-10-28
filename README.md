@@ -49,9 +49,11 @@ strongly-consistent counters). You run your own instance: see [First deploy](#fi
   folder's **Overview** or the command palette. Lock icons open **Password** options:
   an artefact's additional authorized-link gate, or a folder's independent visitor-share passwords.
   Move artefacts or owned folders using the tree or their settings forms. Organization does
-  not change existing links. An owner deletes an **empty** folder (no subfolders, no
-  artefacts) from its **Settings → Delete folder**; its project data goes with it, its visitor
-  shares are revoked, and its paths stay reserved and never resolve again (ADR 0033).
+  not change existing links. An owner deletes a folder with everything in it (subfolders,
+  artefacts, project data) from its **Settings → Delete folder** by typing the folder's name; at
+  most 200 artefacts and 100 folders go per deletion, so delete a larger tree bottom-up. Visitor
+  shares and colleague access end, every path stays reserved and never resolves again, and the
+  daily cleanup removes the stored bytes (ADR 0038).
   Colleague grants follow the current folder tree; visitor shares can cover one artefact or
   the current subtree of a top-level folder.
 - **One hostname, isolated execution.** The console and viewer stay on the existing domain.
@@ -86,7 +88,7 @@ strongly-consistent counters). You run your own instance: see [First deploy](#fi
 | Contract | `GET /_api/contract` — the canonical API, validator, storage, project data and files SDK reference | public |
 
 Every reader uses the same compact toolbar based on Claude's authenticated artefact viewer:
-home and the artefact's grouped title menu on the left; Preview/Code, Share, Download and
+the Artefacts67 mark (a link home) and the artefact's grouped title menu on the left; Preview/Code, Share, Download and
 Fullscreen icons on the right, including narrow viewers. Share distinguishes a **private link**
 requiring authorized sign-in from an existing **visitor-share link**. Managers create external
 access through visitor-share management; copying a private link never grants it.
@@ -140,7 +142,7 @@ platform user's exact email address and choose a role:
 | Viewer | Read and open the authenticated preview |
 | Editor | Viewer access, plus publish, create children, edit metadata/passwords/paths and move artefacts within the owner's estate |
 | Manager | Editor access, plus visitor shares and detailed analytics |
-| Resource owner | All of the above, plus colleague grants, folder moves and deleting an empty folder |
+| Resource owner | All of the above, plus colleague grants, folder moves and deleting a folder with its contents |
 
 Grants apply to descendants and the strongest applicable role wins. A direct grant can be
 removed without removing an inherited one. Newly created children belong to the folder's

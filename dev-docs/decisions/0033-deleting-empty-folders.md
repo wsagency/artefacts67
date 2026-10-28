@@ -1,7 +1,7 @@
 # 33. Deleting empty folders
 
 Date: 2026-10-10
-Status: Accepted
+Status: Accepted; partially superseded by [38](0038-deleting-folders-with-contents.md) (the emptiness rule, the stale-draft rule and `folder-not-empty`: a folder is now deleted with its contents)
 Extends: [17](0017-folders-and-the-folder-index.md), [21](0021-folders-are-the-container.md), [25](0025-subfolders-and-moving.md), [26](0026-collaboration-shares-and-observations.md), [32](0032-project-data-responses-and-mcp.md)
 
 ## Context

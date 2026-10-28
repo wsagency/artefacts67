@@ -25,7 +25,6 @@ const icons = {
   preview: 'M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12Zm13 0a3 3 0 1 1-6 0 3 3 0 0 1 6 0Z',
   code: 'm8 7-5 5 5 5m8-10 5 5-5 5m-3-13-2 16',
   back: 'm10 5-7 7 7 7M3 12h18',
-  home: 'm3 10 9-7 9 7v11h-6v-7H9v7H3Z',
   chevron: 'm6 9 6 6 6-6',
   share: 'M12 16V3m-5 5 5-5 5 5M5 13v8h14v-8',
   download: 'M12 3v12m-5-5 5 5 5-5M5 17v4h14v-4',
@@ -158,14 +157,20 @@ export function DeleteArtifact(props: { base: string; csrf: string }) {
   const [open, setOpen] = createSignal(false);
   return <><Button variant="danger" onClick={() => setOpen(true)}>Delete artefact</Button><Dialog title="Permanently delete artefact?" open={open()} onOpenChange={setOpen}><p>This removes the content, retained versions and personal/shared application data. Existing links stop working and remain reserved. This cannot be undone.</p><PostForm action={`${props.base}/delete`} csrf={props.csrf} submit="Permanently delete" danger><Check name="confirm" value="delete" required>Delete this artefact and all its application data permanently.</Check></PostForm></Dialog></>;
 }
-/** Only an empty folder can be deleted (ADR 0033): blockers replace the action; project data is counted in the confirmation. */
-export function DeleteFolder(props: { base: string; csrf: string; contents?: PageProps['folderContents'] }) {
+/** The owner deletes a folder with everything in it (ADR 0038): the panel counts what goes, over the cap it says why not,
+ *  and the dialog asks for the folder's name before posting the snapshot of the counts it showed. */
+export function DeleteFolder(props: { base: string; csrf: string; name: string; contents?: PageProps['folderContents'] }) {
   const [open, setOpen] = createSignal(false);
-  const held = untrack(() => props.contents) ?? { subfolders: 0, artefacts: 0, unpublished: 0, collections: 0, records: 0, responses: 0 };
+  const [typed, setTyped] = createSignal('');
+  const held = untrack(() => props.contents);
+  if (!held) return null;
+  if (held.tooLarge) return <><p>{held.tooLarge}</p><Button variant="danger" disabled>Delete folder</Button></>;
   const count = (n: number, noun: string) => `${n} ${noun}${n === 1 ? '' : 's'}`;
-  const blockers = ([[held.subfolders, 'subfolder'], [held.artefacts, 'artefact'], [held.unpublished, 'unpublished artefact']] as const).filter(([n]) => n > 0).map(([n, noun]) => count(n, noun));
-  if (blockers.length) return <><p>This folder still contains {blockers.join(' and ')}. Only an empty folder can be deleted: move or delete them first.</p><Button variant="danger" disabled>Delete folder</Button></>;
-  return <><Button variant="danger" onClick={() => setOpen(true)}>Delete folder</Button><Dialog title="Permanently delete folder?" open={open()} onOpenChange={setOpen}><p>The folder is removed, its visitor shares are revoked and direct colleague access to it ends. Its private paths stop working and remain reserved. This cannot be undone.</p>{held.collections > 0 && <p class="feedback error" role="alert">Its project data will be permanently deleted: {count(held.collections, 'collection')} with {count(held.records, 'record')} and {count(held.responses, 'response')}.</p>}<PostForm action={`${props.base}/delete`} csrf={props.csrf} submit="Permanently delete" danger><Check name="confirm" value="delete" required>{held.collections > 0 ? 'Delete this folder and its project data permanently.' : 'Delete this folder permanently.'}</Check></PostForm></Dialog></>;
+  const items = ([[held.subfolders, 'subfolder'], [held.artefacts, 'artefact'], [held.unpublished, 'unpublished artefact'], [held.versions, 'retained version'],
+    [held.collections, 'project data collection'], [held.records, 'record'], [held.responses, 'response'], [held.files, 'project file'], [held.shares, 'active visitor share']] as const)
+    .filter(([n]) => n > 0).map(([n, noun]) => count(n, noun));
+  const Summary = () => items.length ? <><p>Deleting this folder also deletes:</p><ul><For each={items}>{item => <li>{item}</li>}</For></ul></> : <p>This folder is empty.</p>;
+  return <><Summary /><Button variant="danger" onClick={() => setOpen(true)}>Delete folder</Button><Dialog title="Permanently delete folder?" open={open()} onOpenChange={setOpen}><Summary /><p class="feedback error" role="alert">Everything listed is deleted permanently, with every subfolder, artefact and application data inside. Visitor shares are revoked and colleague access ends. Links stop working and their paths stay reserved. No retention setting keeps a copy. This cannot be undone.</p><PostForm action={`${props.base}/delete`} csrf={props.csrf} hidden={{ snapshot: held.snapshot }} submit={false}><Field name="confirm" label={`Type "${props.name}" to confirm`} autocomplete="off" value={typed()} onChange={setTyped} required /><Button type="submit" variant="danger" disabled={typed().trim() !== props.name.trim()}>Permanently delete</Button></PostForm></Dialog></>;
 }
 export function VersionHistory(props: { versions?: Version[]; base: string; csrf: string; write?: boolean; currentVersion?: number }) {
   const [restoreVersion, setRestoreVersion] = createSignal<number | null>(null);

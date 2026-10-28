@@ -169,7 +169,7 @@ function bootstrapProps(screen: string, props: ViewProps) {
     } : {}),
     ...(props.caps?.own ? {
       grants: (props.grants ?? []).map(grant => pick(grant, ["userId", "name", "email", "role", "inherited"])),
-      ...(props.folderContents ? { folderContents: pick(props.folderContents, ["subfolders", "artefacts", "unpublished", "collections", "records", "responses"]) } : {}),
+      ...(props.folderContents ? { folderContents: pick(props.folderContents, ["folders", "subfolders", "artefacts", "unpublished", "versions", "collections", "records", "responses", "files", "shares", "snapshot", "tooLarge"]) } : {}),
     } : {}),
   };
   return out;

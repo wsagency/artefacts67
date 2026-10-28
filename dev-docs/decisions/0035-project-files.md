@@ -383,7 +383,7 @@ same way. Tool descriptions say so.
 
 ### Deletion and the sweep
 
-- **Record delete**, **collection delete** and **folder delete** (ADR 0033's guarded batch) mark
+- **Record delete**, **collection delete** and **folder delete** (ADR 0038's guarded batch) mark
   the affected `project_files` rows `deleted` in the same D1 batch, each statement guarded by the
   parent row no longer existing (`NOT EXISTS` the record / collection / folder). Record updates
   delete dropped files as above. Artefact deletion still does not touch project data or files.

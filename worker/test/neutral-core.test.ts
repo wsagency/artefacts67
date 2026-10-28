@@ -88,6 +88,16 @@ test("documentation is plain and uses ARTEFACTS67_KEY", async () => {
   assert.doesNotMatch(page, /Why use it|Motion walkthrough|WS_KEY\b|WS-Artefacts/);
   assert.match(await (await worker.fetch(new Request("https://fork.example/llms.txt"), {} as WorkerEnv)).text(), /ARTEFACTS67_KEY/);
 });
+
+test("MCP client snippets use the deployment origin", async () => {
+  const text = await (await worker.fetch(new Request("https://fork.example/llms.txt"), {
+    ...env, PUBLIC_ORIGIN: "https://app.example",
+  })).text();
+  assert.match(text, /codex mcp add artefacts67 --url https:\/\/app\.example\/_mcp/);
+  assert.match(text, /claude mcp add --transport http --scope user artefacts67 https:\/\/app\.example\/_mcp/);
+  assert.match(text, /"url":"https:\/\/app\.example\/_mcp"/);
+  assert.doesNotMatch(text, /https:\/\/fork\.example\/_mcp/);
+});
 test("no core source references the report template asset", () => { for (const f of ["src/instructions.ts", "src/contract.ts"]) assert.doesNotMatch(readFileSync(f, "utf8"), /ws-agency-report-template/); }); // tests run in worker/
 
 test("a fresh database does not seed mail_from", async () => {

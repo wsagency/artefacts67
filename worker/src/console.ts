@@ -134,7 +134,8 @@ function errorInfo(error: unknown, fallback = "The request could not be processe
     "font-limit": 413,
     "publish-conflict": 409,
     "project-data": 409,
-    "folder-not-empty": 409,
+    "folder-changed": 409,
+    "folder-too-large": 409,
     "purge-failed": 503,
     "slug-taken": 409,
     "already-bootstrapped": 409,
@@ -974,7 +975,7 @@ function artefactCreate(request: Request, ctx: ConsoleContext, active: CurrentSe
 
 /** /app/f/<ref>[/<action>] — one folder: GET renders the pane; the actions change its display
  *  name, its friendly path, its retired paths, its parent (move), found subfolders, the visitor
- *  shares of the folder and the colleagues let into it, or delete it once empty (ADR 0033). Move
+ *  shares of the folder and the colleagues let into it, or delete it with everything in it (ADR 0038). Move
  *  answers JSON to the tree's drag-and-drop and PRGs a plain form (ADR 0025). Every action asks
  *  `access.may` first.
  *
@@ -986,7 +987,10 @@ function folderPane(request: Request, ctx: ConsoleContext, active: CurrentSessio
     if (!found) return page(messageView({ title: "Page not found" }), 404);
     const me = ctx.auth.meView(active.user, active.session.csrf);
     const render: ScreenRender = (extra = {}, status = 200) => Effect.gen(function* () {
-      const folder = (yield* ctx.folders.byId(found.id)) ?? found;
+      // A folder deleted meanwhile (a double-click on delete, a colleague's action racing the
+      // owner's deletion) has no pane left to show: the same 404 as an unknown ref.
+      const folder = yield* ctx.folders.byId(found.id);
+      if (!folder) return page(messageView({ title: "Page not found" }), 404);
       const caps = yield* standingOf(ctx, active.user, folderSubject(folder));
       const estate = yield* estateOf(ctx, active.user.id);
       const node = findFolderNode(allRoots(estate), folder.id);
@@ -1123,15 +1127,16 @@ function folderPane(request: Request, ctx: ConsoleContext, active: CurrentSessio
         return yield* render({ notice: "Direct access removed. Inherited access, if any, still applies." });
       }
       if (action === "delete") {
-        // The owner's alone, like a move: deletion also ends colleague grants and visitor shares.
+        // The owner's alone, like a move: deletion also ends colleague grants and visitor shares. The
+        // owner types the folder's label and posts the snapshot of the counts they were shown (ADR 0038);
+        // the model writes the folder.delete audit row in the deletion's batch.
         yield* requireMay(ctx, active.user, folderSubject(folder), "own");
-        if (values.confirm !== "delete") return yield* Effect.fail(fail("bad-action", "Confirm permanent deletion of this folder and its project data."));
+        const label = (yield* ctx.folders.name(folder)) || folder.slug || folder.id;
+        if (!values.snapshot || String(values.confirm ?? "").trim() !== label.trim()) {
+          return yield* Effect.fail(fail("bad-action", "Type the folder's name exactly to confirm its permanent deletion."));
+        }
         const parent = folder.parentId ? yield* ctx.folders.byId(folder.parentId) : null;
-        const removed = yield* ctx.folders.remove(folder.id);
-        yield* ctx.auth.audit("user", active.user.id, "folder.delete", { detail: {
-          folder: folder.id, slug: folder.slug, parent: folder.parentId ?? null,
-          collections: removed.collections, records: removed.records, responses: removed.responses,
-        } });
+        yield* ctx.folders.remove(folder.id, { snapshot: String(values.snapshot), actorId: active.user.id });
         const url = parent ? `/app/f/${parent.slug ?? parent.id}` : "/app";
         return isJson ? json({ url }) : redirect(url);
       }

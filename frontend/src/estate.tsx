@@ -78,7 +78,7 @@ export function FolderPane(props: { p: PageProps }) {
       {caps.own && <Panel title="Move folder"><p>Only its owner may move a folder: moving changes inherited access. Private paths remain unchanged.</p><PostForm action={`${base}/move`} csrf={csrf} submit="Move"><Choice name="parent" label="Under" options={[['root', 'Top level'], ...options(p.moveTargets ?? [])]} /></PostForm></Panel>}
       <Aliases base={base} csrf={csrf} />
     </div>
-    {caps.own && <Panel title="Delete folder"><DeleteFolder base={base} csrf={csrf} contents={p.folderContents} /></Panel>}
+    {caps.own && <Panel title="Delete folder"><DeleteFolder base={base} csrf={csrf} name={folder.displayName ?? folder.name ?? ''} contents={p.folderContents} /></Panel>}
   </>]);
   // Folder visits start at Overview; an explicit hash still opens the requested tab.
   if (!location.hash) history.replaceState(history.state, '', '#overview');

@@ -320,7 +320,7 @@ export function ArtifactViewer(props: { viewer: ViewerDescriptor | null; title?:
     <header class="viewer-bar">
       <div class="viewer-identity">
         {selectedChild() && <Button variant="ghost" size="sm" class="viewer-icon-button" aria-label="Back to folder" title="Back to folder" onClick={() => select(props.viewer)}><Icon name="back" /></Button>}
-        <a class="viewer-home" href={viewer()?.signedIn ? '/app' : '/'} aria-label="Artefacts67 home" title="Artefacts67 home"><Icon name="home" /></a>
+        <a class="viewer-home" href={viewer()?.signedIn ? '/app' : '/'} aria-label="Artefacts67 home" title="Artefacts67 home"><svg viewBox="0 0 64 64" width="18" height="18" aria-hidden="true"><path fill="#ea9423" fill-rule="evenodd" d="M32 5 59 21 32 37 5 21ZM32 15 21.875 21 32 27 42.125 21Z" /><path fill="currentColor" d="m8 33 24 14 24-14v10L32 57 8 43Z" /></svg></a>
         <h1 class="sr-only">{title()}</h1>
         {menu()}
       </div>

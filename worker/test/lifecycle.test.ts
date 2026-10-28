@@ -8,7 +8,7 @@ import type { FontFetcher } from "../src/fonts.js";
 import { openD1Shim } from "./db.js";
 import { memoryBucket, rateLimitBinding } from "./doubles.js";
 import { openStore } from "../src/store.js";
-import { openArtifacts } from "../src/artifacts.js";
+import { PURGE_LIMITS, openArtifacts } from "../src/artifacts.js";
 import { openFolders } from "../src/folders.js";
 import { openProjectData } from "../src/project-data.js";
 import { openProjectFiles } from "../src/project-files.js";
@@ -393,4 +393,131 @@ test("runtime state and reports are lazy, sealed Effects independent of publishe
   assert.equal(await Effect.runPromise(reports.resolve(reportId, owner.id)), false);
   await Effect.runPromise(artifacts.remove(artifact.id, { authorId: owner.id }));
   await assert.rejects(Effect.runPromise(state.execute(reader, { op: "set", key: "draft", value: "cannot revive" })), { code: "not-found" });
+});
+
+const HOUR_AGO = (hours = 2) => new Date(Date.now() - hours * 3_600_000).toISOString();
+const keysOf = (bucket: { objects: Map<string, unknown> }, id: string) => [...bucket.objects.keys()].filter(key => key.startsWith(`art/${id}/`));
+const countOf = async (db: ReturnType<typeof openD1Shim>, sql: string, ...params: unknown[]) =>
+  Number((await db.prepare(`SELECT COUNT(*) AS n FROM ${sql}`).bind(...params).first<{ n: number }>())?.n ?? 0);
+/** A withdrawn artefact row with one stray object, as an old batch or a failed purge leaves it. */
+async function withdrawnRow(db: ReturnType<typeof openD1Shim>, bucket: { put(key: string, value: Uint8Array): Promise<unknown> }, id: string, ownerId: string, at = HOUR_AGO()) {
+  await db.prepare("INSERT INTO artifacts (id, owner_id, title_sealed, current_version, created_at, updated_at, deleted_at) VALUES (?,?,?,?,?,?,?)")
+    .bind(id, ownerId, "x", 0, at, at, at).run();
+  await bucket.put(`art/${id}/1-0000000000000000.enc`, new Uint8Array([1]));
+}
+/** Runs `body` with console.error captured and returns what it logged. */
+async function errorsOf(body: () => Promise<unknown>) {
+  const logged: unknown[][] = [], error = console.error;
+  console.error = (...args: unknown[]) => { logged.push(args); };
+  try { await body(); } finally { console.error = error; }
+  return logged;
+}
+
+test("the sweep purges withdrawn artefacts after an hour of grace", async () => {
+  const { artifacts, folders, owner, bucket, db } = await services();
+  const withdrawn: string[] = [];
+  for (const name of ["Old", "Fresh"]) {
+    const folder = await Effect.runPromise(folders.create({ ownerId: owner.id, name }));
+    const artifact = await Effect.runPromise(artifacts.create({ ownerId: owner.id, folderId: folder.id, html: HTML, authorId: owner.id }));
+    await Effect.runPromise(artifacts.publish({ artifactId: artifact.id, html: NEXT, authorId: owner.id }));
+    await db.prepare("INSERT INTO artifact_runtime_state (artifact_id, scope, actor_key, key_hash, value_sealed, updated_at) VALUES (?,?,?,?,?,?)")
+      .bind(artifact.id, "shared", owner.id, "key", "x", new Date().toISOString()).run();
+    const { snapshot } = await Effect.runPromise(folders.contents(folder.id));
+    await Effect.runPromise(folders.remove(folder.id, { snapshot, actorId: owner.id }));
+    withdrawn.push(artifact.id);
+  }
+  const [old, fresh] = withdrawn;
+  const live = await Effect.runPromise(artifacts.create({ ownerId: owner.id, html: HTML, authorId: owner.id }));
+  await Effect.runPromise(artifacts.publish({ artifactId: live.id, html: NEXT, authorId: owner.id }));
+  await db.prepare("UPDATE artifacts SET created_at = ?, updated_at = ? WHERE id = ?").bind(HOUR_AGO(), HOUR_AGO(), live.id).run();
+  await db.prepare("UPDATE artifacts SET deleted_at = ? WHERE id = ?").bind(HOUR_AGO(), old).run();
+  assert.equal(await Effect.runPromise(artifacts.sweep()), 1);
+  assert.deepEqual(keysOf(bucket, old), []);
+  assert.equal(await countOf(db, "artifact_versions WHERE artifact_id = ?", old), 0);
+  assert.equal(await countOf(db, "artifact_runtime_state WHERE artifact_id = ?", old), 0);
+  assert.ok((await Effect.runPromise(artifacts.byId(old)))?.purgedAt);
+  assert.equal(keysOf(bucket, fresh).length, 2);
+  assert.equal(await countOf(db, "artifact_versions WHERE artifact_id = ?", fresh), 2);
+  assert.equal(await countOf(db, "artifact_runtime_state WHERE artifact_id = ?", fresh), 1);
+  assert.equal((await Effect.runPromise(artifacts.byId(fresh)))?.purgedAt, null);
+  assert.equal(await Effect.runPromise(artifacts.sweep()), 0);
+  assert.equal(keysOf(bucket, live.id).length, 2);
+  assert.equal(await countOf(db, "artifact_versions WHERE artifact_id = ?", live.id), 2);
+  assert.equal(await Effect.runPromise(artifacts.document(await Effect.runPromise(artifacts.byId(live.id)))), NEXT);
+});
+
+test("one run purges at most 100; the next finishes", async () => {
+  const { artifacts, owner, bucket, db } = await services();
+  for (let i = 0; i < 150; i++) await withdrawnRow(db, bucket, `bulk${String(i).padStart(16, "0")}`, owner.id);
+  assert.equal(PURGE_LIMITS.batch * PURGE_LIMITS.batches, 100);
+  assert.equal(await Effect.runPromise(artifacts.sweep()), 100);
+  assert.equal(bucket.objects.size, 50);
+  assert.equal(await Effect.runPromise(artifacts.sweep()), 50);
+  assert.equal(bucket.objects.size, 0);
+  assert.equal(await Effect.runPromise(artifacts.sweep()), 0);
+  assert.equal(await countOf(db, "artifacts WHERE purged_at IS NULL"), 0);
+});
+
+test("a bucket failure leaves rows for the next run", async () => {
+  const { artifacts, owner, bucket, db } = await services();
+  const first = await Effect.runPromise(artifacts.create({ ownerId: owner.id, html: HTML, authorId: owner.id }));
+  await db.prepare("UPDATE artifacts SET deleted_at = ?, current_version = 0, key_wrap_master = NULL WHERE id = ?").bind(HOUR_AGO(), first.id).run();
+  const removeObject = bucket.delete;
+  bucket.delete = async () => { throw new Error("storage unavailable"); };
+  assert.equal(await Effect.runPromise(artifacts.sweep()), 0);
+  assert.equal((await Effect.runPromise(artifacts.byId(first.id)))?.purgedAt, null);
+  assert.equal(await countOf(db, "artifact_versions WHERE artifact_id = ?", first.id), 1);
+  bucket.delete = removeObject;
+  assert.equal(await Effect.runPromise(artifacts.sweep()), 1);
+  assert.deepEqual(keysOf(bucket, first.id), []);
+  assert.equal(await countOf(db, "artifact_versions WHERE artifact_id = ?", first.id), 0);
+});
+
+test("a stuck purge is logged by id and the sweep goes on past it", async () => {
+  const { artifacts, owner, bucket, db } = await services();
+  const stuck = Array.from({ length: PURGE_LIMITS.batch }, (_, i) => `stuck${String(i).padStart(15, "0")}`);
+  for (const id of stuck) await withdrawnRow(db, bucket, id, owner.id, HOUR_AGO(3));
+  for (const id of ["late0000000000000001", "late0000000000000002"]) await withdrawnRow(db, bucket, id, owner.id);
+  const removeObject = bucket.delete.bind(bucket);
+  bucket.delete = async (keys) => {
+    if ([keys].flat().some(key => key.startsWith("art/stuck"))) throw new Error("storage refused");
+    return removeObject(keys);
+  };
+  let purged = -1;
+  const logged = await errorsOf(async () => { purged = await Effect.runPromise(artifacts.sweep()); });
+  assert.equal(purged, 2);
+  assert.deepEqual(logged, stuck.map(id => ["artefacts67 purge failed", id]));
+  assert.deepEqual(keysOf(bucket, "late0000000000000001"), []);
+  assert.equal(await countOf(db, "artifacts WHERE purged_at IS NULL"), stuck.length);
+});
+
+test("the purge refuses a live artefact, whoever asks", async () => {
+  const { artifacts, owner, bucket, db } = await services();
+  const live = await Effect.runPromise(artifacts.create({ ownerId: owner.id, html: HTML, authorId: owner.id }));
+  // A selection that wrongly yields a live id stands in for any future caller of the purge.
+  const prepare = db.prepare.bind(db), pick = prepare("SELECT ? AS id").bind(live.id);
+  db.prepare = sql => sql.startsWith("SELECT id FROM artifacts WHERE deleted_at IS NOT NULL") ? Object.assign(prepare(sql), { bind: () => pick }) : prepare(sql);
+  let purged = -1;
+  const logged = await errorsOf(async () => { purged = await Effect.runPromise(artifacts.sweep()); });
+  db.prepare = prepare;
+  assert.equal(purged, 0);
+  assert.deepEqual(logged, [["artefacts67 purge failed", live.id]]);
+  assert.equal(keysOf(bucket, live.id).length, 1);
+  assert.equal(await countOf(db, "artifact_versions WHERE artifact_id = ?", live.id), 1);
+  assert.equal(await Effect.runPromise(artifacts.document(await Effect.runPromise(artifacts.byId(live.id)))), HTML);
+});
+
+test("old 0033 drafts and failed purges are swept", async () => {
+  const { artifacts, owner, bucket, db } = await services();
+  await withdrawnRow(db, bucket, "draft000000000000001", owner.id);
+  const failed = await Effect.runPromise(artifacts.create({ ownerId: owner.id, html: HTML, authorId: owner.id }));
+  const removeObject = bucket.delete;
+  bucket.delete = async () => { throw new Error("storage unavailable"); };
+  await assert.rejects(Effect.runPromise(artifacts.remove(failed.id, { authorId: owner.id })),
+    (error: unknown) => asCodeError(error).code === "purge-failed" && /daily cleanup/.test(asCodeError(error).message));
+  bucket.delete = removeObject;
+  await db.prepare("UPDATE artifacts SET deleted_at = ? WHERE id = ?").bind(HOUR_AGO(), failed.id).run();
+  assert.equal(await Effect.runPromise(artifacts.sweep()), 2);
+  assert.equal(bucket.objects.size, 0);
+  assert.equal(await countOf(db, "artifacts WHERE purged_at IS NULL"), 0);
 });

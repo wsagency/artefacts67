@@ -130,7 +130,7 @@ test("scheduled storage cleanup still removes expired rows when observation clea
     ARTEFACTS_MASTER_KEY: MASTER, PUBLIC_ORIGIN: ORIGIN,
   }, { waitUntil: (promise: Promise<unknown>) => { work.push(promise); } } as ExecutionContext);
   const results = await Promise.allSettled(work);
-  assert.equal(work.length, 3);                                                  // the project file sweep joins
+  assert.equal(work.length, 4);                                                  // the project file and artefact sweeps join
   assert.equal(results.filter(result => result.status === "rejected").length, 1);
   const remaining = f.db.prepare("SELECT anonymous, actor_key FROM artifact_runtime_state").all();
   assert.deepEqual(remaining.results.map(row => row.actor_key), [await Effect.runPromise(sha256hex("user:owner"))]);
@@ -150,6 +150,22 @@ test("scheduled cleanup sweeps deleted project files", async (t) => {
   await Promise.allSettled(work);
   assert.equal(f.db.prepare("SELECT COUNT(*) AS n FROM project_files").first<{ n: number }>()?.n, 0);
   assert.equal(bucket.objects.has(`file/${id}.enc`), false);
+});
+
+test("scheduled cleanup purges withdrawn artefacts", async (t) => {
+  const f = await fixture(t);
+  const at = new Date(Date.now() - 2 * 3_600_000).toISOString();
+  const bucket = memoryBucket();
+  await bucket.put(`art/${f.artifact.id}/1-0000000000000000.enc`, new Uint8Array(33));
+  f.db.prepare("UPDATE artifacts SET deleted_at = ?, current_version = 0, key_wrap_master = NULL WHERE id = ?").bind(at, f.artifact.id).run();
+  const work: Promise<unknown>[] = [];
+  await worker.scheduled({} as ScheduledController, {
+    DB: f.db, ARTIFACTS: bucket, RATELIMIT: rateLimitBinding(), ARTEFACTS_MASTER_KEY: MASTER, PUBLIC_ORIGIN: ORIGIN,
+  }, { waitUntil: (promise: Promise<unknown>) => { work.push(promise); } } as ExecutionContext);
+  await Promise.allSettled(work);
+  assert.equal(bucket.objects.size, 0);
+  assert.equal(f.db.prepare("SELECT COUNT(*) AS n FROM artifact_versions WHERE artifact_id = ?").bind(f.artifact.id).first<{ n: number }>()?.n, 0);
+  assert.ok(f.db.prepare("SELECT purged_at FROM artifacts WHERE id = ?").bind(f.artifact.id).first<{ purged_at: string | null }>()?.purged_at);
 });
 
 test("shared writes use live colleague authority and a share never borrows its signed-in holder's editing right", async (t) => {

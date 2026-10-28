@@ -1,7 +1,7 @@
 # 28. HeroUI console and opaque-origin artefact applications
 
 Date: 2026-09-30
-Status: Accepted; implementation is not yet deployed
+Status: Accepted for the opaque-origin runtime and application-data model; console framework superseded by [ADR 0030](0030-solid-2-solid-ui-and-dynamic-console.md)
 
 ## Context and problem
 
