@@ -210,35 +210,40 @@ export default {
 
   async fetch(request: Request, env: WorkerEnv): Promise<Response> {
     setWebAnalyticsToken(env.WEB_ANALYTICS_TOKEN);
-    const url = new URL(request.url);
+    const isHead = request.method === "HEAD";
+    const dispatchRequest = isHead ? new Request(request, { method: "GET" }) : request;
+    const finish = (response: Response) => isHead
+      ? new Response(null, { status: response.status, statusText: response.statusText, headers: response.headers })
+      : response;
+    const url = new URL(dispatchRequest.url);
     const origin = String(env.PUBLIC_ORIGIN || "").replace(/\/$/, "");
     const legacy = String(env.LEGACY_HOSTS || "").split(",").map(h => h.trim().toLowerCase()).filter(Boolean);
-    if (origin && legacy.includes(url.hostname)) return redirect(origin + url.pathname + url.search, {}, 308);
+    if (origin && legacy.includes(url.hostname)) return finish(redirect(origin + url.pathname + url.search, {}, 308));
     if (url.pathname.startsWith("/_ui/")) {
-      return env.ASSETS?.fetch ? env.ASSETS.fetch(request) : json({ error: "not_found" }, 404);
+      return finish(env.ASSETS?.fetch ? await env.ASSETS.fetch(dispatchRequest) : json({ error: "not_found" }, 404));
     }
-    const match = route(request.method, url.pathname);
+    const match = route(dispatchRequest.method, url.pathname);
     if (!match) {
       if (env.ASSETS?.fetch) {
         // Keep the 1.x `/assets/*` URLs while Wrangler mounts this small asset directory at `/`.
-        const assetUrl = new URL(request.url);
+        const assetUrl = new URL(dispatchRequest.url);
         if (assetUrl.pathname.startsWith("/assets/")) {
           assetUrl.pathname = assetUrl.pathname.slice("/assets".length);
-          return env.ASSETS.fetch(new Request(assetUrl, request));
+          return finish(await env.ASSETS.fetch(new Request(assetUrl, dispatchRequest)));
         }
-        return env.ASSETS.fetch(request);
+        return finish(await env.ASSETS.fetch(dispatchRequest));
       }
-      return json({ error: "not_found" }, 404);
+      return finish(json({ error: "not_found" }, 404));
     }
 
-    const program = responseProgram(request, env, match).pipe(
+    const program = responseProgram(dispatchRequest, env, match).pipe(
       Effect.catchCause((cause) => Effect.sync(() => {
         const error = Cause.squash(cause);
         console.error("artefacts67 request error", error);
         return json({ error: "internal_error" }, 500);
       })),
     );
-    return Effect.runPromise(program);
+    return finish(await Effect.runPromise(program));
   },
 };
 

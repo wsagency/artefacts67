@@ -10,8 +10,14 @@ All notable changes to this project are documented in this file. The format is b
 - Source code link on the documentation page and the sign-in screens.
 - Withdrawn artefacts' stored versions and application data are removed at the first daily
   cleanup at least an hour after their deletion, at most 100 artefacts per cleanup (ADR 0038).
+- AI instructions include a native-dialog recipe for recording acknowledgement before an in-artefact download.
+- Console sidebar footer can copy the AI instructions to the clipboard.
+
+### Fixed
+- Gated folder shares ignore individually withdrawn artefacts during key synchronization.
 
 ### Changed
+- `HEAD` follows `GET` routes with matching status and headers and no response body, including static assets.
 - Pinned dependencies refreshed to current stable releases and Solid 2 RC.19, including TypeScript 7,
   Vite 8.3.5, and Wrangler 4.154.0. CI now uses Node 24. Worker `allowScripts` pins permit the
   esbuild and workerd install scripts required for clean npm 11 installs; `frontend/src/vite-env.d.ts`

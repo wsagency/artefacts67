@@ -253,7 +253,7 @@ export function openShares({
       return;
     }
     const shareKeyHex = yield* shareKeyOf(share);
-    const scope = yield* scopeOf(share);
+    const scope = (yield* scopeOf(share)).filter((artifact) => artifacts.live(artifact));
     const wanted = new Set(scope.map((artifact) => artifact.id));
     const { results } = yield* Effect.tryPromise({
       try: async () => db.prepare("SELECT artifact_id FROM share_keys WHERE share_id = ?").bind(share.id).all<{ artifact_id: string }>(),
@@ -285,7 +285,9 @@ export function openShares({
     for (const share of keep.values()) if (!wrapped.has(share.id)) yield* writeWrap(share, artifact, yield* shareKeyOf(share));
   });
   const syncFolder = (folderId: unknown) => Effect.gen(function* () {
-    for (const artifact of yield* artifactsIn(yield* folders.subtreeIds(folderId))) yield* syncArtifact(artifact.id);
+    for (const artifact of yield* artifactsIn(yield* folders.subtreeIds(folderId))) {
+      if (artifacts.live(artifact)) yield* syncArtifact(artifact.id);
+    }
   });
 
   const requireManage = (actorId: unknown, kind: unknown, targetId: unknown): Effect.Effect<ManagedTarget, CodeError> => Effect.gen(function* () {

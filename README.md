@@ -109,6 +109,8 @@ folder paths; use arrow keys and Enter to navigate. **Create new top folder**, *
 **Create artefact**, and **Share** use the positioned resource: nested creation uses the
 selected folder or the selected artefact's folder, and Share opens existing sharing options
 without granting access automatically. Position is retained across same-route form responses.
+The sidebar footer's **Copy AI prompt** button fetches `/llms.txt` and copies the agent instructions
+to the clipboard, with an accessible success or failure announcement.
 
 `/instructions` documents the platform for people and agents. `DESIGN_TEMPLATE_URL` optionally
 names a fallback design template that agents use when the user has not specified a design.

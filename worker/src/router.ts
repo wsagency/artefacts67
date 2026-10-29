@@ -69,8 +69,9 @@ export interface RouteMatch { handler: RouteHandler; params: RouteParams }
 
 // Pure so plain `node --test` can exercise it without workerd.
 export function route(method: string, pathname: string): RouteMatch | null {
+  const effectiveMethod = method === "HEAD" ? "GET" : method;
   for (const r of routes) {
-    if ("method" in r && r.method !== method) continue;
+    if ("method" in r && r.method !== effectiveMethod) continue;
     const match = r.pattern.exec(pathname);
     if (match) return { handler: r.handler, params: (match.groups ?? {}) as RouteParams };
   }

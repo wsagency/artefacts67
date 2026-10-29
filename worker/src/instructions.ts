@@ -51,6 +51,32 @@ const ENDPOINTS = [
   ["GET", "/_api/contract", "Public", "Canonical Markdown API, validator, and SDK reference"],
 ];
 
+const TERMS_CODE = `<dialog id="terms">
+  <form id="terms-form">
+    <p>Read and accept the terms before downloading this project file.</p>
+    <label><input id="accepted" type="checkbox" required> I accept these terms.</label>
+    <p id="terms-error" role="alert"></p>
+    <button type="submit">Accept</button>
+    <button id="cancel" type="button">Cancel</button>
+  </form>
+</dialog>
+<script>
+const dialog = document.querySelector("#terms"), form = document.querySelector("#terms-form");
+dialog.showModal(); document.querySelector("#accepted").focus();
+document.querySelector("#cancel").addEventListener("click", () => dialog.close());
+form.addEventListener("submit", async event => {
+  event.preventDefault(); if (!form.reportValidity()) return;
+  try {
+    if (!window.artefacts?.data) throw new Error("Open this artefact in the hosted viewer.");
+    await window.artefacts.data.submit("download-terms", { accepted: true, termsVersion: "2026-01" });
+    await window.artefacts.data.download("assets", recordId, fileId);
+    dialog.close();
+  } catch {
+    document.querySelector("#terms-error").textContent = "Could not record acceptance or download the file. Try again.";
+  }
+});
+</script>`;
+
 export function agentInstructions(origin: string, env: DocsEnv): string {
   const template = String(env.DESIGN_TEMPLATE_URL ?? "").trim();
   return `# Artefacts67: instructions for AI agents
@@ -90,6 +116,16 @@ Use window.artefacts.storage inside the published viewer. get(key, options) reso
 ## Project data and MCP
 A project is an artefact's top-level folder. Define declarative collections with PUT /_api/projects/<folder>/collections/<name> and body { kind: "records" | "responses", fields, visitors? }; a redefining PUT replaces fields and visitors, so omitting visitors resets it to false. Field types are text, email, number, boolean, date, choice, and file (maxBytes, accept, multiple), each optionally required (a required boolean must be true: the explicit confirmation). records collections hold shared data you create, update (optional ifVersion), and delete; responses collections hold reader submissions you can only list, get, and delete with manage authority. Only wak_ master keys reach project data and MCP; a waa_ key gets 403. MCP is POST /_mcp (stateless JSON-RPC 2.0, same Authorization header) with tools list_folders, list_artifacts, publish_artifact, list_collections, define_collection, delete_collection, list_records, get_record, create_record, update_record, delete_record, start_upload, get_upload, complete_upload, cancel_upload, and get_file. To store a file in a records collection: POST /_api/projects/<folder>/collections/<name>/uploads (or start_upload) with { field, name, type, size, lastModified }; PUT each part n (1…upload.parts, upload.partBytes each, the last the remainder) to upload.partPath + n on this origin with the same Bearer key and Content-Type: application/octet-stream; POST …/uploads/<id>/complete (or complete_upload); then put the returned file id in the field with create_record/update_record within 24 h. Starting the same file again resumes it: re-send only parts missing from upload.received or whose size or sha256 differ. Agents cannot upload to responses collections. Bytes never go through MCP; download with GET file.downloadPath (from get_file) and the same key. Files are not malware-scanned, and a gated artefact protects its project's files by authorization, not by the document password. Inside an artefact, use window.artefacts.data: list/get/create/update/delete for records, submit(collection, eventOrFormOrObject)/mine for responses; a share visitor reaches a collection only when visitors is true. Build native <form> controls whose names match the fields, call submit(collection, event) in the form's submit listener (the event adds the clicked button's name/value), and show a failure on rejection. Selected file inputs and File values in create/update/submit are uploaded first (optional last argument { onProgress }); upload(collection, field, file, { onProgress, signal }) uploads one file, file(collection, recordId, fileId) returns a File to display images, audio, or video in the frame, and download(collection, recordId, fileId) saves it. Uploads need a live runtime grant (1 h from opening); after "Runtime access expired", reopen the artefact and re-pick the file to resume. A confirmation is an acknowledgement, not an e-signature or identity proof. Unfiled artefacts have no project (no-project). A top-level folder with collections cannot be nested until its collections are deleted.
 
+
+## Terms before a download inside an artefact
+Use this when an artefact offers its own downloads, such as project files through \`window.artefacts.data.download\` or generated files.
+First define a \`responses\` collection through the API or MCP, for example \`{kind:"responses", fields:{accepted:{type:"boolean",required:true}, termsVersion:{type:"text"}}, visitors:true}\` when share visitors must accept.
+Use a native \`<dialog>\` opened with \`showModal()\`; its terms, required checkbox and label, and Accept/Cancel buttons keep keyboard focus in the modal. Escape cancels. On acceptance, await \`window.artefacts.data.submit(collection, {accepted:true, termsVersion})\` before releasing a project-file download. Use a Blob download for generated content.
+The example assumes \`recordId\` and \`fileId\` identify the project file; replace the terms text and version for the actual terms. The acknowledgement is not an e-signature or identity proof. This recipe does not gate the viewer toolbar's Download, Copy, or Code controls.
+
+\`\`\`html
+${TERMS_CODE}
+\`\`\`
 ## MCP client setup
 Use the deployment's canonical origin (\`${origin}\`), not a redirecting legacy host: redirects drop the \`Authorization\` header. Before connecting, set \`ARTEFACTS67_KEY\` in your environment to a master key created under Settings → API keys. Do not paste the key into a command or config.
 
@@ -223,6 +259,7 @@ export function instructionsPage(origin: string, env: DocsEnv): string {
 
 <section id="ai"><h2>How to work with an AI agent</h2><ol><li>Give the agent this page and the <a href="/_api/contract">full contract</a>, or the machine-readable <a href="/llms.txt">AI instructions</a>.</li><li>Specify the exact goal, folder or artefact, whether this is a new publication or update, and who may access the result.</li><li>Supply an existing scoped key securely through the agent's tools or environment, not in the document or this page. Prefer an artefact-scoped key when only one existing artefact needs changes.</li><li>Let the agent use the documented write API for publication. For console-only actions, provide an authorized browser session or perform that step yourself. Provider security approval and consequential actions still require your confirmation.</li><li>Ask for the resulting URL, version, warnings, and the actions actually verified. Never accept a claimed share, restore, or deletion based only on a made-up API endpoint.</li></ol>
 <h3>Copy this briefing</h3><p>The same briefing is available as plain text at <a href="/llms.txt"><code>/llms.txt</code></a>. It contains no credentials.</p>${code(agentInstructions(origin, env), "brief")}
+<h3>Terms before a download inside an artefact</h3><p>Use this when an artefact offers its own project-file downloads or generated files. First define a <code>responses</code> collection through the API or MCP; set <code>visitors: true</code> when share visitors must accept. A native modal keeps focus inside; Escape cancels. Replace the sample terms, version, record ID, and file ID. Show errors and never download unless recording acceptance succeeds. This acknowledgement is not an e-signature. It does not gate the viewer toolbar's Download, Copy, or Code controls.</p>${code(TERMS_CODE)}
 <h3>First publication through the API</h3><p>Save the following complete payload as <code>artefact.json</code>. Replace the example folder and path with your intended target; repeating the same pair updates that artefact.</p>${code(BODY)}${code(curl(origin))}
 <p><code>201</code> means created; <code>200</code> means updated, privately in both cases. The response includes <code>artifact.url</code>, <code>artifact.version</code>, folder metadata, and <code>warnings</code>. The returned ordinary URL requires authorized sign-in; visitor sharing is separate. Review warnings. No publish job needs polling.</p>
 <h3>Change an additional gate or add an old link</h3><p>Use these bodies only for an explicitly requested change with the same authorization and JSON headers.</p><p><code>POST /_api/artifacts/rotate</code>: omit <code>password</code> to preserve the additional gate, a string sets it, and <code>null</code> removes only that gate—not private access or independent visitor-share passwords.</p>${code(ROTATE)}<p><code>POST /_api/artifacts/alias</code>: attach an old private path to the same artefact; a conflicting live or retired path is rejected. Aliases require the same authorized sign-in.</p>${code(ALIAS)}

@@ -82,6 +82,14 @@ test("operator and template values are escaped on the page, plain in llms.txt", 
   const txt = await (await worker.fetch(new Request("https://fork.example/llms.txt"), e)).text();
   assert.match(txt, /t\.html\?a=1&b="2"/);
 });
+test("terms download recipe records acceptance before project-file download", async () => {
+  const text = await (await worker.fetch(new Request("https://fork.example/llms.txt"), {} as WorkerEnv)).text();
+  assert.match(text, /## Terms before a download inside an artefact/);
+  assert.match(text, /\{kind:"responses", fields:\{accepted:\{type:"boolean",required:true\}/);
+  assert.match(text, /await window\.artefacts\.data\.submit\("download-terms"/);
+  assert.match(text, /Blob download for generated content/);
+  assert.match(text, /does not gate the viewer toolbar's Download, Copy, or Code/);
+});
 test("documentation is plain and uses ARTEFACTS67_KEY", async () => {
   const page = await (await worker.fetch(new Request("https://fork.example/instructions"), {} as WorkerEnv)).text();
   assert.match(page, /<h1>Artefacts67 documentation<\/h1>/);

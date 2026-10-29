@@ -100,6 +100,17 @@ export function ConsoleShell(props: { p: PageProps; screen: string; children: JS
   const [error, setError] = createSignal('');
   const [subfolder, setSubfolder] = createSignal<FolderModel | null>(null);
   const [dragTarget, setDragTarget] = createSignal<string | null>(null);
+  const [aiPromptStatus, setAiPromptStatus] = createSignal('');
+  async function copyAiPrompt(): Promise<void> {
+    try {
+      const response = await fetch('/llms.txt');
+      if (!response.ok) throw new Error('Unable to fetch the AI prompt.');
+      await navigator.clipboard.writeText(await response.text());
+      setAiPromptStatus('AI prompt copied');
+    } catch {
+      setAiPromptStatus('Unable to copy the AI prompt.');
+    }
+  }
   let drag: DragPayload | null = null;
   let resize: { x: number; width: number } | null = null;
   let logout: HTMLFormElement | undefined;
@@ -254,6 +265,8 @@ export function ConsoleShell(props: { p: PageProps; screen: string; children: JS
         <footer class="account">
           <div class="preference-row" role="group" aria-label="Sidebar text size"><For each={['s', 'm', 'l'] as const}>{option => <Button size="sm" variant={size() === option ? 'secondary' : 'ghost'} aria-pressed={(size() === option) ? 'true' : 'false'} onClick={() => setSize(option)}>{option.toUpperCase()}</Button>}</For></div>
           <div class="preference-row" role="group" aria-label="Console theme"><For each={['original', 'light', 'calm']}>{option => <Button size="sm" variant={theme() === option ? 'secondary' : 'ghost'} aria-pressed={(theme() === option) ? 'true' : 'false'} onClick={() => setTheme(option)}>{option[0].toUpperCase() + option.slice(1)}</Button>}</For></div>
+          <Button size="sm" variant="secondary" onClick={() => { void copyAiPrompt(); }}>Copy AI prompt</Button>
+          <p class="sr-only" aria-live="polite">{aiPromptStatus()}</p>
           <Menu label="Account menu" trigger={<><span>{props.p.me.name || props.p.me.email}</span><small>{roleLabel(props.p.me.role)}</small></>} class="account-trigger" align="end">
             <MenuLink href="/settings">Profile &amp; security</MenuLink>
             <MenuLink href="/settings/keys">API keys</MenuLink>

@@ -715,3 +715,41 @@ test("share gates reject unreadable bodies and failed limiter checks without rel
   const payload = await opened.json() as ShareGatePayload;
   assert.equal(await openAsRecipient(payload, "pw"), HTML);
 });
+
+test("creating a password-protected folder share succeeds when its subtree contains a deleted artefact", async () => {
+  const env = await environment();
+  const folder = await Effect.runPromise(env.folders.create({ ownerId: env.owner.id, name: "Client", slug: "client" }));
+  const live = await Effect.runPromise(env.artifacts.create({
+    ownerId: env.owner.id, folderId: folder.id, title: "Live", html: HTML, authorId: env.owner.id,
+  }));
+  const deleted = await Effect.runPromise(env.artifacts.create({
+    ownerId: env.owner.id, folderId: folder.id, title: "Withdrawn", html: OTHER_HTML, authorId: env.owner.id,
+  }));
+  await Effect.runPromise(env.artifacts.remove(deleted.id, { authorId: env.owner.id }));
+
+  const share = await Effect.runPromise(env.shares.create({
+    actorId: env.owner.id, kind: "folder", targetId: folder.id, name: "Client visitors", password: "visitor-password",
+  }));
+  assert.equal(share.gated, true);
+  assert.deepEqual((await Effect.runPromise(env.shares.contents(share.id))).map((artifact) => artifact.id), [live.id]);
+});
+
+test("moving a shared folder succeeds when its subtree contains a deleted artefact", async () => {
+  const env = await environment();
+  const folder = await Effect.runPromise(env.folders.create({ ownerId: env.owner.id, name: "Client", slug: "client" }));
+  const destination = await Effect.runPromise(env.folders.create({ ownerId: env.owner.id, name: "Other", slug: "other" }));
+  await Effect.runPromise(env.artifacts.create({
+    ownerId: env.owner.id, folderId: folder.id, title: "Live", html: HTML, authorId: env.owner.id,
+  }));
+  const deleted = await Effect.runPromise(env.artifacts.create({
+    ownerId: env.owner.id, folderId: folder.id, title: "Withdrawn", html: OTHER_HTML, authorId: env.owner.id,
+  }));
+  await Effect.runPromise(env.shares.create({
+    actorId: env.owner.id, kind: "folder", targetId: folder.id, name: "Client visitors", password: "visitor-password",
+  }));
+  await Effect.runPromise(env.artifacts.remove(deleted.id, { authorId: env.owner.id }));
+  env.folders.onChange = (folderId) => env.shares.syncFolder(folderId);
+
+  const moved = await Effect.runPromise(env.folders.setParent(folder.id, destination.id));
+  assert.equal(moved.parentId, destination.id);
+});
