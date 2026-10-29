@@ -1,7 +1,8 @@
-import { untrack } from 'solid-js';
+import { createSignal, untrack } from 'solid-js';
 import { Panel, Field, Choice, PostForm, DataTable, CopyValue, roleLabel, stamp } from './ui';
 import { Passkey } from './auth';
 import { Analytics } from './collaboration';
+import { KeyCreationForm } from './key-creation-form';
 import type { PageProps } from './types';
 
 export function Settings(props: { p: PageProps }) {
@@ -18,7 +19,17 @@ export function Keys(props: { p: PageProps }) {
   const artifacts = p.artifacts ?? [];
   const revoked = (key: (typeof keys)[number]): boolean => Boolean(key.revokedAt ?? key.revoked_at);
   const hasMaster = keys.some(key => key.kind === 'master' && !revoked(key));
-  return <><h1>API keys</h1><p class="muted">Full keys appear only once, immediately after creation or rotation.</p>{p.secret && <Panel title="Copy the new key now"><CopyValue value={p.secret} label="Copy API key" /></Panel>}<Panel title="New key"><PostForm action="/settings/keys/mint" csrf={me.csrf} submit="Create key"><Choice name="kind" label="Kind" options={[['artifact', 'Artefact key'], ...(!hasMaster ? [['master', 'Master key'] as [string, string]] : [])]} />{hasMaster && <p class="muted">A master key already exists. Rotate it rather than creating another.</p>}<Choice name="artifactId" label="Artefact (for an artefact key)" options={artifacts.map(artifact => [artifact.id, artifact.slug || artifact.id])} />{!artifacts.length && <p class="muted">Publish an artefact before creating an artefact key.</p>}<Choice name="scopes" label="Scope (for an artefact key)" options={[['read', 'Read'], ['write', 'Write'], ['read_write', 'Read and write']]} /></PostForm></Panel><Panel title="Your keys"><DataTable headers={['Key', 'Kind', 'Artefact', 'Scope', 'Created', 'Last used', 'Status', 'Actions']} rows={keys.map(key => { const id = key.artifactId ?? key.artifact_id; return [<><span>{key.prefix}</span><small>{key.label}</small></>, key.kind, id ? (artifacts.find(artifact => artifact.id === id)?.slug || id) : '—', key.scopes, stamp(key.createdAt), stamp(key.lastUsedAt) || '—', revoked(key) ? 'Revoked' : 'Active', !revoked(key) && <div class="row"><PostForm action="/settings/keys/rotate" csrf={me.csrf} hidden={{ keyId: key.id }} submit="Rotate" /><PostForm action="/settings/keys/revoke" csrf={me.csrf} hidden={{ keyId: key.id }} submit="Revoke" danger /></div>]; })} /></Panel><Panel title="Documentation"><a href="/_api/contract">API contract</a> · <a href="/instructions">Agent onboarding</a></Panel></>;
+  const [kind, setKind] = createSignal('artifact');
+  return <>
+    <h1>API keys</h1><p class="muted">Full keys appear only once, immediately after creation or rotation.</p>
+    {p.secret && <Panel title="Copy the new key now"><CopyValue value={p.secret} label="Copy API key" /></Panel>}
+    <Panel title="New key"><KeyCreationForm kind={kind()} onKindChange={setKind} hasMaster={hasMaster} csrf={me.csrf} artifacts={artifacts} /></Panel>
+    <Panel title="Your keys"><DataTable headers={['Key', 'Kind', 'Artefact', 'Scope', 'Created', 'Last used', 'Status', 'Actions']} rows={keys.map(key => {
+      const id = key.artifactId ?? key.artifact_id;
+      return [<><span>{key.prefix}</span><small>{key.label}</small></>, key.kind, id ? (artifacts.find(artifact => artifact.id === id)?.slug || id) : '—', key.scopes, stamp(key.createdAt), stamp(key.lastUsedAt) || '—', revoked(key) ? 'Revoked' : 'Active', !revoked(key) && <div class="row"><PostForm action="/settings/keys/rotate" csrf={me.csrf} hidden={{ keyId: key.id }} submit="Rotate" /><PostForm action="/settings/keys/revoke" csrf={me.csrf} hidden={{ keyId: key.id }} submit="Revoke" danger /></div>];
+    })} /></Panel>
+    <Panel title="Documentation"><a href="/_api/contract">API contract</a> · <a href="/instructions">Agent onboarding</a></Panel>
+  </>;
 }
 
 export function AdminHome(props: { p: PageProps }) {

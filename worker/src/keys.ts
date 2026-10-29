@@ -40,15 +40,15 @@ export type KeyKind = "master" | "artifact";
 export type KeyScopes = "master" | "read" | "write" | "read_write";
 export interface KeyRow {
   id: string; user_id: string; kind: KeyKind; artifact_id: string | null;
-  label: string | null; token_hash: string; prefix: string; scopes: KeyScopes;
+  label: string | null; token_hash: string; prefix: string; scopes: KeyScopes; can_read_content: number;
   created_at: string; revoked_at: string | null; last_used_at: string | null;
 }
 export interface Key {
   id: string; userId: string; kind: KeyKind; artifactId: string | null; label: string;
-  prefix: string; scopes: KeyScopes; createdAt: string; revokedAt: string | null; lastUsedAt: string | null;
+  prefix: string; scopes: KeyScopes; can_read_content: boolean; createdAt: string; revokedAt: string | null; lastUsedAt: string | null;
 }
 export interface MintKey {
-  userId: string; kind: unknown; artifactId?: string | null; scopes: unknown; label?: unknown;
+  userId: string; kind: unknown; artifactId?: string | null; scopes: unknown; label?: unknown; can_read_content?: boolean;
 }
 export interface MintedKey { key: string; record: Key }
 export interface KeyAuthentication { key: Key; user: UserRow; artifact: ArtifactRow | null }
@@ -82,7 +82,7 @@ function toKey(row: KeyRow | null | undefined): Key | null;
 function toKey(row: KeyRow | null | undefined): Key | null {
   return row ? {
     id: row.id, userId: row.user_id, kind: row.kind, artifactId: row.artifact_id ?? null,
-    label: row.label ?? "", prefix: row.prefix, scopes: row.scopes, createdAt: row.created_at,
+    label: row.label ?? "", prefix: row.prefix, scopes: row.scopes, can_read_content: row.can_read_content === 1, createdAt: row.created_at,
     revokedAt: row.revoked_at ?? null, lastUsedAt: row.last_used_at ?? null,
   } : null;
 }
@@ -104,7 +104,7 @@ export function openKeys({ db, audit, access }: {
     byId: Effect.fn(function* (id: unknown) {
       return toKey(yield* io(() => db.prepare("SELECT * FROM api_keys WHERE id = ?").bind(String(id ?? "")).first<KeyRow>()));
     }),
-    mint: Effect.fn(function* ({ userId, kind, artifactId = null, scopes: rawScopes, label = null }: MintKey) {
+    mint: Effect.fn(function* ({ userId, kind, artifactId = null, scopes: rawScopes, label = null, can_read_content = false }: MintKey) {
       if (!userId) return yield* Effect.fail(coded("invalid-user", "a key needs its owner"));
       if (kind !== "master" && kind !== "artifact") return yield* Effect.fail(coded("invalid-kind", "kind must be 'master' or 'artifact'"));
       if (kind === "master" && artifactId != null) return yield* Effect.fail(coded("invalid-artifact", "a master key is never bound to one artefact"));
@@ -128,10 +128,10 @@ export function openKeys({ db, audit, access }: {
       const prefix = key.slice(0, 8), id = yield* randomHex(8), at = nowIso();
       const hash = yield* sha256hex(key);
       yield* io(() => db.prepare(
-        "INSERT INTO api_keys (id, user_id, kind, artifact_id, token_hash, prefix, scopes, label, created_at) VALUES (?,?,?,?,?,?,?,?,?)",
-      ).bind(id, userId, kind, bound, hash, prefix, scopes, cleanLabel, at).run());
+        "INSERT INTO api_keys (id, user_id, kind, artifact_id, token_hash, prefix, scopes, label, can_read_content, created_at) VALUES (?,?,?,?,?,?,?,?,?,?)",
+      ).bind(id, userId, kind, bound, hash, prefix, scopes, cleanLabel, can_read_content === true ? 1 : 0, at).run());
       yield* audit.write({ actorType: "user", actorId: userId, action: "key.mint", artifactId: bound, detail: { kind, artifactId: bound, prefix } });
-      return { key, record: { id, userId, kind, artifactId: bound, label: cleanLabel, prefix, scopes, createdAt: at, revokedAt: null, lastUsedAt: null } };
+      return { key, record: { id, userId, kind, artifactId: bound, label: cleanLabel, prefix, scopes, can_read_content: can_read_content === true, createdAt: at, revokedAt: null, lastUsedAt: null } };
     }),
     authenticate: Effect.fn(function* (request: Pick<Request, "headers">) {
       const presented = BEARER.exec(request.headers.get("authorization") ?? "");

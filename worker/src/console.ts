@@ -1565,7 +1565,10 @@ function keysMutation(request: Request, ctx: ConsoleContext, active: CurrentSess
         const artifactId = kind === "artifact" ? String(values.artifactId ?? "").trim() : null;
         if (kind === "artifact" && !artifactId) return yield* Effect.fail(fail("bad-action", "Choose the artifact the key belongs to."));
         const scopes = kind === "master" ? "master" : ["read", "write", "read_write"].includes(values.scopes) ? values.scopes : "read";
-        const result = yield* ctx.keys.mint({ userId: active.user.id, kind, artifactId, scopes, label: null });
+        const result = yield* ctx.keys.mint({
+          userId: active.user.id, kind, artifactId, scopes, label: null,
+          can_read_content: kind === "master" && values.can_read_content === "1",
+        });
         return yield* keysScreen(ctx, active, { secret: result.key });
       }
 

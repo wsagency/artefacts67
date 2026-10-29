@@ -35,11 +35,17 @@ const TOOLS: Tool[] = [
     inputSchema: { type: "object", properties: {} }, call: () => ({ method: "GET", rest: "folders" }) },
   { name: "list_artifacts", description: "List artefacts this key can reach (metadata only).",
     inputSchema: { type: "object", properties: {} }, call: () => ({ method: "GET", rest: "artifacts" }) },
+  { name: "get_artifact", description: "Read an explicitly authorized artefact version.",
+    inputSchema: { type: "object", properties: {
+      artifact: string("Artefact slug or id."), version: { type: "integer", minimum: 1, description: "Retained version (defaults to current)." },
+    }, required: ["artifact"] },
+    call: (args) => ({ method: "GET", rest: `artifacts/${segment(args.artifact)}/content`, query: { version: args.version } }) },
   { name: "publish_artifact", description: "Publish or update one self-contained HTML artefact in a folder.",
     inputSchema: { type: "object", properties: {
       folder: string("Folder slug; created when missing."), slug: string("Artefact slug."), title: string("Title."),
       html: string("Complete HTML document."), folderName: string("Display name for a new folder."),
       lang: string("Document language."), password: string("Optional artefact password."), note: string("Version note."),
+      ifVersion: { type: "integer", minimum: 1, description: "Only publish when the current version matches." },
     }, required: ["folder", "slug", "title", "html"] },
     call: (args) => ({ method: "POST", rest: "artifacts", body: args }) },
   { name: "list_collections", description: "List a project's data collections.",
@@ -118,7 +124,6 @@ export function handleMcp(request: Request, ctx: ApiContext): Effect.Effect<Resp
     if (!who) {
       return json({ error: { code: "unauthorized", message: "A valid API key is required (Authorization: Bearer <key>)." } }, 401);
     }
-    if (who.key.kind !== "master") return json({ error: { code: "forbidden", message: "MCP needs a master key." } }, 403);
     const parsed = yield* readJson(request, API_BODY_LIMIT + 64 * 1024).pipe(
       Effect.map((body) => ({ body })),
       Effect.catch((error) => Effect.succeed({ error })),
@@ -140,6 +145,17 @@ export function handleMcp(request: Request, ctx: ApiContext): Effect.Effect<Resp
     if (typeof message.id !== "string" && typeof message.id !== "number") return rpcError(null, -32600, "Invalid request: id is a string or a number.");
     const id: RpcId = message.id;
     const params = isObject(message.params) ? message.params : {};
+    let canDiscoverContent = false;
+    if (who.key.kind === "artifact" && who.key.can_read_content && ctx.keys.hasScope(who.key, "read") && who.artifact) {
+      canDiscoverContent = yield* ctx.keys.may(who.key, {
+        ownerId: who.artifact.owner_id, folderId: who.artifact.folder_id, artifactId: who.artifact.id,
+      }, "read");
+    }
+    const lifecycle = message.method === "initialize" || message.method === "ping" || message.method === "tools/list";
+    const contentCall = message.method === "tools/call" && params.name === "get_artifact";
+    if (who.key.kind !== "master" && !lifecycle && !contentCall) {
+      return json({ error: { code: "forbidden", message: "This MCP operation needs a master key; artifact keys are limited to authorized get_artifact reads." } }, 403);
+    }
 
     switch (message.method) {
       case "initialize": {
@@ -148,7 +164,8 @@ export function handleMcp(request: Request, ctx: ApiContext): Effect.Effect<Resp
         return reply(id, { protocolVersion, capabilities: { tools: {} }, serverInfo: { name: "artefacts67", version: "2.0.0" } });
       }
       case "ping": return reply(id, {});
-      case "tools/list": return reply(id, { tools: MCP_TOOLS });
+      case "tools/list": return reply(id, { tools: who.key.kind === "master" ? MCP_TOOLS
+        : canDiscoverContent ? MCP_TOOLS.filter(({ name }) => name === "get_artifact") : [] });
       case "tools/call": {
         const tool = TOOLS.find((candidate) => candidate.name === params.name);
         if (!tool) return rpcError(id, -32602, `Unknown tool ${String(params.name)}.`);

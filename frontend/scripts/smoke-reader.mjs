@@ -1,5 +1,6 @@
 // Node 22+, Chrome, and an authenticated local smoke artefact are required.
-// WS_SMOKE_VIEWER, WS_SMOKE_SESSION, WS_SMOKE_CHROME, and WS_SMOKE_API_KEY (a local wak_ master key) are explicit inputs.
+// WS_SMOKE_VIEWER, WS_SMOKE_SESSION, WS_SMOKE_CHROME, WS_SMOKE_API_KEY (local content-read wak_ master), and WS_SMOKE_NOREAD_API_KEY (local key without content-read capability) are required.
+// WS_SMOKE_OWNER_SESSION is optional and is used only for cleanup console POSTs.
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { createHash, randomBytes } from 'node:crypto';
@@ -11,10 +12,12 @@ import { setTimeout as delay } from 'node:timers/promises';
 const viewer = new URL(process.env.WS_SMOKE_VIEWER ?? '');
 assert(['localhost', '127.0.0.1'].includes(viewer.hostname), 'This mutating check is local-only.');
 assert(process.env.WS_SMOKE_SESSION && process.env.WS_SMOKE_CHROME, 'Supply the local session and Chrome executable.');
-assert(process.env.WS_SMOKE_API_KEY?.startsWith('wak_'), 'Supply a local master key (never a production one).');
+assert(process.env.WS_SMOKE_API_KEY?.startsWith('wak_'), 'Supply a local content-read master key (never a production one).');
+assert(/^(wak_|waa_)/.test(process.env.WS_SMOKE_NOREAD_API_KEY ?? ''), 'Supply a separate local key without can_read_content (never a production one).');
 const profile = await mkdtemp(join(tmpdir(), 'ws-reader-check-'));
 const chrome = spawn(process.env.WS_SMOKE_CHROME, ['--headless=new', '--no-first-run', '--no-default-browser-check', '--remote-debugging-port=0', `--user-data-dir=${profile}`, 'about:blank'], { stdio: ['ignore', 'ignore', 'pipe'] });
 let socket;
+let settingsMasterKey;
 try {
   const endpoint = await new Promise((resolve, reject) => {
     let logs = '';
@@ -219,6 +222,74 @@ try {
   await evaluate('document.querySelector(\'nav.section-nav a[href="/settings/keys"]\').click()');
   await until('location.pathname==="/settings/keys" && !!document.querySelector(\'main form[action="/settings/keys/mint"]\')');
   assert(await evaluate('document.querySelector("aside.sidebar")===settingsSidebar'), 'API-key navigation must preserve the sidebar owner.');
+  assert(await evaluate('(() => { const form=document.querySelector(\'main form[action="/settings/keys/mint"]\'); const kind=form.querySelector(\'select[name="kind"]\'); return !!kind && Array.from(kind.options).some(option=>option.value==="master") && !form.querySelector(\'input[name="can_read_content"]\'); })()'), 'A dedicated local smoke user must not see a content-read checkbox while creating an artefact key.');
+  await evaluate('(() => { const form=document.querySelector(\'main form[action="/settings/keys/mint"]\'); const kind=form.querySelector(\'select[name="kind"]\'); kind.value="master"; kind.dispatchEvent(new Event("change",{bubbles:true})); return true; })()');
+  await until('!!document.querySelector(\'main form[action="/settings/keys/mint"] input[name="can_read_content"]\')');
+  assert(await evaluate('(() => { const form=document.querySelector(\'main form[action="/settings/keys/mint"]\'); const capability=form.querySelector(\'input[name="can_read_content"]\'); return capability && !capability.checked; })()'), 'The master-key option must show an unchecked content-read checkbox.');
+  await evaluate('(() => { const form=document.querySelector(\'main form[action="/settings/keys/mint"]\'); form.querySelector(\'input[name="can_read_content"]\').checked=true; form.requestSubmit(); return true; })()');
+  await until('document.querySelector("main h1")?.textContent==="API keys" && document.querySelector("main h2")?.textContent==="Copy the new key now"');
+  const contentKey = await evaluate('document.querySelector("main input[readonly]")?.value');
+  settingsMasterKey = contentKey;
+  assert(contentKey?.startsWith("wak_"), 'The one-time token notice remains intact after minting the opted-in master key.');
+  const viewerArtifact = /^\/app\/a\/([^/]+)\/view\/?$/.exec(viewer.pathname);
+  assert(viewerArtifact, 'Use the prescribed local /app/a/<smoke-slug>/view URL.');
+  const artifactRef = decodeURIComponent(viewerArtifact[1]);
+  const artifactListResponse = await fetch(new URL('/_api/artifacts', viewer.origin), {
+    headers: { Authorization: `Bearer ${process.env.WS_SMOKE_API_KEY}` },
+  });
+  assert.equal(artifactListResponse.status, 200, 'The local master key must list the smoke fixture.');
+  const fixture = (await artifactListResponse.json()).artifacts.find(artifact =>
+    artifact.id === artifactRef || artifact.slug === artifactRef);
+  assert(fixture, 'The reader URL must identify the dedicated Solid 2 smoke artefact.');
+  const contentPath = `/_api/artifacts/${encodeURIComponent(artifactRef)}/content?version=${fixture.version}`;
+  const contentResponse = await fetch(new URL(contentPath, viewer.origin), {
+    headers: { Authorization: `Bearer ${process.env.WS_SMOKE_API_KEY}` },
+  });
+  assert.equal(contentResponse.status, 200, 'The local content-read wak_ key must read artefact content.');
+  const content = await contentResponse.json();
+  assert.equal(content.version, fixture.version);
+  assert.equal(content.artifact.version, fixture.version);
+  assert.equal(content.title, fixture.title, 'The returned title must match current fixture metadata.');
+  assert.match(content.html, /Solid 2 smoke/, 'The authorized read must return the fixture HTML.');
+  console.log(`content read (HTTP): ${artifactRef} version=${content.version} capability=allowed`);
+  const uiContentResponse = await fetch(new URL(contentPath, viewer.origin), {
+    headers: { Authorization: `Bearer ${contentKey}` },
+  });
+  assert.equal(uiContentResponse.status, 200, 'The opted-in key created through Settings must read artefact content.');
+  console.log(`content read (HTTP): ${artifactRef} version=${fixture.version} capability=allowed (Settings key)`);
+  const deniedContent = await fetch(new URL(contentPath, viewer.origin), {
+    headers: { Authorization: `Bearer ${process.env.WS_SMOKE_NOREAD_API_KEY}` },
+  });
+  assert.equal(deniedContent.status, 403, 'A local wak_ key without can_read_content must be refused.');
+  const stalePublish = await fetch(new URL('/_api/artifacts', viewer.origin), {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${process.env.WS_SMOKE_API_KEY}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      folder: fixture.folder.slug,
+      slug: fixture.slug,
+      title: content.title,
+      lang: content.language,
+      html: content.html,
+      ifVersion: fixture.version + 1,
+    }),
+  });
+  assert.equal(stalePublish.status, 409, 'A stale conditional publish must conflict.');
+  const stalePublishBody = await stalePublish.json();
+  assert.equal(stalePublishBody.error?.code, 'conflict', 'A stale conditional publish must return a conflict envelope.');
+  assert.equal(stalePublishBody.error?.details?.currentVersion, fixture.version,
+    'The conflict must report the fixture’s current version.');
+  const unchangedContentResponse = await fetch(new URL(`/_api/artifacts/${encodeURIComponent(artifactRef)}/content`, viewer.origin), {
+    headers: { Authorization: `Bearer ${process.env.WS_SMOKE_API_KEY}` },
+  });
+  assert.equal(unchangedContentResponse.status, 200, 'The fixture must remain content-readable after a stale publish.');
+  const unchangedContent = await unchangedContentResponse.json();
+  assert.equal(unchangedContent.version, fixture.version, 'The stale publish must not change the fixture version.');
+  assert.equal(unchangedContent.html, content.html, 'The stale publish must not change the fixture HTML.');
+  console.log(`ifVersion (HTTP): stale publish rejected (409), currentVersion=${fixture.version}, fixture unchanged`);
+  console.log('content read (HTTP): capability=denied (403)');
   // Native forms inside the sandbox reach project responses through the SDK (ADR 0032).
   let mcpId = 0;
   const mcp = async (method, params) => {
@@ -388,6 +459,12 @@ document.getElementById('offer').addEventListener('submit', async (event) => {
   const csrf = (await (await fetch(new URL('/app', viewer.origin), { headers: { Cookie: cookie } })).text()).match(/"csrf":"([^"]+)"/)?.[1];
   assert(csrf, 'The local session must render the console.');
   const consolePost = (path, fields) => fetch(new URL(path, viewer.origin), { method: 'POST', redirect: 'manual', headers: { Cookie: cookie, Origin: viewer.origin, 'Content-Type': 'application/x-www-form-urlencoded' }, body: new URLSearchParams({ csrf, ...fields }) });
+  const cleanupCookie = `wsa_session=${process.env.WS_SMOKE_OWNER_SESSION ?? process.env.WS_SMOKE_SESSION}`;
+  const cleanupCsrf = process.env.WS_SMOKE_OWNER_SESSION
+    ? (await (await fetch(new URL('/app', viewer.origin), { headers: { Cookie: cleanupCookie } })).text()).match(/"csrf":"([^"]+)"/)?.[1]
+    : csrf;
+  assert(cleanupCsrf, 'The local owner session must render the console for cleanup.');
+  const cleanupConsolePost = (path, fields) => fetch(new URL(path, viewer.origin), { method: 'POST', redirect: 'manual', headers: { Cookie: cleanupCookie, Origin: viewer.origin, 'Content-Type': 'application/x-www-form-urlencoded' }, body: new URLSearchParams({ csrf: cleanupCsrf, ...fields }) });
   const apiBytes = async path => {
     const response = await fetch(new URL(path, viewer.origin), { headers: { Authorization: `Bearer ${key}` } });
     assert.equal(response.status, 200, `GET ${path}`);
@@ -657,15 +734,33 @@ $('probe-upload').addEventListener('click', () => {
     // open (an interrupted run) deleted, so they stop counting toward the 5 per reader; the sweep
     // aborts their R2 multipart uploads.
     for (const name of created.collections) await attempt(`collection ${name}`, () => tool('delete_collection', { ...project, name }));
-    if (created.share) await attempt('share', async () => assert.equal((await consolePost(`/app/a/${clientSlug}/share-revoke`, { shareId: created.share })).status, 200));
-    for (const slug of created.artifacts) await attempt(`artefact ${slug}`, async () => assert.equal((await consolePost(`/app/a/${slug}/delete`, { confirm: 'delete' })).status, 303));
+    if (created.share) await attempt('share', async () => assert.equal((await cleanupConsolePost(`/app/a/${clientSlug}/share-revoke`, { shareId: created.share })).status, 200));
+    for (const slug of created.artifacts) await attempt(`artefact ${slug}`, async () => assert.equal((await cleanupConsolePost(`/app/a/${slug}/delete`, { confirm: 'delete' })).status, 303));
     await rm(work, { recursive: true, force: true });
     if (failures.length) throw new Error(`Project files cleanup failed: ${failures.join('; ')}`);
   }
-  console.log('Solid reader smoke passed: modal focus, Preview/Code, dynamic rename, stable frame/sidebar, opaque sandbox, validation/tab/GET-URL continuity, pending-GET/same-URL/away-back POST ownership, restore GET-URL continuity, account/API-key navigation, native form submission through the SDK and MCP, project files (API upload, in-frame display, viewer download, multipart form upload with reload-and-resume, abort, signed-out visitor upload).');
+  console.log('Solid reader smoke passed: modal focus, Preview/Code, dynamic rename, stable frame/sidebar, opaque sandbox, validation/tab/GET-URL continuity, pending-GET/same-URL/away-back POST ownership, restore GET-URL continuity, account/API-key navigation, unchecked content-read checkbox default, authorized HTTP content read and denied-capability 403, stale ifVersion publish conflict with unchanged fixture, native form submission through the SDK and MCP, project files (API upload, in-frame display, viewer download, multipart form upload with reload-and-resume, abort, signed-out visitor upload).');
 } finally {
+  let revokeError;
+  try {
+    if (settingsMasterKey) {
+      const headers = { Authorization: `Bearer ${settingsMasterKey}` };
+      const listed = await fetch(new URL('/_api/keys', viewer.origin), { headers });
+      assert.equal(listed.status, 200, 'The Settings-created master key must remain able to list its own record for cleanup.');
+      const record = (await listed.json()).keys.find(key => key.prefix === settingsMasterKey.slice(0, 8));
+      assert(record, 'The Settings-created master key record must be available for cleanup.');
+      const revoked = await fetch(new URL(`/_api/keys/${encodeURIComponent(record.id)}`, viewer.origin), {
+        method: 'DELETE', headers,
+      });
+      assert.equal(revoked.status, 200, 'The smoke must revoke its Settings-created master key.');
+      console.log('settings master key revoked: success');
+    }
+  } catch (error) {
+    revokeError = error;
+  }
   socket?.close();
   chrome.kill();
   await new Promise(resolve => { if (chrome.exitCode !== null || chrome.signalCode !== null) resolve(); else chrome.once('close', resolve); });
   await rm(profile, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+  if (revokeError) throw revokeError;
 }

@@ -195,6 +195,174 @@ test("an artifact key reaches its one artefact and nothing else", async () => {
   assert.equal((await env.api("/_api/artifacts/rotate", { key: writer.token, method: "POST", body: { artifact: "drugo", password: null } })).status, 403);
 });
 
+test("artifact-key mint accepts an explicit content-read capability and defaults it off", async () => {
+  const env = await environment();
+  assert.equal((await env.publish({ folder: "acme", slug: "upute", title: "Upute", html: HTML })).status, 201);
+  const omitted = await (await env.api("/_api/keys", {
+    method: "POST", body: { artifact: "upute", scopes: "read" },
+  })).json<KeyResponse>();
+  assert.equal(omitted.key.can_read_content, false);
+  const optedIn = await (await env.api("/_api/keys", {
+    method: "POST", body: { artifact: "upute", scopes: "read", can_read_content: true },
+  })).json<KeyResponse>();
+  assert.equal(optedIn.key.can_read_content, true);
+});
+test("content reads require explicit capability, read scope and live bound authority", async () => {
+  const env = await environment();
+  await env.publish({ folder: "acme", slug: "upute", title: "Upute", html: HTML, lang: "hr", password: "tajna-lozinka" });
+  await env.publish({ folder: "acme", slug: "upute", title: "Novo", html: HTML2, lang: "en" });
+  await env.publish({ folder: "acme", slug: "drugo", title: "Drugo", html: HTML });
+
+  const plain = await Effect.runPromise(env.keys.mint({ userId: env.owner.id, kind: "master", scopes: "master" }));
+  const capableMaster = await Effect.runPromise(env.keys.mint({
+    userId: env.owner.id, kind: "master", scopes: "master", can_read_content: true,
+  }));
+  const list = await (await env.api("/_api/artifacts")).json<ArtifactListResponse>();
+  const artifactId = list.artifacts.find(({ slug }) => slug === "upute")!.id;
+  const masterRead = await env.api("/_api/artifacts/upute/content?version=1", { key: capableMaster.key });
+  assert.equal(masterRead.status, 200);
+  const masterContent = await masterRead.json<{ artifact: { id: string; slug: string; version: number }; version: number; type: string; title: string; language: string; html: string }>();
+  assert.deepEqual({ ...masterContent, html: undefined }, {
+    artifact: { id: artifactId, slug: "upute", version: 1 },
+    version: 1, type: "text/html", title: "Novo", language: "en", html: undefined,
+  });
+  assert.match(masterContent.html, /<h1>Bok<\/h1>/);
+  assert.equal(JSON.stringify(list).includes(HTML), false);
+  assert.equal((await env.api("/_api/artifacts/upute/content", { key: plain.key })).status, 403);
+
+  const artifact = list.artifacts.find(({ slug }) => slug === "upute")!;
+  const defaultOff = await Effect.runPromise(env.keys.mint({
+    userId: env.owner.id, kind: "artifact", artifactId: artifact.id, scopes: "read",
+  }));
+  assert.equal((await env.api("/_api/artifacts/upute/content", { key: defaultOff.key })).status, 403);
+  const readKey = await Effect.runPromise(env.keys.mint({
+    userId: env.owner.id, kind: "artifact", artifactId: artifact.id, scopes: "read", can_read_content: true,
+  }));
+  const scopedContent = await env.api("/_api/artifacts/upute/content", { key: readKey.key });
+  assert.equal(scopedContent.status, 200);
+  assert.match((await scopedContent.json<{ html: string }>()).html, /<h1>Drugo izdanje<\/h1>/);
+  const writer = await Effect.runPromise(env.keys.mint({
+    userId: env.owner.id, kind: "artifact", artifactId: artifact.id, scopes: "write", can_read_content: true,
+  }));
+  assert.equal((await env.api("/_api/artifacts/upute/content", { key: writer.key })).status, 403);
+
+  const other = list.artifacts.find(({ slug }) => slug === "drugo")!;
+  assert.equal((await env.api(`/_api/artifacts/${other.id}/content`, { key: readKey.key })).status, 403);
+  await Effect.runPromise(env.keys.revoke(readKey.record.id, env.owner.id));
+  assert.equal((await env.api("/_api/artifacts/upute/content", { key: readKey.key })).status, 401);
+  const attempts = await Effect.runPromise(env.store.audit.recent(30));
+  const contentReads = attempts.filter(({ action }) => action === "artifact.content.read");
+  assert.ok(contentReads.length >= 4);
+  const details = contentReads.map(({ detail }) => JSON.parse(detail ?? "{}") as { allowed?: boolean });
+  assert.equal(details.some(({ allowed }) => allowed === true), true);
+  assert.equal(details.some(({ allowed }) => allowed === false), true);
+  assert.equal(contentReads.some(({ detail }) => (detail ?? "").includes(HTML)), false);
+});
+test("content reads fail closed when the production audit insert fails over HTTP and MCP", async () => {
+  const env = await environment();
+  await env.publish({ folder: "acme", slug: "upute", title: "Upute", html: HTML });
+  const key = await Effect.runPromise(env.keys.mint({
+    userId: env.owner.id, kind: "master", scopes: "master", can_read_content: true,
+  }));
+  env.DB.exec(`CREATE TRIGGER fail_content_read_audit BEFORE INSERT ON audit_log
+    WHEN NEW.action = 'artifact.content.read'
+    BEGIN SELECT RAISE(ABORT, 'audit unavailable'); END;`);
+
+  const http = await env.api("/_api/artifacts/upute/content", { key: key.key });
+  assert.equal(http.status, 500);
+  assert.equal((await http.text()).includes(HTML), false);
+
+  const mcp = await env.fetch("/_mcp", {
+    method: "POST",
+    headers: { authorization: `Bearer ${key.key}`, "content-type": "application/json", accept: "application/json, text/event-stream" },
+    body: JSON.stringify({
+      jsonrpc: "2.0", id: 1, method: "tools/call",
+      params: { name: "get_artifact", arguments: { artifact: "upute" } },
+    }),
+  });
+  assert.equal(mcp.status, 200);
+  const mcpBody = await mcp.json<{
+    jsonrpc: string; id: number;
+    result: { isError: boolean; content: Array<{ type: string; text: string }>; structuredContent: ErrorResponse };
+  }>();
+  assert.equal(mcpBody.jsonrpc, "2.0");
+  assert.equal(mcpBody.id, 1);
+  assert.equal(mcpBody.result.isError, true);
+  assert.equal(mcpBody.result.structuredContent.error.code, "internal");
+  assert.equal(mcpBody.result.content[0]?.type, "text");
+  const serializedMcp = JSON.stringify(mcpBody);
+  assert.equal(serializedMcp.includes(HTML), false);
+  assert.equal(serializedMcp.includes("audit unavailable"), false);
+});
+
+test("authorized content reads do not require the artefact password", async () => {
+  const env = await environment();
+  await env.publish({ folder: "acme", slug: "tajno", title: "Tajno", html: HTML, password: "tajna-lozinka" });
+  const key = await Effect.runPromise(env.keys.mint({
+    userId: env.owner.id, kind: "master", scopes: "master", can_read_content: true,
+  }));
+  const response = await env.api("/_api/artifacts/tajno/content", { key: key.key });
+  assert.equal(response.status, 200);
+  assert.match((await response.json<{ html: string }>()).html, /<h1>Bok<\/h1>/);
+});
+test("content reads stop when the live folder grant is revoked", async () => {
+  const env = await environment();
+  await env.publish({ folder: "acme", slug: "upute", title: "Upute", html: HTML });
+  const artifact = (await (await env.api("/_api/artifacts")).json<ArtifactListResponse>())
+    .artifacts.find(({ slug }) => slug === "upute")!;
+  const collaborator = await Effect.runPromise(addUser(env.store, "collaborator0001", "collaborator@example.test"));
+  const folder = env.DB.prepare("SELECT id FROM folders WHERE slug = ?").bind("acme").first<{ id: string }>();
+  assert.ok(folder);
+  const access = openAccess({ db: env.DB, audit: env.store.audit });
+  await Effect.runPromise(access.grant({ actorId: env.owner.id, folderId: folder.id, userId: collaborator.id, role: "viewer" }));
+  const key = await Effect.runPromise(env.keys.mint({
+    userId: collaborator.id, kind: "artifact", artifactId: artifact.id, scopes: "read", can_read_content: true,
+  }));
+  assert.equal((await env.api("/_api/artifacts/upute/content", { key: key.key })).status, 200);
+  await Effect.runPromise(access.revoke({ actorId: env.owner.id, folderId: folder.id, userId: collaborator.id }));
+  assert.equal((await env.api("/_api/artifacts/upute/content", { key: key.key })).status, 403);
+});
+test("failed content reads are audited without recording content", async () => {
+  const env = await environment();
+  await env.publish({ folder: "acme", slug: "upute", title: "Upute", html: HTML });
+  const artifact = (await (await env.api("/_api/artifacts")).json<ArtifactListResponse>())
+    .artifacts.find(({ slug }) => slug === "upute")!;
+  const key = await Effect.runPromise(env.keys.mint({
+    userId: env.owner.id, kind: "master", scopes: "master", can_read_content: true,
+  }));
+  const rows = async () => (await Effect.runPromise(env.store.audit.recent(30)))
+    .filter(({ action }) => action === "artifact.content.read");
+  const auditedFailure = async (reason: string) => {
+    const event = (await rows()).map(({ detail: value }) => JSON.parse(value ?? "{}") as {
+      allowed?: boolean; success?: boolean; reason?: string;
+    }).find(({ reason: value }) => value === reason);
+    assert.ok(event, `expected an audit event for ${reason}`);
+    assert.equal(event.success, false);
+  };
+
+  assert.equal((await env.api("/_api/artifacts/upute/content?version=99", { key: key.key })).status, 404);
+  await auditedFailure("not-found");
+
+  const version = env.DB.prepare("SELECT r2_key FROM artifact_versions WHERE artifact_id = ? AND version = 1")
+    .bind(artifact.id).first<{ r2_key: string }>();
+  assert.ok(version);
+  const ciphertext = env.bucket.objects.get(version.r2_key);
+  assert.ok(ciphertext);
+  env.bucket.objects.delete(version.r2_key);
+  assert.equal((await env.api("/_api/artifacts/upute/content?version=1", { key: key.key })).status, 500);
+  await auditedFailure("content-missing");
+
+  const beforeDecryption = (await rows()).length;
+  env.bucket.objects.set(version.r2_key, new Uint8Array([1, 2, 3]));
+  assert.equal((await env.api("/_api/artifacts/upute/content?version=1", { key: key.key })).status, 500);
+  const afterDecryption = await rows();
+  assert.equal(afterDecryption.length, beforeDecryption + 1);
+  assert.equal(afterDecryption.some(({ detail: event }) => (event ?? "").includes(HTML)), false);
+});
+
+
+
+
 test("keys list without their secret, and revocation bites immediately", async () => {
   const env = await environment();
   const nameless = await env.api("/_api/keys", { method: "POST", body: { artifact: null } });
@@ -546,4 +714,45 @@ test("key model refusals are validation responses and rotation revokes the old s
   assert.equal((await env.api("/_api/artifacts", { key: original.token })).status, 401);
   assert.equal((await env.api("/_api/artifacts", { key: rotated.token })).status, 200);
   assert.equal((await env.api("/_api/keys/rotate", { method: "POST", body: { id: "missing" } })).status, 404);
+});
+test("HTTP publish and rotate-with-HTML honor optional ifVersion without changing omitted writes", async () => {
+  const env = await environment();
+  const created = await env.publish({ folder: "acme", slug: "upute", title: "Upute", html: HTML });
+  assert.equal(created.status, 201);
+  const published = await env.publish({ folder: "acme", slug: "upute", title: "Upute", html: HTML2, ifVersion: 1 });
+  assert.equal(published.status, 200);
+  assert.equal((await published.json<PublishedResponse>()).artifact.version, 2);
+  const objectCount = env.bucket.objects.size;
+
+  const stalePublish = await env.publish({ folder: "acme", slug: "upute", title: "Upute", html: HTML, ifVersion: 1 });
+  assert.equal(stalePublish.status, 409);
+  assert.deepEqual(await stalePublish.json(), { error: { code: "conflict", message: "Artefact has changed since version 1.", details: { currentVersion: 2 } } });
+  assert.equal(env.bucket.objects.size, objectCount);
+
+  const rotated = await env.api("/_api/artifacts/rotate", {
+    method: "POST", body: { artifact: "upute", html: HTML, ifVersion: 2 },
+  });
+  assert.equal(rotated.status, 200);
+  const staleRotate = await env.api("/_api/artifacts/rotate", {
+    method: "POST", body: { artifact: "upute", html: HTML2, ifVersion: 2 },
+  });
+  assert.equal(staleRotate.status, 409);
+  assert.deepEqual(await staleRotate.json(), { error: { code: "conflict", message: "Artefact has changed since version 2.", details: { currentVersion: 3 } } });
+  assert.equal(env.bucket.objects.size, objectCount + 1);
+
+  const unconditional = await env.publish({ folder: "acme", slug: "upute", title: "Upute", html: HTML2 });
+  assert.equal((await unconditional.json<PublishedResponse>()).artifact.version, 4);
+});
+test("HTTP publish with ifVersion does not create a missing artefact or folder", async () => {
+  const env = await environment();
+  const response = await env.publish({
+    folder: "new-folder", slug: "missing", title: "Missing", html: HTML, ifVersion: 1,
+  });
+  assert.equal(response.status, 409);
+  assert.deepEqual(await response.json(), {
+    error: { code: "conflict", message: "Artefact has changed since version 1.", details: { currentVersion: 0 } },
+  });
+  assert.equal((await env.DB.prepare("SELECT COUNT(*) AS count FROM folders").first<{ count: number }>())?.count, 0);
+  assert.equal((await env.DB.prepare("SELECT COUNT(*) AS count FROM artifacts").first<{ count: number }>())?.count, 0);
+  assert.equal(env.bucket.objects.size, 0);
 });

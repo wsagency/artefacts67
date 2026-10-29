@@ -65,6 +65,31 @@ test("mint shows the plaintext once and stores only its hash", async () => {
   assert.equal("token_hash" in master.record, false);
 });
 
+test("content-read capability defaults off, is stored when opted in, and survives rotation", async () => {
+  const { owner, keys, db } = await services();
+  const ordinary = await Effect.runPromise(keys.mint({ userId: owner.id, kind: "master", scopes: "master" }));
+  assert.equal(ordinary.record.can_read_content, false);
+  assert.equal(rawKey(db, ordinary.record.id).can_read_content, 0);
+  const explicitlyOff = await Effect.runPromise(keys.mint({
+    userId: owner.id, kind: "master", scopes: "master", can_read_content: false,
+  }));
+  assert.equal(explicitlyOff.record.can_read_content, false);
+  assert.equal(rawKey(db, explicitlyOff.record.id).can_read_content, 0);
+  db.prepare("INSERT INTO api_keys (id, user_id, kind, artifact_id, token_hash, prefix, scopes, label, created_at) VALUES (?,?,?,?,?,?,?,?,?)")
+    .bind("legacy-key", owner.id, "master", null, "legacy-hash", "wak_legacy", "master", "", "2026-01-01T00:00:00.000Z").run();
+  assert.equal((await Effect.runPromise(keys.byId("legacy-key")))?.can_read_content, false);
+
+  const optedIn = await Effect.runPromise(keys.mint({
+    userId: owner.id, kind: "master", scopes: "master", can_read_content: true,
+  }));
+  assert.equal(optedIn.record.can_read_content, true);
+  assert.equal(rawKey(db, optedIn.record.id).can_read_content, 1);
+  const rotated = await Effect.runPromise(keys.rotate(optedIn.record.id, owner.id));
+  assert.ok(rotated);
+  assert.equal(rotated.record.can_read_content, true);
+  assert.equal(rawKey(db, optedIn.record.id).can_read_content, 1);
+});
+
 test("an artifact key is waa_-shaped and bound to its artefact", async () => {
   const { owner, artifacts, keys } = await services();
   const artifact = await Effect.runPromise(artifacts.create({ ownerId: owner.id, html: HTML, authorId: owner.id }));

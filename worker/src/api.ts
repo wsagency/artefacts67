@@ -21,11 +21,11 @@ import { asCodeError, type CodeError } from "./types.js";
 export interface ApiContext {
   keys: Pick<Keys, "authenticate" | "hasScope" | "may" | "mint" | "list" | "rotate" | "revoke">;
   artifacts: Pick<Artifacts, "byId" | "bySlug" | "byPath" | "title" | "path" | "url" | "gated" | "live" |
-    "prepare" | "create" | "publish" | "setPassword" | "listByOwner" | "listByFolder" | "alias">;
+    "prepare" | "create" | "publish" | "setPassword" | "listByOwner" | "listByFolder" | "alias" | "readContent">;
   folders: Pick<Folders, "byId" | "byPath" | "path" | "name" | "create" | "alias">;
   access: Pick<Access, "foldersFor" | "role">;
   limiter: Pick<RateLimiter, "hit">;
-  store: { audit: Pick<Audit, "write"> };
+  store: { audit: Pick<Audit, "write" | "writeRequired"> };
   projectData: ProjectData;
   projectFiles: ProjectFiles;
   publicOrigin: string;
@@ -35,8 +35,9 @@ export interface ApiContext {
 /** Fields remain unknown until the existing validator or the consuming model narrows them. */
 interface ApiBody {
   folder?: unknown; folderName?: unknown; slug?: unknown; title?: unknown; lang?: unknown;
-  html?: unknown; password?: unknown; note?: unknown; allow_weak_password?: unknown;
+  html?: unknown; password?: unknown; note?: unknown; allow_weak_password?: unknown; ifVersion?: unknown;
   artifact?: unknown; paths?: unknown; scopes?: unknown; label?: unknown; id?: unknown;
+  can_read_content?: unknown;
 }
 const isApiBody = (value: unknown): value is ApiBody => value !== null && typeof value === "object";
 const objectBody = (value: unknown): ApiBody => isApiBody(value) ? value : {};
@@ -77,6 +78,8 @@ const may = (ctx: ApiContext, who: KeyAuthentication, target: KeyResource, need 
   ctx.keys.may(who.key, target, need);
 const audit = (ctx: ApiContext, who: KeyAuthentication, action: string, artifactId: string | null, detail: unknown) =>
   ctx.store.audit.write({ actorType: "api_key", actorId: who.key.id, action, artifactId, detail });
+const auditContentRead = (ctx: ApiContext, who: KeyAuthentication, artifactId: string | null, detail: unknown) =>
+  ctx.store.audit.writeRequired({ actorType: "api_key", actorId: who.key.id, action: "artifact.content.read", artifactId, detail });
 /** The accepted weak-password exception must be visible afterwards (ADR 0023). */
 const writeDetail = (detail: Record<string, unknown>, weakUsed: boolean) =>
   weakUsed ? { ...detail, weakPassword: true } : detail;
@@ -124,6 +127,13 @@ export function handleApi(request: Request, ctx: ApiContext, { rest = "" }: { re
       case "POST keys/rotate": return yield* rotateKey(request, ctx, who);
       default: break;
     }
+    const content = /^artifacts\/([^/]+)\/content$/.exec(path);
+    if (content && method === "GET") {
+      let reference: string;
+      try { reference = decodeURIComponent(content[1]); } catch { return envelope("not-found", "No such artefact."); }
+      return yield* readArtifactContent(request, ctx, who, reference);
+    }
+
     const revoke = /^keys\/([A-Za-z0-9_-]+)$/.exec(path);
     if (revoke && method === "DELETE") return yield* revokeKey(ctx, who, revoke[1]);
     const file = FILE_ROUTE.exec(path);
@@ -134,11 +144,14 @@ export function handleApi(request: Request, ctx: ApiContext, { rest = "" }: { re
   }).pipe(Effect.catchCause((cause) => {
     if (Cause.hasInterrupts(cause)) return Effect.failCause(cause);
     const error = asCodeError(Cause.squash(cause));
-    if (error.code === "validation" || error.code?.startsWith("font-") || error.code === "external-reference") {
+    if (error.code === "validation" || (typeof error.code === "string" && error.code.startsWith("font-")) || error.code === "external-reference") {
       return Effect.succeed(envelope("validation", error.message,
         (error.issues ?? [{ code: error.code, message: error.message }]).map(issue => ({ ...issue, field: "html" }))));
     }
     if (error.code === "not-found") return Effect.succeed(envelope("not-found", error.message));
+    if (error.code === "version-conflict" && "currentVersion" in error && typeof error.currentVersion === "number") {
+      return Effect.succeed(envelope("conflict", error.message, { currentVersion: error.currentVersion }));
+    }
     if (error.code === "slug-taken" || error.code === "publish-conflict") return Effect.succeed(envelope("conflict", error.message));
     // Unexpected failures also keep the documented machine-readable shape.
     console.error("artefacts67 api error", error);
@@ -193,6 +206,13 @@ function publish(request: Request, ctx: ApiContext, who: KeyAuthentication) {
     const read = yield* readApiJson(request);
     if ("error" in read) return read.error;
     const body = objectBody(read.body);
+    if (body.ifVersion !== undefined &&
+        (typeof body.ifVersion !== "number" || !Number.isSafeInteger(body.ifVersion) || body.ifVersion < 1)) {
+      return envelope("validation", "ifVersion must be a positive integer.", [
+        { code: "invalid-version", message: "ifVersion must be a positive integer.", field: "ifVersion" },
+      ]);
+    }
+    const ifVersion = typeof body.ifVersion === "number" ? body.ifVersion : undefined;
 
     if (body.allow_weak_password === true && who.key.kind !== "master") {
       return envelope("forbidden", "Only a master key may publish a password below the floor.");
@@ -218,6 +238,10 @@ function publish(request: Request, ctx: ApiContext, who: KeyAuthentication) {
     if (existing && !(yield* may(ctx, who, { ownerId: existing.ownerId, folderId: existing.folderId, artifactId: existing.id }, "write"))) {
       return envelope("forbidden", "That artefact belongs to another user.");
     }
+    // A conditional update cannot create a fresh artefact: there is no current version to match.
+    if (ifVersion !== undefined && !existing) {
+      return envelope("conflict", `Artefact has changed since version ${ifVersion}.`, { currentVersion: 0 });
+    }
     // Capture once before any write; the source-bound preparation capability is reused by
     // create/upsert and verified by the model, never fetched a second time.
     const gated = body.password != null && body.password !== "" ? true : Boolean(existing && ctx.artifacts.gated(existing));
@@ -225,7 +249,7 @@ function publish(request: Request, ctx: ApiContext, who: KeyAuthentication) {
     const destination = folder.value ?? (yield* createFolder(ctx, who, body.folder, body.folderName));
     if (existing) {
       yield* ctx.artifacts.publish({ artifactId: existing.id, html: body.html, note, ...authorOf(who),
-        title: body.title, lang: body.lang, password: body.password ?? undefined, prepared });
+        title: body.title, lang: body.lang, password: body.password ?? undefined, prepared, ifVersion });
       const updated = yield* ctx.artifacts.byId(existing.id);
       if (!updated) return yield* Effect.fail(new Error("The published artefact could not be read."));
       yield* audit(ctx, who, "artifact.publish", updated.id, writeDetail({ version: updated.currentVersion }, weakUsed));
@@ -250,6 +274,51 @@ function listArtifacts(ctx: ApiContext, who: KeyAuthentication) {
     return json({ artifacts: views });
   });
 }
+/** Content leaves only through this explicitly authorized, audited read. */
+function readArtifactContent(request: Request, ctx: ApiContext, who: KeyAuthentication, reference: string) {
+  return Effect.gen(function* () {
+    const rawVersion = new URL(request.url).searchParams.get("version");
+    const version = rawVersion === null ? undefined
+      : /^\d+$/.test(rawVersion) && Number.isSafeInteger(Number(rawVersion)) && Number(rawVersion) > 0
+        ? Number(rawVersion) : null;
+    const artifact = yield* ctx.artifacts.byPath(reference);
+    if (!artifact || !ctx.artifacts.live(artifact)) {
+      yield* auditContentRead(ctx, who, artifact?.id ?? null, { version: version ?? null, allowed: false });
+      return envelope("not-found", "No such artefact.");
+    }
+    if (version === null) {
+      yield* auditContentRead(ctx, who, artifact.id, { allowed: false });
+      return envelope("validation", "version must be a positive integer.");
+    }
+    const resource = { ownerId: artifact.ownerId, folderId: artifact.folderId, artifactId: artifact.id };
+    const allowed = who.key.can_read_content && ctx.keys.hasScope(who.key, "read") &&
+      (yield* may(ctx, who, resource, "read"));
+    if (!allowed) {
+      yield* auditContentRead(ctx, who, artifact.id, { version: version ?? null, allowed: false });
+      return envelope("forbidden", "This key cannot read artefact content.");
+    }
+    const content = yield* Effect.gen(function* () {
+      const selected = yield* ctx.artifacts.readContent(artifact, version);
+      const title = yield* ctx.artifacts.title(artifact);
+      return { selected, title };
+    }).pipe(Effect.catch((error) => Effect.gen(function* () {
+      yield* auditContentRead(ctx, who, artifact.id, {
+        version: version ?? null, allowed: true, success: false,
+        reason: typeof error.code === "string" ? error.code : "read-failed",
+      });
+      return yield* Effect.fail(error);
+    })));
+    const { selected, title } = content;
+    yield* auditContentRead(ctx, who, artifact.id, {
+      version: selected.version.version, allowed: true, success: true,
+    });
+    return json({
+      artifact: { id: artifact.id, slug: artifact.slug, version: selected.version.version },
+      version: selected.version.version, type: "text/html", title, language: artifact.lang, html: selected.html,
+    });
+  });
+}
+
 /** Own and explicitly shared estate, deduplicated and sorted newest first. */
 function readableArtifacts(ctx: ApiContext, who: KeyAuthentication): Effect.Effect<Artifact[], CodeError> {
   return Effect.gen(function* () {
@@ -300,6 +369,13 @@ function rotate(request: Request, ctx: ApiContext, who: KeyAuthentication) {
     const read = yield* readApiJson(request);
     if ("error" in read) return read.error;
     const body = objectBody(read.body);
+    if (body.ifVersion !== undefined &&
+        (typeof body.ifVersion !== "number" || !Number.isSafeInteger(body.ifVersion) || body.ifVersion < 1)) {
+      return envelope("validation", "ifVersion must be a positive integer.", [
+        { code: "invalid-version", message: "ifVersion must be a positive integer.", field: "ifVersion" },
+      ]);
+    }
+    const ifVersion = typeof body.ifVersion === "number" ? body.ifVersion : undefined;
     if (body.allow_weak_password === true && who.key.kind !== "master") {
       return envelope("forbidden", "Only a master key may publish a password below the floor.");
     }
@@ -322,7 +398,8 @@ function rotate(request: Request, ctx: ApiContext, who: KeyAuthentication) {
       warnings.push(...doc.warnings.map(issue => ({ ...issue, field: "html" })));
       const gated = body.password === undefined ? ctx.artifacts.gated(artifact) : body.password != null && body.password !== "";
       const prepared = yield* ctx.artifacts.prepare(body.html, { gated });
-      yield* ctx.artifacts.publish({ artifactId: artifact.id, html: body.html, password: body.password, prepared, ...authorOf(who) });
+      yield* ctx.artifacts.publish({ artifactId: artifact.id, html: body.html, password: body.password, prepared, ifVersion,
+        ...authorOf(who) });
     }
     // Omitted leaves the gate alone; null clears it; a string sets/rotates it.
     if (body.html === undefined && body.password !== undefined) yield* ctx.artifacts.setPassword(artifact.id, body.password);
@@ -426,7 +503,7 @@ function mintKey(request: Request, ctx: ApiContext, who: KeyAuthentication) {
       return envelope("forbidden", "That artefact belongs to another user.");
     }
     return yield* ctx.keys.mint({ userId: who.key.userId, kind: "artifact", artifactId: artifact.id,
-      scopes, label: body.label ?? null }).pipe(
+      scopes, label: body.label ?? null, can_read_content: body.can_read_content === true }).pipe(
       Effect.map(minted => json({ key: minted.record, token: minted.key }, 201)),
       Effect.catch(error => Effect.succeed(keyIssue(error, "The key could not be minted."))),
     );

@@ -1,6 +1,8 @@
 // The key and platform-mail HTTP surfaces: routing, CSRF, user scoping and
 // one-time-secret rendering. Unused seams use the real platform factories.
 
+import { createRequire } from "node:module";
+import { fileURLToPath } from "node:url";
 import test from "node:test";
 import assert from "node:assert/strict";
 import * as Effect from "effect/Effect";
@@ -11,27 +13,35 @@ import type { CurrentSession } from "../src/auth.js";
 import type { Artifact } from "../src/artifacts.js";
 import type { Keys, Key, MintKey, MintedKey } from "../src/keys.js";
 import type { AuditEntry, Role, Settings } from "../src/store.js";
+const frontendRequire = createRequire(new URL("../../frontend/package.json", import.meta.url));
+const { createServer } = frontendRequire("vite") as { createServer(options: object): Promise<{
+  ssrLoadModule(path: string): Promise<Record<string, (props: Record<string, unknown>) => unknown>>;
+  close(): Promise<void>;
+}> };
+const { renderToString } = frontendRequire("@solidjs/web") as { renderToString(render: () => unknown): string };
+const { default: solid } = frontendRequire("@solidjs/vite-plugin") as { default(options: object): unknown };
+import { shouldShowContentReadCheck } from "../../frontend/src/key-capability.js";
 
 const KEY_ROWS: Key[] = [
   { id: "k1", userId: "u-owner", kind: "master", artifactId: null, label: "", prefix: "wak_1a2b3c4d",
-    scopes: "master", createdAt: "2026-01-05T10:00:00.000Z", revokedAt: null, lastUsedAt: null },
+    scopes: "master", can_read_content: false, createdAt: "2026-01-05T10:00:00.000Z", revokedAt: null, lastUsedAt: null },
   { id: "k2", userId: "u-owner", kind: "artifact", artifactId: "a1", label: "CI objava", prefix: "waa_9e8f7a6b",
-    scopes: "read_write", createdAt: "2026-02-06T11:30:00.000Z", revokedAt: null, lastUsedAt: "2026-03-01T09:12:00.000Z" },
+    scopes: "read_write", can_read_content: false, createdAt: "2026-02-06T11:30:00.000Z", revokedAt: null, lastUsedAt: "2026-03-01T09:12:00.000Z" },
 ];
 
-interface KeyOptions { rotateResult?: MintedKey | null; revokeResult?: boolean }
+interface KeyOptions { rotateResult?: MintedKey | null; revokeResult?: boolean; noMaster?: boolean }
 interface AuditCall {
   actorType: string; actorId: unknown; action: string; options?: Pick<AuditEntry, "artifactId" | "detail">;
 }
 
-function keysModel(base: Keys, { rotateResult, revokeResult }: KeyOptions = {}) {
+function keysModel(base: Keys, { rotateResult, revokeResult, noMaster = false }: KeyOptions = {}) {
   const calls = {
     mint: [] as MintKey[], rotate: [] as Array<Parameters<Keys["rotate"]>>,
     revoke: [] as Array<Parameters<Keys["revoke"]>>, list: [] as string[],
   };
   const model: Keys = {
     ...base,
-    list: userId => Effect.sync(() => { calls.list.push(userId); return KEY_ROWS; }),
+    list: userId => Effect.sync(() => { calls.list.push(userId); return noMaster ? KEY_ROWS.filter(key => key.kind !== "master") : KEY_ROWS; }),
     mint: args => Effect.sync(() => {
       calls.mint.push(args);
       return { key: `waa_${"f".repeat(40)}`, record: { ...KEY_ROWS[1], userId: args.userId, artifactId: args.artifactId ?? null } };
@@ -61,12 +71,12 @@ function settingsStore(base: Settings, initial: string) {
   return { calls, settings };
 }
 
-function harness({ role = "member", mailFrom = "", rotateResult, revokeResult }: KeyOptions & { role?: Role; mailFrom?: string } = {}) {
+function harness({ role = "member", mailFrom = "", rotateResult, revokeResult, noMaster = false }: KeyOptions & { role?: Role; mailFrom?: string } = {}) {
   const base = openConsoleContext();
   const id = role === "owner" ? "u-owner" : "u-member";
   const audits: AuditCall[] = [];
   const settings = settingsStore(base.store.settings, mailFrom);
-  const keys = keysModel(base.keys, { rotateResult, revokeResult });
+  const keys = keysModel(base.keys, { rotateResult, revokeResult, noMaster });
   const active: CurrentSession = {
     session: { id: "session", userId: id, csrf: "csrf", pending2fa: false, createdAt: "", expiresAt: "" },
     user: {
@@ -124,6 +134,45 @@ test("the keys screen is lazy and lists only the signed-in member's keys", async
   assert.doesNotMatch(page, /waa_[0-9a-f]{40}/);               // a full key never renders
   assert.deepEqual(keys.calls.list, ["u-member"]);             // scoped to the session user
 });
+test("content-read checkbox appears only for master-key selection when no master key exists", () => {
+  assert.equal(shouldShowContentReadCheck("artifact", false), false);
+  assert.equal(shouldShowContentReadCheck("master", false), true);
+  assert.equal(shouldShowContentReadCheck("master", true), false);
+});
+test("the API-key creation form renders its unchecked content-read checkbox only for a master key", async () => {
+  const vite = await createServer({
+    root: fileURLToPath(new URL("../../frontend", import.meta.url)),
+    configFile: false,
+    plugins: [solid({ ssr: true, refresh: false })],
+    server: { middlewareMode: true },
+    appType: "custom",
+  });
+  try {
+    const { KeyCreationForm } = await vite.ssrLoadModule("/src/key-creation-form.tsx");
+    const base = { onKindChange: () => {}, hasMaster: false, csrf: "csrf", artifacts: [] };
+    const master = renderToString(() => KeyCreationForm({ ...base, kind: "master" }));
+    const artifact = renderToString(() => KeyCreationForm({ ...base, kind: "artifact" }));
+    assert.match(master, /name="can_read_content"/);
+    assert.doesNotMatch(master.match(/<input[^>]*name="can_read_content"[^>]*>/)?.[0] ?? "", /\bchecked\b/);
+    assert.doesNotMatch(artifact, /name="can_read_content"/);
+  } finally {
+    await vite.close();
+  }
+});
+
+
+test("the master-key screen exposes the no-master state and forwards the checked capability", async () => {
+  const { keys, request, post } = harness({ noMaster: true });
+  const page = await (await request("/settings/keys")).text();
+  const bootstrap = JSON.parse(page.match(/<script id="ws-bootstrap" type="application\/json">([\s\S]*?)<\/script>/)?.[1] ?? "{}");
+  assert.equal(bootstrap.props.keys.some((key: Key) => key.kind === "master"), false);
+  const minted = await post("/settings/keys/mint", { csrf: "csrf", kind: "master", can_read_content: "1" });
+  assert.equal(minted.status, 200);
+  assert.deepEqual(keys.calls.mint, [{
+    userId: "u-member", kind: "master", artifactId: null, scopes: "master", label: null, can_read_content: true,
+  }]);
+});
+
 
 test("minting calls keys.mint as the session user and re-renders the one-time plaintext", async () => {
   const { keys, post } = harness({ role: "member" });
@@ -131,7 +180,9 @@ test("minting calls keys.mint as the session user and re-renders the one-time pl
     csrf: "csrf", kind: "artifact", artifactId: "a1", scopes: "read_write",
   });
   assert.equal(response.status, 200);
-  assert.deepEqual(keys.calls.mint, [{ userId: "u-member", kind: "artifact", artifactId: "a1", scopes: "read_write", label: null }]);
+  assert.deepEqual(keys.calls.mint, [{
+    userId: "u-member", kind: "artifact", artifactId: "a1", scopes: "read_write", label: null, can_read_content: false,
+  }]);
   const page = await response.text();
   assert.match(page, /waa_[0-9a-f]{40}/);
 });

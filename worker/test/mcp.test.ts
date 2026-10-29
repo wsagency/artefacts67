@@ -14,7 +14,8 @@ const HTML = `<!doctype html><html lang="en"><head><meta charset="utf-8"><title>
 
 // Test-only wire shapes: absent members fail the assertions at runtime.
 interface Structured {
-  artifact: { id: string; version: number }; collection: { kind: string }; error: { code: string };
+  artifact: { id: string; version: number }; html: string; collection: { kind: string };
+  error: { code: string; details?: { currentVersion: number } };
   record: { id: string; version: number; data: unknown }; records: Array<{ id: string }>;
   collections: Array<{ name: string }>; folders: unknown[]; artifacts: unknown[];
   upload: { id: string; partPath: string; received: unknown[] }; file: { id: string; size: number; downloadPath: string };
@@ -22,7 +23,7 @@ interface Structured {
 interface ToolResult { content: Array<{ type: string; text: string }>; structuredContent: Structured; isError: boolean }
 interface RpcResult {
   protocolVersion: string; capabilities: unknown; serverInfo: { name: string };
-  tools: Array<{ name: string; description: string; inputSchema: { type: string } }>;
+  tools: Array<{ name: string; description: string; inputSchema: { type: string; properties?: Record<string, object>; required?: string[] } }>;
 }
 interface RpcResponse { jsonrpc: "2.0"; id: unknown; result: RpcResult & ToolResult; error?: { code: number; message: string } }
 
@@ -34,8 +35,9 @@ async function environment() {
   }));
   const keys = openKeys({ db: DB, audit: store.audit, access: openAccess({ db: DB, audit: store.audit }) });
   const master = await Effect.runPromise(keys.mint({ userId: owner.id, kind: "master", scopes: "master" }));
+  const bucket = memoryBucket();
   const RATELIMIT = rateLimitBinding();
-  const env = { DB, ARTIFACTS: memoryBucket(), ARTEFACTS_MASTER_KEY: MASTER, RATELIMIT };
+  const env = { DB, ARTIFACTS: bucket, ARTEFACTS_MASTER_KEY: MASTER, RATELIMIT };
   const raw = (body: string | undefined, { key = master.key as string | null, method = "POST", headers = {} as Record<string, string> } = {}) => {
     const all: Record<string, string> = { "content-type": "application/json", accept: "application/json, text/event-stream", ...headers };
     if (key) all.authorization = `Bearer ${key}`;
@@ -54,7 +56,7 @@ async function environment() {
     assert.equal(response.status, 200);
     return (await response.json<RpcResponse>()).result as ToolResult;
   };
-  return { DB, keys, owner, master, RATELIMIT, raw, rpc, call, put, get };
+  return { DB, bucket, keys, owner, master, RATELIMIT, raw, rpc, call, put, get };
 }
 
 test("initialize negotiates the protocol version", async () => {
@@ -93,9 +95,12 @@ test("client responses are accepted without a body", async () => {
 test("tools/list publishes every tool with an input schema", async () => {
   const env = await environment();
   const body = await (await env.rpc({ jsonrpc: "2.0", id: 1, method: "tools/list" })).json<RpcResponse>();
-  const tools = body.result.tools as Array<{ name: string; description: string; inputSchema: { type: string } }>;
+  const tools = body.result.tools as Array<{
+    name: string; description: string;
+    inputSchema: { type: string; properties?: Record<string, object>; required?: string[] };
+  }>;
   assert.deepEqual(tools.map((tool) => tool.name), [
-    "list_folders", "list_artifacts", "publish_artifact", "list_collections", "define_collection", "delete_collection",
+    "list_folders", "list_artifacts", "get_artifact", "publish_artifact", "list_collections", "define_collection", "delete_collection",
     "list_records", "get_record", "create_record", "update_record", "delete_record",
     "start_upload", "get_upload", "complete_upload", "cancel_upload", "get_file",
   ]);
@@ -103,10 +108,16 @@ test("tools/list publishes every tool with an input schema", async () => {
     assert.equal(tool.inputSchema.type, "object", tool.name);
     assert.ok(tool.description.length > 0, tool.name);
   }
-  for (const tool of tools.slice(11)) {
+  for (const tool of tools.slice(12)) {
     assert.match(tool.description, /partPath|downloadPath/, tool.name);
     assert.match(tool.description, /Authorization: Bearer/, tool.name);
   }
+  const publish = tools.find(tool => tool.name === "publish_artifact");
+  assert.ok(publish);
+  assert.deepEqual(publish.inputSchema.properties?.ifVersion, {
+    type: "integer", minimum: 1, description: "Only publish when the current version matches.",
+  });
+  assert.equal(publish.inputSchema.required?.includes("ifVersion"), false);
 });
 
 test("tools/call uploads a file whose bytes travel over HTTP", async () => {
@@ -159,6 +170,61 @@ test("tools/call publishes and manages records through the API", async () => {
   assert.equal((await env.call("list_artifacts")).structuredContent.artifacts.length, 1);
 });
 
+test("get_artifact returns explicit content through shared authorization", async () => {
+  const env = await environment();
+  const published = await env.call("publish_artifact", { folder: "acme", slug: "form", title: "Form", html: HTML });
+  const artifactId = published.structuredContent.artifact.id;
+  const denied = await env.call("get_artifact", { artifact: "form" });
+  assert.equal(denied.isError, true);
+  assert.equal(denied.structuredContent.error.code, "forbidden");
+
+  const capable = await Effect.runPromise(env.keys.mint({
+    userId: env.owner.id, kind: "master", artifactId: null, scopes: "master", can_read_content: true,
+  }));
+  const success = await env.call("get_artifact", { artifact: "form", version: 1 }, { key: capable.key });
+  assert.equal(success.isError, false);
+  const content = success.structuredContent;
+  assert.deepEqual({ ...content, html: undefined }, {
+    artifact: { id: artifactId, slug: "form", version: 1 },
+    version: 1, type: "text/html", title: "Form", language: "en", html: undefined,
+  });
+  assert.match(String(content.html), /<h1>Form<\/h1>/);
+  const scoped = await Effect.runPromise(env.keys.mint({
+    userId: env.owner.id, kind: "artifact", artifactId, scopes: "read", can_read_content: true,
+  }));
+  assert.equal((await env.call("get_artifact", { artifact: "form" }, { key: scoped.key })).isError, false);
+  const writer = await Effect.runPromise(env.keys.mint({
+    userId: env.owner.id, kind: "artifact", artifactId, scopes: "write", can_read_content: true,
+  }));
+  assert.equal((await env.call("get_artifact", { artifact: "form" }, { key: writer.key })).structuredContent.error.code, "forbidden");
+  assert.equal((await env.call("get_artifact", { artifact: "form" }, { key: env.master.key })).structuredContent.error.code, "forbidden");
+  assert.equal((await env.call("list_artifacts")).structuredContent.artifacts.length, 1);
+  assert.equal(JSON.stringify((await env.call("list_artifacts")).structuredContent).includes(HTML), false);
+});
+test("scoped content readers can initialize and discover only get_artifact", async () => {
+  const env = await environment();
+  const published = await env.call("publish_artifact", { folder: "acme", slug: "form", title: "Form", html: HTML });
+  const key = await Effect.runPromise(env.keys.mint({
+    userId: env.owner.id, kind: "artifact", artifactId: published.structuredContent.artifact.id,
+    scopes: "read", can_read_content: true,
+  }));
+  const initialized = await env.rpc({
+    jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: "2025-06-18" },
+  }, { key: key.key });
+  assert.equal(initialized.status, 200);
+  assert.equal((await initialized.json<RpcResponse>()).result.protocolVersion, "2025-06-18");
+  const listed = await env.rpc({ jsonrpc: "2.0", id: 2, method: "tools/list" }, { key: key.key });
+  assert.equal(listed.status, 200);
+  assert.deepEqual((await listed.json<RpcResponse>()).result.tools.map(({ name }) => name), ["get_artifact"]);
+  const refused = await env.rpc({
+    jsonrpc: "2.0", id: 3, method: "tools/call", params: { name: "list_artifacts", arguments: {} },
+  }, { key: key.key });
+  assert.equal(refused.status, 403);
+  assert.equal((await refused.json<{ error: { message: string } }>()).error.message,
+    "This MCP operation needs a master key; artifact keys are limited to authorized get_artifact reads.");
+});
+
+
 test("API errors become tool errors", async () => {
   const env = await environment();
   await env.call("publish_artifact", { folder: "acme", slug: "form", title: "Form", html: HTML });
@@ -177,11 +243,14 @@ test("authentication, origin and method guards", async () => {
 
   const published = await env.call("publish_artifact", { folder: "acme", slug: "form", title: "Form", html: HTML });
   const scoped = await Effect.runPromise(env.keys.mint({ userId: env.owner.id, kind: "artifact", artifactId: published.structuredContent.artifact.id, scopes: "read_write" }));
-  for (const body of [{ jsonrpc: "2.0", id: 9, method: "tools/list" }, { jsonrpc: "2.0", id: 10, method: "tools/call", params: { name: "list_collections", arguments: { folder: "acme" } } }]) {
-    const denied = await env.rpc(body, { key: scoped.key });
-    assert.equal(denied.status, 403);
-    assert.equal((await denied.json<{ error: { code: string } }>()).error.code, "forbidden");
-  }
+  const hidden = await env.rpc({ jsonrpc: "2.0", id: 9, method: "tools/list" }, { key: scoped.key });
+  assert.equal(hidden.status, 200);
+  assert.deepEqual((await hidden.json<RpcResponse>()).result.tools.map(({ name }) => name), []);
+  const denied = await env.rpc({
+    jsonrpc: "2.0", id: 10, method: "tools/call", params: { name: "list_collections", arguments: { folder: "acme" } },
+  }, { key: scoped.key });
+  assert.equal(denied.status, 403);
+  assert.equal((await denied.json<{ error: { code: string } }>()).error.code, "forbidden");
 
   assert.equal((await env.rpc(initialize, { headers: { origin: "https://evil.test" } })).status, 403);
   assert.equal((await env.rpc(initialize, { headers: { origin: "https://example.test" } })).status, 200);
@@ -218,4 +287,39 @@ test("tool calls share the API rate limit", async () => {
   const limited = await env.call("list_folders");
   assert.equal(limited.isError, true);
   assert.equal(limited.structuredContent.error.code, "rate-limited");
+});
+test("MCP publish_artifact forwards optional ifVersion and preserves omitted writes", async () => {
+  const env = await environment();
+  const first = await env.call("publish_artifact", { folder: "acme", slug: "form", title: "Form", html: HTML });
+  assert.equal(first.isError, false);
+  assert.equal(first.structuredContent.artifact.version, 1);
+
+  const update = await env.call("publish_artifact", {
+    folder: "acme", slug: "form", title: "Form", html: HTML.replace("<h1>Form</h1>", "<h1>New</h1>"), ifVersion: 1,
+  });
+  assert.equal(update.isError, false);
+  assert.equal(update.structuredContent.artifact.version, 2);
+  const objectCount = env.bucket.objects.size;
+
+  const stale = await env.call("publish_artifact", { folder: "acme", slug: "form", title: "Form", html: HTML, ifVersion: 1 });
+  assert.equal(stale.isError, true);
+  assert.equal(stale.structuredContent.error.code, "conflict");
+  assert.equal(stale.structuredContent.error.details?.currentVersion, 2);
+
+  const unconditional = await env.call("publish_artifact", { folder: "acme", slug: "form", title: "Form", html: HTML });
+  assert.equal(unconditional.isError, false);
+  assert.equal(unconditional.structuredContent.artifact.version, 3);
+  assert.equal(env.bucket.objects.size, objectCount + 1);
+});
+test("MCP conditional publish cannot create a missing artefact or folder", async () => {
+  const env = await environment();
+  const response = await env.call("publish_artifact", {
+    folder: "new-folder", slug: "missing", title: "Missing", html: HTML, ifVersion: 1,
+  });
+  assert.equal(response.isError, true);
+  assert.equal(response.structuredContent.error.code, "conflict");
+  assert.equal(response.structuredContent.error.details?.currentVersion, 0);
+  assert.equal((await env.DB.prepare("SELECT COUNT(*) AS count FROM folders").first<{ count: number }>())?.count, 0);
+  assert.equal((await env.DB.prepare("SELECT COUNT(*) AS count FROM artifacts").first<{ count: number }>())?.count, 0);
+  assert.equal(env.bucket.objects.size, 0);
 });

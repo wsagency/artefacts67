@@ -171,10 +171,11 @@ its part size (§8 Files).
 
 | Method | Path | Auth | Purpose |
 |---|---|---|---|
-| \`POST\` | \`/_api/artifacts\` | master, or artifact key with \`write\` | upsert + synchronous publish → \`200\`/\`201\` |
+| \`POST\` | \`/_api/artifacts\` | master, or artifact key with \`write\` | upsert + synchronous publish → \`200\`/\`201\`; optional \`ifVersion\` guards updates |
 | \`GET\` | \`/_api/artifacts\` | master, or artifact key with \`read\` | list currently readable artefacts (an artifact key lists only its one) |
+| \`GET\` | \`/_api/artifacts/<ref>/content\` | master, or artifact key with \`read\` and \`can_read_content\` | explicitly authorized content read; optional \`?version=\` selects a retained version |
 | \`GET\` | \`/_api/folders\` | master | list owned and explicitly shared readable folders |
-| \`POST\` | \`/_api/artifacts/rotate\` | master, or artifact key with \`write\` | set/clear the password gate, optionally a new version |
+| \`POST\` | \`/_api/artifacts/rotate\` | master, or artifact key with \`write\` | set/clear the password gate, optionally a new version; \`ifVersion\` applies with \`html\` |
 | \`POST\` | \`/_api/artifacts/alias\` | master, or artifact key with \`write\` | record retired paths on one artefact |
 | \`POST\` | \`/_api/folders/alias\` | master | record retired paths on one folder |
 | \`POST\` | \`/_api/keys\` | master | mint an artifact key bound to one artefact |
@@ -191,7 +192,7 @@ its part size (§8 Files).
 | \`POST\` | \`/_api/projects/<folder>/collections/<name>/uploads/<id>/complete\` | master (\`write\`, records only) | finish an upload (§8 Files) |
 | \`GET\` | \`/_api/projects/<folder>/collections/<name>/files/<fileId>\` | master (\`read\`, or \`manage\` for responses) | attached file metadata (§8 Files) |
 | \`GET\` | \`/_api/projects/<folder>/collections/<name>/records/<id>/files/<fileId>\` | master (\`read\`, or \`manage\` for responses) | download file bytes (§8 Files) |
-| \`POST\` | \`/_mcp\` | master | MCP over Streamable HTTP (§8) |
+| \`POST\` | \`/_mcp\` | master, or artifact key authorized for \`get_artifact\` | MCP over Streamable HTTP (§8) |
 | \`GET\` | \`/_api/contract\` | public | this document |
 
 **Publish** — \`POST /_api/artifacts\`, JSON body:
@@ -205,9 +206,16 @@ its part size (§8 Files).
   "lang": "hr",
   "html": "<!doctype html><html lang=\\"hr\\">…</html>",
   "password": "optional-strong-password",
-  "note": "optional version note"
+  "note": "optional version note",
+  "ifVersion": 5
 }
 \`\`\`
+
+\`ifVersion\` is optional and must be a positive integer. On an update, the write succeeds only
+if the current version matches; otherwise the API returns \`409 conflict\` with \`currentVersion\`
+and leaves the current version unchanged. A conditional publish cannot create a new artefact
+(it returns \`409 conflict\`, \`currentVersion: 0\`). Omitting \`ifVersion\` preserves the existing
+unconditional publish behavior.
 
 - Upsert: the identity key is \`(folder, slug)\`. Re-posting the same pair **updates** the
   artefact — a new version under the same private ordinary address.
@@ -231,8 +239,12 @@ its part size (§8 Files).
   findings (§3)… ] }\` — \`warnings\` is always present, possibly empty. The JSON spelling is
   \`artifact\` (the schema spelling); the metadata never includes content or a password.
 
+
+In M1, ordinary \`site\` publishes remain complete-document writes and are unchanged. M1 does
+not implement page types, themes or new viewer behavior. The optional \`ifVersion\` write guard
+does not add conditional tokens to console forms.
 **Rotate** — \`POST /_api/artifacts/rotate\`, body \`{ "artifact": "<slug-or-id>", "password":
-<omitted> | null | "≥ 8 characters", "html": "<optional new document>" }\`. An ordinary path is
+<omitted> | null | "≥ 8 characters", "html": "<optional new document>", "ifVersion": 5 }\`. An ordinary path is
 globally unique, so rotate addresses the artefact directly — there is no \`folder\` field.
 \`password\` omitted leaves the additional gate exactly as it is; \`null\` **clears only that gate**
 without changing private access or independent visitor-share passwords; a string sets
@@ -242,6 +254,11 @@ a scoped key): without it a short password is \`invalid-password\`, with it the 
 waived for that one write and the audit row records \`weakPassword: true\`. \`html\`, when
 present, publishes a new version under the same link. Metadata (\`title\`, \`lang\`, …) belongs
 to publish, never to rotate.
+
+\`ifVersion\` is optional and applies when \`html\` is supplied. A stale version returns
+\`409 conflict\` with \`currentVersion\`; the rejected write does not replace the newer version,
+and a losing concurrent write's stored object is removed. Without \`ifVersion\`, rotate keeps
+its existing unconditional behavior. Conditional tokens are not part of console forms in M1.
 
 **Retired paths** — \`POST /_api/artifacts/alias\`, body
 \`{ "artifact": "<slug-or-id>", "paths": ["<path>", …] }\` →
@@ -258,22 +275,35 @@ answers to is \`409 conflict\` — the single path namespace is not weakened by 
 to it.
 
 **Read** — \`GET /_api/folders\` → \`{ "folders": […] }\`; \`GET /_api/artifacts\` →
-\`{ "artifacts": [ …the same \`artifact\` view publish returns… ] }\` (an artifact key gets the
-one artefact it is bound to). Metadata and private ordinary addresses only — there is no content
-endpoint at any scope, and a returned URL is not anonymous read authority.
+\`{ "artifacts": [ …the same metadata view publish returns… ] }\` (an artifact key gets the
+one artefact it is bound to). These lists expose metadata only. Content is returned only by
+\`GET /_api/artifacts/<ref>/content[?version=<positive integer>]\`, which returns
+\`{ "artifact": { "id", "slug", "version" }, "version", "type": "text/html", "title",
+"language", "html" }\`. Omit \`version\` for the current version. This explicit read requires
+\`can_read_content\` plus the key's current read authority; artifact keys must also have \`read\`
+scope and the requested artefact must be their bound artefact. Password-gated content needs no
+password for an authorized key. A password or visitor share alone never authorizes this route.
+Missing artefacts or retained versions return \`404 not-found\`; missing capability, scope or
+authority returns \`403 forbidden\`. Each attempt is audited with its outcome and version where
+available; audit details never include source content.
+
+Content reads require this capability and the key's current authority; password and visitor
+shares never authorize the API or MCP read. Every content read is audited with its outcome and
+without source content.
 
 **Keys** — master-key only on every \`/_api/keys\` path (an artifact key gets \`403 forbidden\`
 there), and \`POST /_api/keys\` mints **artifact** keys only (ADR 0015: a master key never
 mints another master key — the console owns that). Mint body:
-\`{ "artifact": "<slug-or-id>", "scopes": "read" | "write" | "read_write", "label"? }\` (label
-≤ 120 characters) → \`{ "key": { "id", "kind", "artifactId", "prefix", "scopes", "label",
-"createdAt" }, "token": "waa_…" }\`. \`POST /_api/keys/rotate\`, body \`{ "id": "<key id>" }\` →
-the same \`{ "key", "token" }\` shape with the new plaintext. \`GET /_api/keys\` →
-\`{ "keys": [ { "id", "kind", "artifactId", "prefix", "scopes", "label", "createdAt",
-"revokedAt", "lastUsedAt" } ] }\` — prefixes only, never the hash. \`DELETE /_api/keys/<id>\`
-revokes → \`{ "ok": true, "id": "…" }\` (\`404 not-found\` for a missing, foreign, or already
-revoked key). The plaintext \`token\` appears exactly once, in the mint or rotate response; it
-is never re-readable.
+\`{ "artifact": "<slug-or-id>", "scopes": "read" | "write" | "read_write", "label"?,
+"can_read_content"? }\` (label ≤ 120 characters; \`can_read_content\` is boolean) → \`{ "key":
+{ "id", "kind", "artifactId", "prefix", "scopes", "label", "can_read_content", "createdAt" },
+"token": "waa_…" }\`. \`can_read_content\` is an explicit opt-in on key creation; absent and
+unchecked values are false, including for existing keys. \`POST /_api/keys/rotate\`, body
+\`{ "id": "<key id>" }\` → the same \`{ "key", "token" }\` shape with the new plaintext and the
+existing capability unchanged. \`GET /_api/keys\` returns keys with the same capability boolean
+and prefixes only, never the hash. \`DELETE /_api/keys/<id>\` revokes → \`{ "ok": true, "id": "…" }\`
+(\`404 not-found\` for a missing, foreign, or already revoked key). The plaintext \`token\` appears
+exactly once, in the mint or rotate response; it is never re-readable.
 
 **Errors** — one envelope everywhere:
 
@@ -311,10 +341,14 @@ owner console at \`/settings/keys\`.
   Revocation, suspension or a move out of a granted subtree removes reach on subsequent requests;
   issuing a key never snapshots a grant. A leaked key's maximum scope is one artefact.
 
-Platform-wide listing is an Owner/Admin console view, never an API-key capability. No key of
-any tier can read artefact content or retrieve a password. Authorized users read through the
-console's isolated preview or an authorized ordinary link; external visitors need an active
-visitor share and its independent gate. Password changes require resource editing authority.
+Platform-wide listing is an Owner/Admin console view, never an API-key capability. The M1
+\`can_read_content\` capability is an explicit key-creation opt-in (unchecked by default and false
+for existing keys); key rotation preserves it. API and MCP content reads require that capability
+and current read authority, and artifact keys additionally require \`read\` scope and their bound
+artefact. Authorized keys can read password-gated content without its password; a password or
+visitor share alone never authorizes API/MCP content reads. Every read is audited with its
+outcome but without source content. The console's isolated preview and authorized ordinary links
+remain separate from this API capability. Password changes require resource editing authority.
 
 ## 6. Visual styleguide
 
@@ -620,20 +654,25 @@ without \`Content-Type: application/octet-stream\` is \`422 validation\` (field 
 ### MCP
 
 \`POST /_mcp\` speaks the Model Context Protocol over Streamable HTTP, stateless: one JSON-RPC
-2.0 message per request (no batches), a JSON response, no sessions or SSE. Send the same
-\`Authorization: Bearer wak_…\` master key; a non-master key gets \`403 forbidden\` ("MCP needs a
-master key."). Other methods get \`405\` with \`Allow: POST\`. A request carrying an \`Origin\` other
-than the platform's own is refused (\`403\`). An unsupported \`MCP-Protocol-Version\` header is
-\`400\`; \`2025-06-18\` and \`2025-03-26\` are supported. A body over the API limit is \`413 too-large\`.
-A notification (no \`id\`) gets \`202\` with no body.
+2.0 message per request (no batches), a JSON response, no sessions or SSE. Send a master key,
+or an artifact key with \`can_read_content\`, \`read\` scope and current authority when calling
+\`get_artifact\`; other operations still require a master key. Other methods get \`405\` with
+\`Allow: POST\`. A request carrying an \`Origin\` other than the platform's own is refused (\`403\`).
+An unsupported \`MCP-Protocol-Version\` header is \`400\`; \`2025-06-18\` and \`2025-03-26\` are
+supported. A body over the API limit is \`413 too-large\`. A notification (no \`id\`) gets \`202\`
+with no body.
 
 Methods: \`initialize\`, \`ping\`, \`tools/list\`, \`tools/call\`. Tools: \`list_folders\`,
-\`list_artifacts\`, \`publish_artifact\`, \`list_collections\`, \`define_collection\`,
+\`list_artifacts\`, \`publish_artifact\`, \`get_artifact\`, \`list_collections\`, \`define_collection\`,
 \`delete_collection\`, \`list_records\`, \`get_record\`, \`create_record\`, \`update_record\`,
 \`delete_record\`, \`start_upload\` \`{ folder, collection, field, name, type?, size, lastModified? }\`,
-\`get_upload\`, \`complete_upload\` and \`cancel_upload\` \`{ folder, collection, uploadId }\`, and
-\`get_file\` \`{ folder, collection, fileId }\` (16 tools). Each tool runs the matching \`/_api\`
-request with the caller's key, so authority, rate limits and audit are identical. A tool result is
+\`get_upload\`, \`complete_upload\`, \`cancel_upload\` \`{ folder, collection, uploadId }\`, and
+\`get_file\` \`{ folder, collection, fileId }\` (17 tools). \`publish_artifact\` accepts optional
+\`ifVersion\`; a stale value returns \`409 conflict\` with the current version, and omission retains
+unconditional publication. \`get_artifact({artifact,version?})\` returns content only through an
+explicitly authorized read. Its result has the same metadata and HTML fields as the HTTP content
+route. Each tool runs the matching \`/_api\` request with the caller's key, so authority, rate
+limits and audit are identical. A tool result is
 \`{ "content": [ { "type": "text", "text": "<JSON>" } ], "structuredContent": <the API body>,
 "isError": <API status ≥ 400> }\`.
 

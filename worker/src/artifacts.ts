@@ -44,6 +44,8 @@ const KEY_BYTES = 32;
 export const PURGE_LIMITS = { batch: 10, batches: 10, graceMs: 3_600_000 } as const;
 
 const coded = (code: string, message: string): CodeError => Object.assign(new Error(message), { code });
+const versionConflict = (expected: number, currentVersion: number) =>
+  Object.assign(coded("version-conflict", `Artefact has changed since version ${expected}.`), { currentVersion });
 const io = <A>(run: () => Awaitable<A>): Effect.Effect<A, CodeError> =>
   Effect.tryPromise({ try: () => Promise.resolve(run()), catch: asCodeError });
 
@@ -83,10 +85,12 @@ export interface CreateArtifact {
 }
 export interface PublishArtifact {
   artifactId: string; html: unknown; authorType?: AuthorType; authorId: string;
-  note?: string | null; password?: unknown; title?: unknown; lang?: unknown; prepared?: unknown;
+  note?: string | null; password?: unknown; title?: unknown; lang?: unknown; prepared?: unknown; ifVersion?: number;
 }
 export interface DuplicateArtifact extends Omit<CreateArtifact, "html" | "prepared"> { artifactId: string }
-export interface RestoreArtifact { artifactId: string; version: unknown; authorType?: AuthorType; authorId: string; note?: string | null }
+export interface RestoreArtifact {
+  artifactId: string; version: unknown; authorType?: AuthorType; authorId: string; note?: string | null; ifVersion?: number;
+}
 export interface PublishedVersion { version: number; size: number; createdAt: string; warnings: ValidationIssue[] }
 export type ArtifactChange = (artifactId: string) => Effect.Effect<unknown, CodeError>;
 export interface Artifacts {
@@ -121,6 +125,7 @@ export interface Artifacts {
   remove(artifactId: string, options?: { authorId?: string }): Effect.Effect<Artifact, CodeError>;
   /** Purges withdrawn artefacts past their grace; returns how many. A storage failure ends the run. */
   sweep(): Effect.Effect<number, CodeError>;
+  readContent(artifact: Artifact | null | undefined, version?: unknown): Effect.Effect<{ version: ArtifactVersion; html: string }, CodeError>;
   document(artifact: Artifact | null | undefined, version?: unknown): Effect.Effect<string, CodeError>;
   gatePayload(artifact: Artifact | null | undefined): Effect.Effect<GatePayload, CodeError>;
   ciphertext(artifact: Artifact): Effect.Effect<ArtifactCiphertext, CodeError>;
@@ -131,7 +136,7 @@ interface Capture extends PreparedArtifactHtml { exact?: boolean }
 interface Provenance { size: number; sha256: string }
 interface WriteVersion {
   keyHex: string; authorType: AuthorType; authorId: string; note: string | null;
-  captured?: Capture; provenance?: Provenance | null; changes?: D1Statement[];
+  captured?: Capture; provenance?: Provenance | null; changes?: D1Statement[]; ifVersion?: number;
 }
 
 function toArtifact(row: ArtifactRow): Artifact;
@@ -236,7 +241,10 @@ export function openArtifacts({ db, bucket, masterKeyHex, settings, iterations =
 
   /** R2 first, then the atomic rows/trigger that decide the winning publication. */
   const writeVersion = Effect.fn(function* (artifact: Artifact, html: unknown,
-    { keyHex, authorType, authorId, note, captured, provenance = null, changes = [] }: WriteVersion) {
+    { keyHex, authorType, authorId, note, captured, provenance = null, changes = [], ifVersion }: WriteVersion) {
+    if (ifVersion !== undefined && artifact.currentVersion !== ifVersion) {
+      return yield* Effect.fail(versionConflict(ifVersion, artifact.currentVersion));
+    }
     if (typeof html !== "string") return yield* Effect.fail(coded("invalid-content", "artefact content must be a string"));
     const authored = enc.encode(html);
     const ready: Capture = captured ?? (yield* prepareArtifactHtml(html, { fetcher: fontFetch }));
@@ -264,7 +272,16 @@ export function openArtifacts({ db, bucket, masterKeyHex, settings, iterations =
         yield* io(() => db.prepare("UPDATE artifacts SET purged_at = NULL WHERE id = ? AND deleted_at IS NOT NULL").bind(artifact.id).run());
         return yield* Effect.fail(coded("purge-failed", "Publication failed and its content could not be removed; if the artefact is withdrawn, the daily cleanup removes it"));
       })));
-      if (error.message.includes("publish-conflict:")) return yield* Effect.fail(coded("publish-conflict", "artefact withdrawn or version changed"));
+      if (error.message.includes("publish-conflict:")) {
+        if (ifVersion !== undefined) {
+          const current = yield* io(() => db.prepare("SELECT current_version FROM artifacts WHERE id = ? AND deleted_at IS NULL")
+            .bind(artifact.id).first<{ current_version: number }>());
+          if (current && Number(current.current_version) !== ifVersion) {
+            return yield* Effect.fail(versionConflict(ifVersion, Number(current.current_version)));
+          }
+        }
+        return yield* Effect.fail(coded("publish-conflict", "artefact withdrawn or version changed"));
+      }
       return yield* Effect.fail(error);
     })));
     yield* prune(artifact.id, yield* self.versions(artifact.id));
@@ -381,7 +398,7 @@ export function openArtifacts({ db, bucket, masterKeyHex, settings, iterations =
     prepare: (html, options) => service.prepare(html, options),
     create: (input) => create(input),
     publish: Effect.fn(function* ({ artifactId, html, authorType = "user", authorId, note = null,
-      password: rawPassword, title, lang, prepared = null }: PublishArtifact) {
+      password: rawPassword, title, lang, prepared = null, ifVersion }: PublishArtifact) {
       const artifact = yield* required(artifactId);
       if (artifact.deletedAt) return yield* Effect.fail(coded("not-found", "no such artefact"));
       const keyHex = yield* self.contentKey(artifact), changes: D1Statement[] = [];
@@ -396,7 +413,7 @@ export function openArtifacts({ db, bucket, masterKeyHex, settings, iterations =
       if (lang != null) changes.push(db.prepare("UPDATE artifacts SET lang = ? WHERE id = ?").bind(String(lang), artifact.id));
       const gated = rawPassword !== undefined ? gatePassword(rawPassword) != null : self.gated(artifact);
       const captured = yield* resolvePrepared(html, prepared, gated);
-      const result = yield* writeVersion(artifact, html, { keyHex, authorType, authorId, note, captured, changes });
+      const result = yield* writeVersion(artifact, html, { keyHex, authorType, authorId, note, captured, changes, ifVersion });
       yield* changed(artifact.id);
       return result;
     }),
@@ -457,11 +474,11 @@ export function openArtifacts({ db, bucket, masterKeyHex, settings, iterations =
       return yield* create({ ownerId, folderId, title: title ?? (yield* self.title(source)), slug, password,
         lang: source.lang, html, authorType, authorId, note }, yield* Effect.try({ try: () => storedCapture(html), catch: asCodeError }), row);
     }),
-    restore: Effect.fn(function* ({ artifactId, version, authorType = "user", authorId, note = null }: RestoreArtifact) {
+    restore: Effect.fn(function* ({ artifactId, version, authorType = "user", authorId, note = null, ifVersion }: RestoreArtifact) {
       const { artifact, row } = yield* retained(yield* self.byId(artifactId), version);
       const html = yield* self.document(artifact, version);
       const result = yield* writeVersion(artifact, html, { keyHex: yield* self.contentKey(artifact),
-        authorType, authorId, note, captured: yield* Effect.try({ try: () => storedCapture(html), catch: asCodeError }), provenance: row });
+        authorType, authorId, note, ifVersion, captured: yield* Effect.try({ try: () => storedCapture(html), catch: asCodeError }), provenance: row });
       yield* changed(artifact.id);
       return result;
     }),
@@ -498,9 +515,22 @@ export function openArtifacts({ db, bucket, masterKeyHex, settings, iterations =
       }
       return purged;
     }),
+    readContent: Effect.fn(function* (artifact: Artifact | null | undefined, version: unknown = artifact?.currentVersion) {
+      const { artifact: current, row } = yield* retained(artifact, version);
+      const object = yield* io(() => bucket.get(row.r2_key));
+      if (!object) return yield* Effect.fail(coded("content-missing", `R2 object missing for ${current.id}@${String(version)}`));
+      const bytes = new Uint8Array(yield* io(() => object.arrayBuffer()));
+      return {
+        version: {
+          artifactId: row.artifact_id, version: Number(row.version), r2Key: row.r2_key, size: Number(row.size),
+          sha256: row.sha256, authorType: row.author_type, authorId: row.author_id,
+          note: row.note ?? null, createdAt: row.created_at,
+        },
+        html: utf8(yield* openBlob(yield* self.contentKey(current), bytes)),
+      };
+    }),
     document: Effect.fn(function* (artifact: Artifact | null | undefined, version: unknown = artifact?.currentVersion) {
-      const current = (yield* retained(artifact, version)).artifact;
-      return utf8(yield* openBlob(yield* self.contentKey(current), yield* readObject(current, version)));
+      return (yield* self.readContent(artifact, version)).html;
     }),
     gatePayload: Effect.fn(function* (artifact: Artifact | null | undefined) {
       const current = (yield* retained(artifact, artifact?.currentVersion)).artifact;

@@ -521,3 +521,52 @@ test("old 0033 drafts and failed purges are swept", async () => {
   assert.equal(bucket.objects.size, 0);
   assert.equal(await countOf(db, "artifacts WHERE purged_at IS NULL"), 0);
 });
+test("conditional restore refuses a stale version and leaves the live version and objects intact", async () => {
+  const { artifacts, owner, bucket } = await services();
+  const first = await Effect.runPromise(artifacts.create({ ownerId: owner.id, html: HTML, authorId: owner.id }));
+  await Effect.runPromise(artifacts.publish({ artifactId: first.id, html: NEXT, authorId: owner.id }));
+  const before = [...bucket.objects.keys()];
+
+  await assert.rejects(
+    Effect.runPromise(artifacts.restore({ artifactId: first.id, version: 1, authorId: owner.id, ifVersion: 1 })),
+    (error: unknown) => error !== null && typeof error === "object" && "code" in error &&
+      error.code === "version-conflict" && "currentVersion" in error && error.currentVersion === 2,
+  );
+  assert.deepEqual([...bucket.objects.keys()], before);
+  assert.equal((await Effect.runPromise(artifacts.byId(first.id)))?.currentVersion, 2);
+  assert.equal(await Effect.runPromise(artifacts.document(await Effect.runPromise(artifacts.byId(first.id)))), NEXT);
+
+  const restored = await Effect.runPromise(artifacts.restore({ artifactId: first.id, version: 1, authorId: owner.id }));
+  assert.equal(restored.version, 3);
+});
+
+test("simultaneous conditional publications retain one winner and remove the losing R2 object", async () => {
+  const { artifacts, owner, bucket } = await services();
+  const first = await Effect.runPromise(artifacts.create({ ownerId: owner.id, html: HTML, authorId: owner.id }));
+  const originalPut = bucket.put.bind(bucket);
+  let putCount = 0;
+  let release: (() => void) | undefined;
+  const bothPutting = new Promise<void>(resolve => { release = resolve; });
+  bucket.put = async (...args) => {
+    putCount++;
+    if (putCount === 2) release?.();
+    await bothPutting;
+    return originalPut(...args);
+  };
+  const attempts = await Promise.allSettled([
+    Effect.runPromise(artifacts.publish({ artifactId: first.id, html: NEXT, authorId: owner.id, ifVersion: 1 })),
+    Effect.runPromise(artifacts.publish({ artifactId: first.id, html: HTML.replace("First", "Third"), authorId: owner.id, ifVersion: 1 })),
+  ]);
+  const winners = attempts.filter(result => result.status === "fulfilled");
+  const loser = attempts.find((result): result is PromiseRejectedResult => result.status === "rejected");
+  assert.equal(winners.length, 1);
+  assert.ok(loser);
+  assert.ok(loser.reason instanceof Error);
+  assert.equal("code" in loser.reason ? loser.reason.code : undefined, "version-conflict");
+  assert.equal((await Effect.runPromise(artifacts.byId(first.id)))?.currentVersion, 2);
+  assert.equal((await Effect.runPromise(artifacts.versions(first.id))).length, 2);
+  assert.equal([...bucket.objects.keys()].filter(key => key.startsWith(`art/${first.id}/`)).length, 2);
+  const current = await Effect.runPromise(artifacts.byId(first.id));
+  assert.ok(current);
+  assert.ok([NEXT, HTML.replace("First", "Third")].includes(await Effect.runPromise(artifacts.document(current))));
+});

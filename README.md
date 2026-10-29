@@ -81,7 +81,7 @@ strongly-consistent counters). You run your own instance: see [First deploy](#fi
 | Visitor share | `/<target>/s/<token>/` | anyone holding an active share link, and its password when required |
 | Observations | `POST /_ev` | the share viewer, with a short-lived authorized opening proof |
 | Write API | `/_api/*` | agents, with a `wak_` master key or a `waa_` artefact key |
-| MCP | `POST /_mcp` | agents, with a `wak_` master key |
+| MCP | `POST /_mcp` | agents, with a `wak_` master key; authorized `waa_` keys may call `get_artifact` |
 | Documentation | `/instructions` — features, workflows, permissions, API reference and copyable AI instructions | public |
 | Root | `/` — redirects to sign-in or the console | public |
 | AI briefing | `GET /llms.txt` — the same agent instructions as plain text, without credentials | public |
@@ -125,6 +125,16 @@ The write API publishes **synchronously**: `POST /_api/artifacts` upserts on `(f
 answers `201`/`200` with the artefact already live. A master key can also mint, rotate and revoke
 per-artefact keys, record retired paths, and — deliberately, per request — accept a password below
 the eight-character floor that guards unattended agents.
+
+Artifact keys can opt into `can_read_content` when created; unchecked or omitted values, including
+for existing keys, are false. Key rotation preserves the capability. The HTTP content-read route
+and MCP `get_artifact` require the opt-in plus current read authority (and `read` scope for artifact
+keys), and audit each outcome without storing source content. Password-gated content does not
+require its password for an authorized key; passwords and visitor shares alone do not grant API/MCP
+read authority. Publish and rotate-with-HTML accept optional `ifVersion`: stale writes conflict and
+concurrent losing content is cleaned up; omission retains unconditional behavior. M1 leaves ordinary
+`site` publication unchanged and does not ship page types, themes, viewer changes or conditional
+console form tokens.
 
 ## Native navigation regression check
 
@@ -244,30 +254,37 @@ a reload before the big file's second part and a resume that skips the acknowled
 checks both files' bytes over the API, aborts an upload (one `upload-cancel`, no part sent), and
 has a signed-out share visitor submit a file (and be refused a records upload). It then deletes
 the records, collections, share and artefacts. A run interrupted before that cleanup can leave
-upload sessions open for up to 24 h (five per reader). Supply its reader URL,
-local `wsa_session` cookie value, Chrome executable, and a local `wak_` master key
-(minted under Settings → API keys on the local console) explicitly; never use production
-credentials:
+upload sessions open for up to 24 h (five per reader). Supply its reader URL, the `wsa_session`
+cookie value for the collaborator, Chrome executable, a local content-read `wak_` master key, and
+a separate key without `can_read_content` (a `wak_` master or a fixture-scoped `waa_` key);
+never use production credentials. Use a collaborator session with no master key and manager access
+to the fixture folder; both API keys belong to the fixture owner.
+With the collaborator session above, `WS_SMOKE_OWNER_SESSION` is required: it is the owner's local
+session cookie used only for cleanup of artefacts created through the master key. Omit it only
+for same-owner runs, where cleanup uses `WS_SMOKE_SESSION`:
 
 ```sh
-WS_SMOKE_VIEWER='http://localhost:8787/app/a/<smoke-slug>/view' \
-WS_SMOKE_SESSION='<local-session-cookie>' \
+WS_SMOKE_VIEWER='http://localhost:8788/app/a/<smoke-slug>/view' \
+WS_SMOKE_SESSION='<local-collaborator-session-cookie>' \
+WS_SMOKE_OWNER_SESSION='<local-owner-session-cookie>' \
 WS_SMOKE_CHROME='<Chrome executable>' \
-WS_SMOKE_API_KEY='<local wak_ master key>' \
+WS_SMOKE_API_KEY='<local content-read wak_ master key>' \
+WS_SMOKE_NOREAD_API_KEY='<local key without can_read_content>' \
 node frontend/scripts/smoke-reader.mjs
 ```
 
 For isolated local development, put a development-only master key in `worker/.dev.vars`, apply
-the local migrations and start the Worker (Wrangler persists to `worker/.wrangler/state`):
+the local migrations and start Wrangler on the reserved smoke port (Wrangler persists to
+`worker/.wrangler/state`):
 
 ```sh
 echo "ARTEFACTS_MASTER_KEY=$(openssl rand -hex 32)" > worker/.dev.vars
 npm run migrate:local
-npm run dev
+npm --prefix worker exec -- wrangler -c worker/wrangler.jsonc dev --port 8788
 ```
 
 The public `worker/wrangler.jsonc` sets no vars, so `PUBLIC_ORIGIN` and `WEBAUTHN_RP_ID` derive
-from the request (for example `http://localhost:8787`). Keep imported snapshots separate and select
+from the request (for example `http://localhost:8788`). Keep imported snapshots separate and select
 their persistence root explicitly; never run root `npm run migrate` for local setup, because it
 targets remote D1. Never reuse or regenerate a production master key for a smoke run.
 

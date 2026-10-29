@@ -7,6 +7,8 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Added
 - Initial open-source release of Artefacts67.
+- Explicit per-key content-read opt-in for HTTP and MCP reads, with read auditing and optional
+  `ifVersion` guards for publish and rotate-with-HTML writes; default `site` publication is unchanged.
 - Source code link on the documentation page and the sign-in screens.
 - Withdrawn artefacts' stored versions and application data are removed at the first daily
   cleanup at least an hour after their deletion, at most 100 artefacts per cleanup (ADR 0038).

@@ -49,6 +49,19 @@ test("an ungated artefact is sealed content the Worker opens with the master key
   assert.equal(rows[0].size, HTML.length);
 });
 
+test("document reads return the selected immutable version", async () => {
+  const { owner, artifacts } = await services();
+  const artifact = await Effect.runPromise(artifacts.create({
+    ownerId: owner.id, slug: "versions", title: "Versioned", html: HTML, authorId: owner.id,
+  }));
+  const updated = await Effect.runPromise(artifacts.publish({ artifactId: artifact.id, html: HTML2, authorId: owner.id }));
+
+  assert.equal(updated.version, 2);
+  assert.equal(await Effect.runPromise(artifacts.document(artifact, 1)), HTML);
+  assert.equal(await Effect.runPromise(artifacts.document(artifact, updated.version)), HTML2);
+  assert.deepEqual((await Effect.runPromise(artifacts.versions(artifact.id))).map(({ version }) => version), [2, 1]);
+});
+
 test("a gated artefact releases a key the visitor derives from the password", async () => {
   const { owner, artifacts } = await services();
   const artifact = await Effect.runPromise(artifacts.create({
@@ -246,4 +259,22 @@ test("artifact work is lazy and a failed downstream change keeps the committed p
   const current = await Effect.runPromise(artifacts.byId(artifact.id));
   assert.equal(current?.currentVersion, 2);
   assert.equal(await Effect.runPromise(artifacts.document(current)), HTML2);
+});
+test("conditional model writes reject a stale snapshot while omitted versions remain unconditional", async () => {
+  const { owner, artifacts, bucket } = await services();
+  const created = await Effect.runPromise(artifacts.create({ ownerId: owner.id, html: HTML, authorId: owner.id }));
+  const published = await Effect.runPromise(artifacts.publish({ artifactId: created.id, html: HTML2, authorId: owner.id }));
+  assert.equal(published.version, 2);
+
+  await assert.rejects(
+    Effect.runPromise(artifacts.publish({ artifactId: created.id, html: HTML3, authorId: owner.id, ifVersion: 1 })),
+    (error: unknown) => error !== null && typeof error === "object" && "code" in error &&
+      error.code === "version-conflict" && "currentVersion" in error && error.currentVersion === 2,
+  );
+  assert.equal((await Effect.runPromise(artifacts.byId(created.id)))?.currentVersion, 2);
+  assert.deepEqual((await Effect.runPromise(artifacts.versions(created.id))).map(row => row.version), [2, 1]);
+  assert.equal(bucket.objects.size, 2);
+
+  const unconditional = await Effect.runPromise(artifacts.publish({ artifactId: created.id, html: HTML3, authorId: owner.id }));
+  assert.equal(unconditional.version, 3);
 });

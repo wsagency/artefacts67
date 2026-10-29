@@ -267,12 +267,14 @@ export type AuditRow = {
 
 /** Best-effort writes must never fail the mutation they record. */
 export function openAudit(db: DatabaseLike): Audit {
+  function writeEntry({ actorType, actorId, action, artifactId = null, detail = null }: AuditEntry): Effect.Effect<void, CodeError> {
+    return Effect.asVoid(io(() => db.prepare(
+      "INSERT INTO audit_log (at, actor_type, actor_id, action, artifact_id, detail) VALUES (?,?,?,?,?,?)",
+    ).bind(nowIso(), actorType, String(actorId ?? ""), action, artifactId, detail ? JSON.stringify(detail) : null).run()));
+  }
   return {
-    write: ({ actorType, actorId, action, artifactId = null, detail = null }: AuditEntry): Effect.Effect<void> =>
-      Effect.catch(Effect.asVoid(io(() => db.prepare(
-        "INSERT INTO audit_log (at, actor_type, actor_id, action, artifact_id, detail) VALUES (?,?,?,?,?,?)",
-      ).bind(nowIso(), actorType, String(actorId ?? ""), action, artifactId, detail ? JSON.stringify(detail) : null).run())),
-      () => Effect.void),
+    write: (entry: AuditEntry): Effect.Effect<void> => writeEntry(entry).pipe(Effect.catch(() => Effect.void)),
+    writeRequired: (entry: AuditEntry): Effect.Effect<void, CodeError> => writeEntry(entry),
     recent: (limit: unknown = 50) => Effect.map(io(() => db.prepare(
       "SELECT at, actor_type, actor_id, action, artifact_id, detail FROM audit_log ORDER BY at DESC LIMIT ?",
     ).bind(Math.max(1, Math.min(200, Number(limit) || 50))).all<AuditRow>()), ({ results }) => results),
@@ -280,6 +282,7 @@ export function openAudit(db: DatabaseLike): Audit {
 }
 export interface Audit {
   write(entry: AuditEntry): Effect.Effect<void, CodeError>;
+  writeRequired(entry: AuditEntry): Effect.Effect<void, CodeError>;
   recent(limit?: unknown): Effect.Effect<AuditRow[], CodeError>;
 }
 
