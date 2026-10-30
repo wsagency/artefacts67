@@ -250,7 +250,7 @@ and blocked scripts or forwarded links mean these are usage estimates, not proof
 
 Use Node.js 24 LTS for CI parity (Node.js 22.12+ is supported). Install each package's locked
 dependencies with `npm ci`, `npm ci --prefix worker` and `npm ci --prefix frontend`.
-`npm run build` generates the API contract module and builds the Solid 2 RC / owned
+`npm run build` generates the API contract module and builds the Solid 2 RC.20 / owned
 SolidUI / Tailwind assets into `frontend/dist`. The strict TypeScript packages use TypeScript 7;
 `frontend/src/vite-env.d.ts` declares CSS imports. `npm run typecheck` checks both packages;
 `npm test` runs the Worker suites. Wrangler's custom build runs the same frontend build for

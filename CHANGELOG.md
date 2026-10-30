@@ -27,10 +27,10 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Changed
 - `HEAD` follows `GET` routes with matching status and headers and no response body, including static assets.
-- Pinned dependencies refreshed to current stable releases and Solid 2 RC.19, including TypeScript 7,
-  Vite 8.3.5, and Wrangler 4.154.0. CI now uses Node 24. Worker `allowScripts` pins permit the
-  esbuild and workerd install scripts required for clean npm 11 installs; `frontend/src/vite-env.d.ts`
-  declares CSS side-effect imports required by TypeScript 7.
+- Pinned dependencies refreshed to current stable releases and Solid 2 RC.20 with
+  `@solidjs/vite-plugin` 3.0.0-next.53, Effect 4.1.0, and Wrangler 4.156.0. CI uses Node 24.
+  Worker `allowScripts` pins permit the esbuild and workerd install scripts required for clean
+  npm 11 installs; `frontend/src/vite-env.d.ts` declares CSS side-effect imports required by TypeScript 7.
 - WS Agency design kit, Artefacts67 logo and favicon.
 - The Cloudflare Web Analytics beacon loads only when `WEB_ANALYTICS_TOKEN` is set.
 - The owner deletes a folder with everything in it (subfolders, artefacts, project data) by
