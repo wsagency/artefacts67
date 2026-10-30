@@ -15,9 +15,11 @@ import { asCodeError } from "../src/types.js";
 import { clientIp, PART_BYTES } from "../src/http.js";
 import worker from "../src/index.js";
 import { validatePageFragment } from "../src/page-validation.js";
+import { openProjectThemes } from "../src/themes.js";
+import { validThemeDefinition } from "./theme-fixtures.js";
 
 interface ReaderGrant { grant: string; cookie: string }
-interface RuntimeLoadBody { html: string; runtime: { grant: string }; observation: RuntimeObservation | null; page?: { type: string; theme: { scope: string; slug: string } | null; brandLock: boolean; lang?: string; compiledTheme?: { slug: string; css: string; tokens: { light: Record<string, string> } } } }
+interface RuntimeLoadBody { html: string; runtime: { grant: string }; observation: RuntimeObservation | null; page?: { type: string; theme: { scope: string; slug: string } | null; themeResolution: "explicit" | "fallback"; brandLock: boolean; lang?: string; fontsCss?: string; compiledTheme?: { slug: string; css: string; tokens: { light: Record<string, string> } } } }
 interface RuntimeStateBody { value?: JsonValue; error?: string; message?: string }
 interface RuntimeDataBody { value?: (ProjectRecord & RecordPage) | null; error?: string; message?: string; issues?: Array<{ field: string; message: string }> }
 interface RuntimeTestCaller {
@@ -466,6 +468,17 @@ test("lifecycle validation failures surface as explicit client errors, not uncau
     assert.equal(body.error, code);
   }
   f.ctx.artifacts.duplicate = original;
+  const theme = await Effect.runPromise(openProjectThemes({ db: f.db, masterKeyHex: MASTER }).define({
+    folderId: f.folder.id, slug: "brand", definition: validThemeDefinition("brand"), actorId: "owner",
+  }));
+  await f.db.prepare("UPDATE artifact_versions SET theme_scope='project',theme_slug='brand',theme_id=? WHERE artifact_id=? AND version=1")
+    .bind(theme.id, f.artifact.id).run();
+  const themedGrant = await f.load({ kind: "console", artifactId: f.artifact.id }, session.cookie);
+  const unfiled = await f.call("duplicate", {
+    grant: themedGrant.grant, title: "Unfiled copy", folderId: null, csrf: session.value.csrf,
+  }, session.cookie);
+  assert.equal(unfiled.status, 400);
+  assert.equal((await unfiled.json() as RuntimeStateBody).error, "theme-project-mismatch");
 });
 
 test("null origins and forged grants cannot write; reports are sealed, rate limited and resolvable", async (t) => {
@@ -1032,7 +1045,12 @@ test("authorized page loads expose only the selected theme and brand lock metada
   }));
   const owner = await f.session("owner");
   const opened = await f.load({ kind: "console", artifactId: page.id }, owner.cookie);
-  assert.deepEqual(opened.body.page, { type: "page", theme: { scope: "platform", slug: "report" }, brandLock: true, lang: "fr-CA" });
+  assert.equal(opened.body.page?.type, "page");
+  assert.deepEqual(opened.body.page?.theme, { scope: "platform", slug: "report" });
+  assert.equal(opened.body.page?.themeResolution, "explicit");
+  assert.equal(opened.body.page?.brandLock, true);
+  assert.equal(opened.body.page?.lang, "fr-CA");
+  assert.equal(opened.body.page?.compiledTheme?.slug, "report");
 });
 test("composition scopes compiled selectors and registers child-dependent kits after the fragment", () => {
   const theme = PLATFORM_THEMES.find(item => item.slug === "editorial")!;
@@ -1066,7 +1084,8 @@ test("sealed overrides on a page without an explicit theme apply to the checked 
   }));
   const owner = await f.session("owner");
   const opened = await f.load({ kind: "console", artifactId: page.id }, owner.cookie);
-  assert.equal(opened.body.page?.theme, null, "The page's authored theme metadata remains absent.");
+  assert.deepEqual(opened.body.page?.theme, { scope: "platform", slug: "report" }, "The live default resolves to Report when no project default is set.");
+  assert.equal(opened.body.page?.themeResolution, "explicit");
   assert.equal(opened.body.page?.brandLock, true);
   assert.equal(opened.body.page?.compiledTheme?.slug, "report");
   assert.equal(opened.body.page?.compiledTheme?.tokens.light.accent, "#8f5e00");
@@ -1085,7 +1104,8 @@ test("stored overrides survive an unavailable platform theme resolving to Report
   const owner = await f.session("owner");
   const opened = await f.load({ kind: "console", artifactId: page.id }, owner.cookie);
   assert.equal(opened.body.page?.theme?.scope, "platform");
-  assert.equal(opened.body.page?.theme?.slug, "removed-platform-theme");
+  assert.equal(opened.body.page?.theme?.slug, "report");
+  assert.equal(opened.body.page?.themeResolution, "fallback");
   assert.equal(opened.body.page?.brandLock, true);
   assert.equal(opened.body.page?.compiledTheme?.slug, "report");
   assert.equal(opened.body.page?.compiledTheme?.tokens.light.accent, "#8f5e00");
@@ -1150,7 +1170,7 @@ test("failed hosted composition installs no delayed connection error or window l
   globalThis.fetch = async () => new Response(JSON.stringify({
     html,
     runtime: { grant: "grant" },
-    page: { type: "page", theme: { scope: "platform", slug: "report" }, brandLock: false },
+    page: { type: "page", theme: { scope: "platform", slug: "report" }, themeResolution: "explicit", brandLock: false },
   }), { headers: { "Content-Type": "application/json" } });
   try {
     const opened = await openArtifact(viewer as never);

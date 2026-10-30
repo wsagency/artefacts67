@@ -23,6 +23,7 @@ import { openProjectData } from "../src/project-data.js";
 import { openProjectFiles } from "../src/project-files.js";
 import { openKeys } from "../src/keys.js";
 import { openAccess, type EstateRole, type GrantInput } from "../src/access.js";
+import { openProjectThemes } from "../src/themes.js";
 import { handleApi } from "../src/api.js";
 
 interface ArtifactListResponse { artifacts: Array<{ slug: string | null }> }
@@ -59,7 +60,7 @@ async function platform() {
   const ctx = {
     store, artifacts, folders, keys, access, projectData: openProjectData({ db, masterKeyHex: MASTER }),
     projectFiles: openProjectFiles({ db, bucket: memoryBucket(), masterKeyHex: MASTER }),
-    publicOrigin: "https://example.test",
+    themes: openProjectThemes({ db, masterKeyHex: MASTER }), publicOrigin: "https://example.test",
     limiter: openRateLimiter({ RATELIMIT: rateLimitBinding() }), contract,
   };
   const api = (path: string, { key, method = "GET", body }: { key?: string; method?: string; body?: object } = {}) => Effect.runPromise(handleApi(new Request(`https://example.test/_api/${path}`, {
@@ -599,4 +600,14 @@ test("grant work is lazy and injected audit Effects propagate original failures 
   assert.equal(await Effect.runPromise(access.role(mate.id, folder.id)), "viewer");
   await assert.rejects(Effect.runPromise(brokenAccess.revoke({ actorId: owner.id, folderId: folder.id, userId: mate.id })), (error: unknown) => error === failure);
   assert.equal(await Effect.runPromise(access.role(mate.id, folder.id)), null);
+});
+
+test("project theme reads follow the live inherited folder grant", async () => {
+  const { folders, owner, mate, access, api, masterKeyFor } = await platform();
+  const project = await Effect.runPromise(folders.create({ ownerId: owner.id, name: "Theme project" }));
+  const key = await masterKeyFor(mate);
+  await Effect.runPromise(access.grant({ actorId: owner.id, folderId: project.id, userId: mate.id, role: "viewer" }));
+  assert.equal((await api(`projects/${project.id}/themes`, { key })).status, 200);
+  await Effect.runPromise(access.revoke({ actorId: owner.id, folderId: project.id, userId: mate.id }));
+  assert.equal((await api(`projects/${project.id}/themes`, { key })).status, 403);
 });

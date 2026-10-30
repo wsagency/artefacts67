@@ -9,12 +9,21 @@ import { memoryBucket, rateLimitBinding, openAsVisitor, authoredDocument } from 
 import { openStore, type Store } from "../src/store.js";
 import { openKeys, type Key } from "../src/keys.js";
 import { openAccess } from "../src/access.js";
-import { API_BODY_LIMIT } from "../src/api.js";
+import { openFolders } from "../src/folders.js";
+import { openArtifacts } from "../src/artifacts.js";
+import { openProjectData } from "../src/project-data.js";
+import { openProjectFiles } from "../src/project-files.js";
+import { openRateLimiter } from "../src/ratelimit.js";
+import { handleApi, API_BODY_LIMIT, type ApiContext } from "../src/api.js";
 import type { GatePayload } from "../src/artifacts.js";
 import type { ValidationIssue } from "../src/validate.js";
+import { contract } from "../src/contract.js";
 import { PLATFORM_THEMES } from "../../frontend/src/platform-themes.js";
 import { composePageDocument } from "../../frontend/src/page-composition.js";
-import { worstPageDocumentLength } from "../src/page-size.js";
+import { validThemeDefinition } from "./theme-fixtures.js";
+import { openProjectThemes } from "../src/themes.js";
+import { THEME_FONT_SOURCE, themeFontFetcher } from "./theme-fixtures.js";
+import { PAGE_DOCUMENT_MAX_LENGTH, worstPageDocumentLength } from "../src/page-size.js";
 
 const PAGE_PNG = Buffer.from(readFileSync(new URL("./fixtures/page-image.png", import.meta.url))).toString("base64");
 const PAGE_JPEG = Buffer.from(readFileSync(new URL("./fixtures/page-photo.jpg", import.meta.url))).toString("base64");
@@ -167,6 +176,140 @@ test("the validator rejects what the platform cannot serve", async () => {
 
   const notJson = await env.api("/_api/artifacts", { method: "POST", body: HTML });
   assert.equal(notJson.status, 422);                       // a bare string is not a JSON object
+});
+test("page publication rejects ThemeRef string shorthand", async () => {
+  const env = await environment();
+  const rejected = await env.publish({ folder: "acme", slug: "string-theme", title: "Invalid ref", type: "page",
+    html: "<main><h1>Content</h1></main>", theme: "report" as never });
+  assert.equal(rejected.status, 422);
+  assert.equal((await rejected.json<ErrorResponse>()).error.code, "validation");
+});
+test("page publication accepts a project ThemeRef", async () => {
+  const env = await environment();
+  await env.publish({ folder: "acme", slug: "project-theme-anchor", title: "Project", html: HTML });
+  const defined = await env.api("/_api/projects/acme/themes/brand", {
+    method: "PUT", body: validThemeDefinition("brand"),
+  });
+  assert.equal(defined.status, 201);
+  const published = await env.publish({
+    folder: "acme", slug: "project-themed-page", title: "Project theme", type: "page",
+    html: "<main><h1>Project theme</h1></main>", theme: { scope: "project", slug: "brand" },
+  });
+  assert.equal(published.status, 201);
+  const artifact = (await published.json<PublishedResponse>()).artifact;
+  const row = await env.DB.prepare(
+    "SELECT theme_scope, theme_slug, theme_id FROM artifact_versions WHERE artifact_id = ? AND version = 1",
+  ).bind(artifact.id).first<{ theme_scope: string | null; theme_slug: string | null; theme_id: string | null }>();
+  assert.deepEqual({ scope: row?.theme_scope, slug: row?.theme_slug }, { scope: "project", slug: "brand" });
+  assert(row?.theme_id);
+});
+test("nested-folder page publication resolves its project theme from the top-level ancestor", async () => {
+  const env = await environment();
+  await env.publish({ folder: "acme", slug: "nested-anchor", title: "Anchor", html: HTML });
+  const parent = await env.DB.prepare("SELECT id,owner_id FROM folders WHERE slug='acme'").first<{ id: string; owner_id: string }>();
+  assert.ok(parent);
+  env.DB.prepare("INSERT INTO folders (id,slug,name_sealed,owner_id,created_at,updated_at,parent_id) VALUES (?,?,?,?,?,?,?)")
+    .bind("nested-child", "nested-child", "sealed", parent.owner_id, new Date().toISOString(), new Date().toISOString(), parent.id).run();
+  const defined = await env.api("/_api/projects/acme/themes/brand", { method: "PUT", body: validThemeDefinition("brand") });
+  assert.equal(defined.status, 201);
+  const published = await env.publish({
+    folder: "nested-child", slug: "nested-themed-page", title: "Nested theme", type: "page",
+    html: "<main><h1>Nested theme</h1></main>", theme: { scope: "project", slug: "brand" },
+  });
+  assert.equal(published.status, 201, await published.text());
+});
+test("page publication counts the current project default and captured font CSS toward the document limit", async () => {
+  const env = await environment();
+  await env.publish({ folder: "acme", slug: "project-default-anchor", title: "Anchor", html: HTML });
+  const definition = validThemeDefinition("expanded");
+  definition.fonts.heading.stack = `"${"A".repeat(80)}", system-ui, sans-serif`;
+  const defined = await env.api("/_api/projects/acme/themes/expanded", { method: "PUT", body: definition });
+  assert.equal(defined.status, 201);
+  const setDefault = await env.api("/_api/projects/acme/theme-default", {
+    method: "PUT", body: { theme: { scope: "project", slug: "expanded" } },
+  });
+  assert.equal(setDefault.status, 200);
+  const baseline = worstPageDocumentLength("", PLATFORM_THEMES, "https://example.test", "en");
+  const projectTheme = PLATFORM_THEMES[0]!;
+  const fontCss = `@font-face{font-family:Example;src:url(data:font/woff2;base64,${"A".repeat(2048)})}`;
+  const withCapturedFonts = worstPageDocumentLength("", PLATFORM_THEMES, "https://example.test", "en", undefined, {
+    compiledTheme: projectTheme, fontsCss: fontCss,
+  });
+  assert.equal(withCapturedFonts, baseline + fontCss.length + "<style id=\"a67-page-fonts\"></style>".length);
+  const largestPlatformSize = worstPageDocumentLength("", PLATFORM_THEMES, "https://example.test", "en");
+  const nearLimit = `<main>${"x".repeat(PAGE_DOCUMENT_MAX_LENGTH - largestPlatformSize - 13)}</main>`;
+  const capturedFontsAtPlatformSelection = worstPageDocumentLength(nearLimit, PLATFORM_THEMES, "https://example.test", "en",
+    undefined, { compiledTheme: PLATFORM_THEMES.find(theme => theme.slug === "report")!, fontsCss: "x" });
+  assert.ok(capturedFontsAtPlatformSelection > PAGE_DOCUMENT_MAX_LENGTH,
+    "switching to the largest platform theme must retain captured-font CSS in the size check");
+  const fragment = `<main>${"x".repeat(1_500_000 - baseline - 13)}</main>`;
+  const rejected = await env.publish({ folder: "acme", slug: "project-expanded-over-limit", title: "Too large",
+    type: "page", html: fragment });
+  assert.equal(rejected.status, 422);
+  assert.ok((await rejected.json<ErrorResponse>()).error.details?.some(issue => issue.code === "composed-too-large"));
+});
+test("project theme with captured fonts publishes at the exact composition limit and rejects limit plus one", async () => {
+  const env = await environment();
+  await env.publish({ folder: "acme", slug: "project-font-limit-anchor", title: "Anchor", html: HTML });
+  const project = await env.DB.prepare("SELECT id FROM folders WHERE slug='acme'").first<{ id: string }>();
+  assert.ok(project);
+  const themes = openProjectThemes({ db: env.DB, masterKeyHex: MASTER, fetcher: themeFontFetcher });
+  const access = openAccess({ db: env.DB, audit: env.store.audit });
+  const context: ApiContext = {
+    keys: env.keys,
+    artifacts: openArtifacts({ db: env.DB, bucket: env.bucket, masterKeyHex: MASTER, settings: env.store.settings }),
+    folders: openFolders({ db: env.DB, masterKeyHex: MASTER }),
+    access,
+    limiter: openRateLimiter({ RATELIMIT: env.limiter }),
+    store: env.store,
+    themes,
+    projectData: openProjectData({ db: env.DB, masterKeyHex: MASTER }),
+    projectFiles: openProjectFiles({ db: env.DB, bucket: env.bucket, masterKeyHex: MASTER }),
+    publicOrigin: "https://example.test",
+    contract,
+  };
+  const directApi = (path: string, body: unknown, method = "POST") => Effect.runPromise(handleApi(
+    new Request(`https://example.test${path}`, {
+      method, headers: { authorization: `Bearer ${env.master.key}`, "content-type": "application/json" },
+      body: JSON.stringify(body),
+    }), context, { rest: path.replace(/^\/_api\/?/, "") }));
+  const definition = { ...validThemeDefinition("font-limited"), fontSources: [THEME_FONT_SOURCE] };
+  definition.fonts.heading = { family: "Example", stack: '"Example", system-ui, sans-serif' };
+  const defined = await directApi("/_api/projects/acme/themes/font-limited", definition, "PUT");
+  assert.equal(defined.status, 201, await defined.clone().text());
+  const selected = { scope: "project" as const, slug: "font-limited" };
+  assert.equal((await directApi("/_api/projects/acme/theme-default", { theme: selected }, "PUT")).status, 200);
+  const definitionRow = await Effect.runPromise(themes.get({ folderId: project.id, theme: selected }));
+  assert.ok("definition" in definitionRow);
+  const resolved = await Effect.runPromise(themes.resolveForRead({ folderId: project.id, theme: selected, themeId: definitionRow.id }));
+  assert.match(resolved.fontsCss, /data:font\/woff2;base64,/);
+  const baseline = worstPageDocumentLength("", PLATFORM_THEMES, "https://example.test", "en", undefined,
+    { compiledTheme: resolved.compiledTheme, fontsCss: resolved.fontsCss });
+  const fragmentLength = PAGE_DOCUMENT_MAX_LENGTH - baseline;
+  const exact = `<main>${"x".repeat(fragmentLength - 13)}</main>`;
+  assert.equal(worstPageDocumentLength(exact, PLATFORM_THEMES, "https://example.test", "en", undefined,
+    { compiledTheme: resolved.compiledTheme, fontsCss: resolved.fontsCss }), PAGE_DOCUMENT_MAX_LENGTH);
+  const accepted = await directApi("/_api/artifacts", {
+    folder: "acme", slug: "project-font-limit-exact", title: "Exact limit", type: "page", html: exact,
+  });
+  assert.equal(accepted.status, 201, await accepted.clone().text());
+  const over = `<main>${"x".repeat(fragmentLength - 12)}</main>`;
+  const rejected = await directApi("/_api/artifacts", {
+    folder: "acme", slug: "project-font-limit-over", title: "Over limit", type: "page", html: over,
+  });
+  assert.equal(rejected.status, 422);
+  assert.ok((await rejected.json<ErrorResponse>()).error.details?.some(issue => issue.code === "composed-too-large"));
+});
+test("omitted publish theme validates overrides against the effective project default", async () => {
+  const env = await environment();
+  await env.publish({ folder: "acme", slug: "default-theme-anchor", title: "Anchor", html: HTML });
+  const setDefault = await env.api("/_api/projects/acme/theme-default", {
+    method: "PUT", body: { theme: { scope: "platform", slug: "launch" } },
+  });
+  assert.equal(setDefault.status, 200);
+  const published = await env.publish({ folder: "acme", slug: "default-blue-page", title: "Default blue", type: "page",
+    html: "<main><h1>Default blue</h1></main>", themeOverrides: { tokens: { accent: "#0000ff" } } });
+  assert.equal(published.status, 201, await published.text());
 });
 test("page publication rejects invalid inline images and accepts signature-matched fixtures", async () => {
   const env = await environment();

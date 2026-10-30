@@ -18,6 +18,10 @@ All notable changes to this project are documented in this file. The format is b
 - Page artefacts use strict fragment validation, registered inline design tokens, local references, and complete supported image signatures while complete-document site output retains its established analytics instrumentation and source bytes. The page viewer uses the trusted inline kit and embedded assets under its restrictive CSP. Registered-theme page downloads are standalone documents with the platform shell, inline kit/runtime, compiled theme and CSP; they exclude the hosted SDK, live persistence and application data.
 - Code-shipped `report`, `editorial`, and `launch` page themes pass a checked contrast/compositing compiler before scoped CSS or a resolved logo token is exposed; `/themes` previews the three themes against one shared sample. The M2 automated accessibility gate exercises shipped page experiences against WCAG 2.2 A/AA rules and reports axe incomplete checks separately, not as a certification of arbitrary authored content.
 - Page publication sizes the exact hosted document including its runtime bridge across platform themes and compiled overrides; standalone composition enforces the same 1,500,000-character cap without the hosted bridge.
+- Project-scoped page themes add immutable revisions with definition-time font capture, project
+  defaults and a Manager+ brand lock. Pages resolve the current revision in their top-level
+  project, including through nested folders; moving to a project without the referenced theme
+  uses its default and then `report`, with fallback disclosed as `themeResolution`.
 
 ### Fixed
 - Theme compiler rejects malformed font stacks and unsafe or over-512px logos, contains wrapped aurora content on opaque surfaces, preserves inverse-header foreground pairing without overriding nested inverse tones, preserves explicit SVG text `fill`, and targets generated KPI surfaces; page validation rejects unwrapped direct text in aurora hero figures.

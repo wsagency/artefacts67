@@ -116,7 +116,7 @@ export function handleGate(request: Request, ctx: GateContext, params: RoutePara
       const payload = yield* ctx.artifacts.gatePayload(artifact);
       const issued = yield* ctx.artifactRuntime.issue(request, ctx, { artifact, source: { kind: "public", path } });
       const version = (yield* ctx.artifacts.versions(artifact.id)).find(item => item.version === artifact.currentVersion);
-      const page = version?.type === "page" ? yield* ctx.artifactRuntime.presentation(version, artifact.lang) : null;
+      const page = version?.type === "page" ? yield* ctx.artifactRuntime.presentation(version, artifact.lang, artifact.folderId) : null;
       return { response: json({ ...payload, ...(page ? { page } : {}), runtime: issued.runtime }, 200, issued.cookie ? { "Set-Cookie": issued.cookie } : {}) };
     }
     return { state: yield* ctx.limiter.hit(key, { limit: threshold, windowMs: lockMs }) };

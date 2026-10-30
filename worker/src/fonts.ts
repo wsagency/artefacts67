@@ -25,6 +25,7 @@ type ResourceKind = "css" | "font";
 type SourceEdit = { start: number; end: number; text: string };
 type ResourceStep = { redirect: string } | { data: string };
 type ResourceMeta = { redirect: string } | { stream: ReadableStream<Uint8Array>; mime: string; cap: number };
+type ThemeFaceFilter = ReadonlyMap<string, ReadonlySet<string>>;
 type SourceEdits = {
   push(edit: SourceEdit): void;
   sort(compare: (a: SourceEdit, b: SourceEdit) => number): SourceEdit[];
@@ -69,13 +70,14 @@ const remoteAttempt = (text: string): boolean =>
   /(?:url\s*\(\s*["']?\s*|@import\s+(?:url\s*\(\s*["']?\s*|["']\s*))(?:[a-z][a-z0-9+.-]*:)?\/\//i
     .test(cssUnescape(text.replace(/\/\*[\s\S]*?\*\//g, " ")));
 
-function providerUrl(value: string, kind: ResourceKind): string {
+function providerUrl(value: string, kind: ResourceKind, css2Only = false): string {
   let url: URL;
   try { url = new URL(value); } catch { return fail("font-provider", "Font URLs must be absolute HTTPS URLs."); }
   const host = kind === "css" ? "fonts.googleapis.com" : "fonts.gstatic.com";
+  const cssPath = css2Only ? url.pathname === "/css2" : ["/css", "/css2"].includes(url.pathname);
   if (url.protocol !== "https:" || url.hostname !== host || url.port || url.username || url.password || url.hash ||
-      (kind === "css" ? !["/css", "/css2"].includes(url.pathname) : !url.pathname.startsWith("/s/")))
-    fail("font-provider", `Only HTTPS ${host} ${kind === "css" ? "/css or /css2 stylesheets" : "/s/ font assets"} are supported.`);
+      (kind === "css" ? !cssPath : !url.pathname.startsWith("/s/")))
+    fail("font-provider", `Only HTTPS ${host} ${kind === "css" ? css2Only ? "/css2 stylesheets" : "/css or /css2 stylesheets" : "/s/ font assets"} are supported.`);
   return url.href;
 }
 
@@ -95,7 +97,9 @@ function fontFormat(bytes: Uint8Array, mime: string): string {
 }
 
 /** A fresh budget/cache per execution: never a shared cross-user fetch/cache side channel. */
-export function prepareArtifactHtml(html: unknown, { fetcher = fetch, gated = false }: PreparationOptions & { fetcher?: FontFetcher } = {}): Effect.Effect<PreparedArtifactHtml, CodeError> {
+export function prepareArtifactHtml(html: unknown, { fetcher = fetch, gated = false, themeFaceFilter }: PreparationOptions & {
+  fetcher?: FontFetcher; themeFaceFilter?: ThemeFaceFilter;
+} = {}): Effect.Effect<PreparedArtifactHtml, CodeError> {
   return Effect.gen(function* () {
     if (typeof html !== "string") return yield* Effect.fail(coded("invalid-content", "Artefact content must be a string."));
     const validation = validateArtefactHtml(html, { gated, checkReferences: false });
@@ -105,9 +109,10 @@ export function prepareArtifactHtml(html: unknown, { fetcher = fetch, gated = fa
     const started = yield* Clock.currentTimeMillis, cache = new Map<string, string>();
     let downloaded = 0, stylesheetCount = 0, fontCount = 0;
 
-    const resource = (value: string, kind: ResourceKind): Effect.Effect<string, CodeError> => Effect.gen(function* () {
-      const initial = yield* Effect.try({ try: () => providerUrl(value, kind), catch: asCodeError });
-      const cached = cache.get(initial);
+    const resource = (value: string, kind: ResourceKind, css2Only = false): Effect.Effect<string, CodeError> => Effect.gen(function* () {
+      const initial = yield* Effect.try({ try: () => providerUrl(value, kind, css2Only), catch: asCodeError });
+      const cacheKey = css2Only ? `${initial}\u0000css2` : initial;
+      const cached = cache.get(cacheKey);
       if (cached !== undefined) return cached;
       if (kind === "css" ? ++stylesheetCount > FONT_LIMITS.stylesheets : ++fontCount > FONT_LIMITS.fonts)
         return yield* Effect.fail(coded("font-limit", "Too many font resources in one document."));
@@ -124,7 +129,7 @@ export function prepareArtifactHtml(html: unknown, { fetcher = fetch, gated = fa
             Effect.tryPromise({
               try: (signal) => fetcher(url, { redirect: "manual", signal: AbortSignal.any([signal, controller.signal]),
                 headers: { Accept: kind === "css" ? "text/css" : "font/woff2,font/woff,font/ttf,font/otf",
-                  "User-Agent": "Mozilla/5.0 Chrome/120.0.0.0 Safari/537.36" } }),
+                  "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36" } }),
               catch: asCodeError,
             }).pipe(Effect.interruptible),
             (response) => Effect.gen(function* () {
@@ -133,7 +138,7 @@ export function prepareArtifactHtml(html: unknown, { fetcher = fetch, gated = fa
                   if (redirects >= FONT_LIMITS.redirects) fail("font-fetch", "Too many font provider redirects.");
                   const location = response.headers.get("location");
                   if (!location) return fail("font-fetch", "Font provider redirect has no destination.");
-                  return { redirect: providerUrl(new URL(location, url).href, kind) };
+                  return { redirect: providerUrl(new URL(location, url).href, kind, css2Only) };
                 }
                 if (!response.ok) fail("font-fetch", `Font provider returned HTTP ${response.status}.`);
                 const mime = (response.headers.get("content-type") ?? "").split(";")[0].trim().toLowerCase();
@@ -185,7 +190,7 @@ export function prepareArtifactHtml(html: unknown, { fetcher = fetch, gated = fa
             }),
           ).pipe(Effect.ensuring(abortConnection));
           if ("redirect" in step) { url = step.redirect; continue; }
-          cache.set(initial, step.data);
+          cache.set(cacheKey, step.data);
           return step.data;
         }
       }).pipe(
@@ -198,7 +203,9 @@ export function prepareArtifactHtml(html: unknown, { fetcher = fetch, gated = fa
       );
     });
 
-    const captureCss = (source: string, { context = "stylesheet", provider = false }: { context?: "stylesheet" | "declarationList"; provider?: boolean } = {}): Effect.Effect<string, CodeError> => Effect.gen(function* () {
+    const captureCss = (source: string, { context = "stylesheet", provider = false, themeFaceFilter, css2Only = false }: {
+      context?: "stylesheet" | "declarationList"; provider?: boolean; themeFaceFilter?: ThemeFaceFilter; css2Only?: boolean;
+    } = {}): Effect.Effect<string, CodeError> => Effect.gen(function* () {
       if (provider && /<\/style/i.test(source)) return yield* Effect.fail(coded("font-css", "Font stylesheet contains an HTML closing tag."));
       // Author CSS is tolerant, but every Raw node is scanned for concealed remote references.
       // Provider stylesheets are platform-fetched input and remain strict.
@@ -210,19 +217,42 @@ export function prepareArtifactHtml(html: unknown, { fetcher = fetch, gated = fa
           if (remoteAttempt(source)) return Effect.fail(coded("external-reference", "Unparsed CSS attempts a remote reference."));
           return Effect.succeed(null);
         }));
-      if (!ast) return source;
+      const providerRules = ast!.type === "StyleSheet" ? ast!.children.toArray() : [];
       const edits = editList(source), jobs: Effect.Effect<void, CodeError>[] = [];
       let capturedUrls = 0;
       yield* Effect.try({ try: () => {
         if (provider && syntaxErrors.length) fail("font-css", "Unsupported or invalid CSS syntax.");
         if (provider) {
-          if (ast.type !== "StyleSheet") return fail("font-css", "Unsupported or invalid CSS syntax.");
-          ast.children.forEach((node) => {
+          if (ast!.type !== "StyleSheet") return fail("font-css", "Unsupported or invalid CSS syntax.");
+          providerRules.forEach((node) => {
             if (node.type !== "Atrule" || cssName(node.name) !== "font-face")
-              fail("font-css", "Provider stylesheets may contain only @font-face rules.");
+              fail("font-css", "Provider stylesheets may contain only font-face rules.");
           });
         }
-        css.walk(ast, { enter(this: css.WalkContext, node: css.CssNode) {
+        const selectedFaces = new Set<object>();
+        if (provider && themeFaceFilter) {
+          for (const candidate of providerRules) {
+            if (candidate.type !== "Atrule" || cssName(candidate.name) !== "font-face" || !candidate.loc) continue;
+            const start = candidate.loc.start.offset, end = candidate.loc.end.offset;
+            const preceding = source.slice(0, start);
+            const subset = /\/\*\s*(latin-ext|latin)\s*\*\/\s*$/.exec(preceding)?.[1];
+            let weight: string | undefined, family: string | undefined;
+            css.walk(candidate, node => {
+              if (node.type !== "Declaration") return;
+              const property = cssName(node.property);
+              if (property === "font-weight") weight = css.generate(node.value);
+              if (property === "font-family") family = css.generate(node.value).replace(/^['"]|['"]$/g, "").toLocaleLowerCase();
+            });
+            const weights = family ? themeFaceFilter.get(family) : undefined;
+            if ((subset === "latin" || subset === "latin-ext") && weights && weight &&
+                (weights.has(weight) || weights.has(weight.replace(/\s+/g, "..")))) {
+              selectedFaces.add(candidate);
+            } else {
+              edits.push({ start, end, text: "" });
+            }
+          }
+        }
+        css.walk(ast!, { enter(this: css.WalkContext, node: css.CssNode) {
           if (node.type === "Function" && cssName(node.name) === "url") {
             if (provider) fail("font-css", "Escaped or malformed CSS URL functions are not supported.");
             if (remoteAttempt(node.loc ? source.slice(node.loc.start.offset, node.loc.end.offset) : "url(//"))
@@ -244,7 +274,9 @@ export function prepareArtifactHtml(html: unknown, { fetcher = fetch, gated = fa
             const qualifier = source.slice(first.loc.end.offset, prelude.loc.end.offset).trim();
             if (/\b(?:layer|supports)\b/i.test(qualifier)) fail("font-css", "Font imports with layer/supports qualifiers are not supported.");
             jobs.push(Effect.gen(function* () {
-              let text = yield* captureCss(yield* resource(url, "css"), { provider: true });
+              let text = yield* captureCss(yield* resource(url, "css", css2Only), {
+                provider: true, themeFaceFilter, css2Only,
+              });
               if (qualifier) text = `@media ${qualifier}{${text}}`;
               yield* Effect.try({ try: () => edits.push({ start: loc.start.offset, end: loc.end.offset, text }), catch: asCodeError });
             }));
@@ -255,6 +287,7 @@ export function prepareArtifactHtml(html: unknown, { fetcher = fetch, gated = fa
           if (node.type === "Url" && remote(node.value)) {
             if (cssName(this.atrule?.name) !== "font-face" || cssName(this.declaration?.property) !== "src")
               fail("external-reference", "Only font-face src may capture a remote CSS URL.");
+            if (provider && themeFaceFilter && !selectedFaces.has(this.atrule!)) return;
             const url = providerUrl(node.value, "font"), loc = node.loc;
             if (!loc) throw new Error("CSS source location is unavailable.");
             capturedUrls++;
@@ -299,7 +332,9 @@ export function prepareArtifactHtml(html: unknown, { fetcher = fetch, gated = fa
             return;
           }
           if (rel.includes("stylesheet")) {
-            const text = yield* captureCss(yield* resource(href, "css"), { provider: true });
+            const text = yield* captureCss(yield* resource(href, "css", !!themeFaceFilter), {
+              provider: true, themeFaceFilter, css2Only: !!themeFaceFilter,
+            });
             yield* Effect.try({ try: () => {
               if (/<\/style/i.test(text)) fail("font-css", "Font stylesheet contains an HTML closing tag.");
               const mediaValue = attrs.get("media"), media = mediaValue ? ` media="${attrEscape(mediaValue)}"` : "";
@@ -340,6 +375,94 @@ export function prepareArtifactHtml(html: unknown, { fetcher = fetch, gated = fa
     if (final.errors.length) return yield* Effect.fail(Object.assign(new Error("Prepared document rejected by validation."), { code: "validation", issues: final.errors }));
     return { html: prepared, warnings: validation.warnings };
   });
+}
+
+/** Captures and seals the Google CSS2 WOFF2 faces used by one project theme. */
+export function captureThemeFonts(sources: readonly string[], { fetcher = fetch, families }: { fetcher?: FontFetcher; families?: readonly string[] } = {}): Effect.Effect<Uint8Array<ArrayBuffer>, CodeError> {
+  return Effect.gen(function* () {
+    if (sources.length > 8) return yield* Effect.fail(coded("font-limit", "A project theme may use at most eight font sources."));
+    const allowedWeights = new Map<string, Set<string>>();
+    for (const source of sources) {
+      let url: URL;
+      try { url = new URL(source); } catch { return yield* Effect.fail(coded("font-provider", "Font URLs must be absolute Google CSS2 URLs.")); }
+      if (url.protocol !== "https:" || url.hostname !== "fonts.googleapis.com" || url.pathname !== "/css2" ||
+          url.port || url.username || url.password || url.hash)
+        return yield* Effect.fail(coded("font-provider", "Project theme fonts require approved Google CSS2 URLs."));
+      for (const family of url.searchParams.getAll("family")) {
+        const [name, ...axes] = family.split(":");
+        const axis = axes.join(":");
+        const weightIndex = axis.indexOf("wght@");
+        const requested = weightIndex >= 0 ? axis.slice(weightIndex + "wght@".length)
+          .split(";").map(tuple => tuple.split(",").at(-1) ?? "").filter(Boolean) : [];
+        if (!requested.length || !name) continue;
+        if (families && !families.some(declared => declared.toLocaleLowerCase() === name.toLocaleLowerCase()))
+          return yield* Effect.fail(coded("font-css", "Google CSS2 requests a font family not declared by the theme."));
+        const key = name.toLocaleLowerCase();
+        let weights = allowedWeights.get(key);
+        if (!weights) {
+          weights = new Set();
+          allowedWeights.set(key, weights);
+        }
+        for (const weight of requested) weights.add(weight);
+      }
+    }
+    if (sources.length && allowedWeights.size === 0)
+      return yield* Effect.fail(coded("font-css", "Project theme font sources must declare requested weights."));
+    const links = sources.map(source => `<link rel="stylesheet" href="${attrEscape(source)}">`).join("");
+    const html = `<!doctype html><html><head>${links}</head><body></body></html>`;
+    const prepared = yield* prepareArtifactHtml(html, { fetcher, themeFaceFilter: allowedWeights });
+    const styles = [...prepared.html.matchAll(/<style(?:\s[^>]*)?>([\s\S]*?)<\/style>/gi)].map(match => match[1]!);
+    const selected: string[] = [];
+    let fontBytes = 0;
+    for (const stylesheet of styles) {
+      const parsed = css.parse(stylesheet, { positions: true });
+      if (parsed.type !== "StyleSheet") return yield* Effect.fail(coded("font-css", "Google CSS2 returned an invalid stylesheet."));
+      for (const rule of parsed.children.toArray()) {
+        if (rule.type !== "Atrule" || cssName(rule.name) !== "font-face" || !rule.loc)
+          return yield* Effect.fail(coded("font-css", "Google CSS2 may contain only font-face rules."));
+        const start = rule.loc.start.offset, end = rule.loc.end.offset;
+        const preceding = stylesheet.slice(0, start);
+        const subset = /\/\*\s*(latin-ext|latin)\s*\*\/\s*$/.exec(preceding)?.[1];
+        if (subset !== "latin" && subset !== "latin-ext") continue;
+        let weight: string | undefined, faceUrl: string | undefined, family: string | undefined;
+        css.walk(rule, node => {
+          if (node.type !== "Declaration") {
+            if (node.type === "Url") faceUrl = node.value;
+            return;
+          }
+          const property = cssName(node.property);
+          if (property === "font-weight") weight = css.generate(node.value);
+          if (property === "font-family") family = css.generate(node.value).replace(/^['"]|['"]$/g, "").toLocaleLowerCase();
+        });
+        if (!weight || !faceUrl || !family) continue;
+        const requestedWeights = allowedWeights.get(family);
+        if (!requestedWeights || (!requestedWeights.has(weight) && !requestedWeights.has(weight.replace(/\s+/g, "..")))) continue;
+        const faceCss = stylesheet.slice(start, end);
+        if (/data:font\/(?:woff|otf|ttf);base64,/i.test(faceCss))
+          return yield* Effect.fail(coded("font-format", "Project theme font faces must contain only WOFF2 data."));
+        const dataUrl = /url\(["']?(data:font\/woff2;base64,[A-Za-z0-9+/=]+)["']?\)/.exec(faceCss)?.[1];
+        if (!dataUrl) return yield* Effect.fail(coded("font-format", "Google CSS2 theme faces must be WOFF2."));
+        const encoded = dataUrl.slice(dataUrl.indexOf(",") + 1);
+        const bytes = atob(encoded).length;
+        fontBytes += bytes;
+        if (fontBytes > 256 * 1024) return yield* Effect.fail(coded("font-limit", "Resolved project theme fonts exceed 256 KiB."));
+        const comment = /\/\*\s*(?:latin-ext|latin)\s*\*\/\s*$/.exec(preceding)?.[0] ?? "";
+        selected.push(`${comment}${stylesheet.slice(start, end)}`);
+      }
+    }
+    if (sources.length && selected.length === 0)
+      return yield* Effect.fail(coded("font-css", "Google CSS2 returned no declared Latin WOFF2 faces."));
+    return encoder.encode(selected.join("\n")) as Uint8Array<ArrayBuffer>;
+  });
+}
+
+/** Measures actual embedded bytes rather than the base64/descriptor payload size. */
+export function themeFontByteLength(fontPayload: Uint8Array): number {
+  const stylesheet = new TextDecoder("utf-8", { fatal: true }).decode(fontPayload);
+  const source = /data:font\/woff2;base64,([A-Za-z0-9+/=]+)/g;
+  let total = 0, face: RegExpExecArray | null;
+  while ((face = source.exec(stylesheet))) total += atob(face[1]!).length;
+  return total;
 }
 
 // ---- prepared-content capabilities -------------------------------------------

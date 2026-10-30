@@ -146,8 +146,10 @@ export interface Destination {
 export interface PagePresentation {
   type: 'page';
   theme: { scope: 'platform' | 'project'; slug: string } | null;
+  themeResolution: 'explicit' | 'fallback';
   brandLock: boolean;
   lang?: string;
+  fontsCss?: string;
   compiledTheme?: CompiledTheme;
 }
 export interface OpenedArtifact {

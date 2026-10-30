@@ -12,9 +12,11 @@ import { openFolders } from "../src/folders.js";
 import { openProjectData, type Collection, type ProjectRecord } from "../src/project-data.js";
 import { openProjectFiles, type FileRef, type PartView, type UploadView } from "../src/project-files.js";
 import { openArtifacts } from "../src/artifacts.js";
+import { openProjectThemes } from "../src/themes.js";
 import { openRateLimiter } from "../src/ratelimit.js";
 import { contract } from "../src/contract.js";
 import { handleApi } from "../src/api.js";
+import { THEME_FONT_SOURCE, validThemeDefinition } from "./theme-fixtures.js";
 import { PART_BYTES } from "../src/http.js";
 
 interface ApiOptions { key?: string; method?: string; body?: unknown }
@@ -62,9 +64,9 @@ async function environment() {
     worker.fetch(new Request(`https://example.test${path}`, { method: "PUT",
       headers: { authorization: `Bearer ${key}`, "content-type": type, "content-length": String(bytes.byteLength) }, body: bytes }), env);
   const raw = (path: string, key = master) => worker.fetch(new Request(`https://example.test${path}`, { headers: { authorization: `Bearer ${key}` } }), env);
-  /** The API handler over a context whose file model a test may replace. */
-  const direct = (request: Request, files: typeof projectFiles) => Effect.runPromise(handleApi(request, {
+  const direct = (request: Request, files: typeof projectFiles, themes = openProjectThemes({ db: DB, masterKeyHex: MASTER })) => Effect.runPromise(handleApi(request, {
     keys, folders, access, projectData, store, contract, publicOrigin: "https://example.test", projectFiles: files,
+    themes,
     artifacts: openArtifacts({ db: DB, bucket, masterKeyHex: MASTER, settings: store.settings }), limiter: openRateLimiter(env),
   }, { rest: new URL(request.url).pathname.replace(/^\/_api\//, "") }));
   return { DB, store, owner, access, keys, folders, projectData, projectFiles, master, masterFor, api, put, raw, direct, acme, artifactId };
@@ -304,4 +306,87 @@ test("file routes follow tiers and kinds", async () => {
     headers: { authorization: `Bearer ${env.master}`, "content-type": "application/octet-stream", "content-length": "5" } }),
     { ...env.projectFiles, putPart: () => Effect.fail(Object.assign(new Error("busy"), { code: "rate-limited", retryAfter: 1 })) });
   assert.deepEqual([busy.status, (await busy.json<ErrorResponse>()).error.code, busy.headers.get("Retry-After")], [429, "rate-limited", "1"]);
+});
+
+test("project theme routes share live role gates and audit sealed definitions", async () => {
+  const env = await environment();
+  const keyFor = async (id: string, role: "viewer" | "editor" | "manager") => {
+    await addUser(env.store, id);
+    await Effect.runPromise(env.access.grant({ actorId: env.owner.id, folderId: env.acme.id, userId: id, role }));
+    return env.masterFor(id);
+  };
+  const viewer = await keyFor("themeviewer", "viewer");
+  const editor = await keyFor("themeeditor", "editor");
+  const manager = await keyFor("thememanager", "manager");
+  const definition = validThemeDefinition("brand");
+
+  assert.equal((await env.api("projects/acme/themes", { key: viewer })).status, 200);
+  assert.equal((await env.api("projects/acme/themes/brand", { key: viewer })).status, 404);
+  assert.equal((await env.api("projects/acme/themes/brand", { key: viewer, method: "PUT", body: definition })).status, 403);
+  const created = await env.api("projects/acme/themes/brand", { key: editor, method: "PUT", body: definition });
+  assert.equal(created.status, 201);
+  const invalidDefinition = structuredClone(definition);
+  (invalidDefinition.tokens.light as Record<string, unknown>).unknown = "#000000";
+  assert.equal((await env.api("projects/acme/themes/invalid", { key: editor, method: "PUT", body: invalidDefinition })).status, 422);
+  const listed = await (await env.api("projects/acme/themes", { key: viewer })).json<{ themes: Array<Record<string, unknown>> }>();
+  assert.equal(listed.themes[0]?.slug, "brand");
+  assert.equal(JSON.stringify(listed).includes("tokens"), false);
+  const got = await env.api("projects/acme/themes/brand", { key: viewer });
+  assert.equal(got.status, 200);
+  const themeResponse = (await got.json<{ theme: { scope: string; slug: string; revision: number; definition: unknown } }>()).theme;
+  assert.deepEqual({ scope: themeResponse.scope, slug: themeResponse.slug, revision: themeResponse.revision },
+    { scope: "project", slug: "brand", revision: 1 });
+  assert.deepEqual(themeResponse.definition, definition);
+
+  assert.equal((await env.api("projects/acme/theme-default", { key: viewer, method: "PUT", body: {
+    theme: { scope: "platform", slug: "editorial" },
+  } })).status, 403);
+  assert.equal((await env.api("projects/acme/theme-default", { key: editor, method: "PUT", body: {
+    theme: { scope: "platform", slug: "editorial" },
+  } })).status, 200);
+  assert.equal((await env.api("projects/acme/theme-default", { key: editor, method: "PUT", body: { theme: "launch" } })).status, 422);
+  assert.equal((await env.api("projects/acme/theme-brand-lock", { key: editor, method: "PUT", body: { brandLock: true } })).status, 403);
+  assert.equal((await env.api("projects/acme/theme-brand-lock", { key: manager, method: "PUT", body: { brandLock: true } })).status, 200);
+  assert.equal((await env.api("projects/acme/themes/brand", { key: editor, method: "DELETE" })).status, 200);
+
+  await Effect.runPromise(env.access.revoke({ actorId: env.owner.id, folderId: env.acme.id, userId: "themeeditor" }));
+  assert.equal((await env.api("projects/acme/themes/brand", { key: editor, method: "PUT", body: definition })).status, 403);
+  const events = await env.DB.prepare("SELECT action,detail FROM audit_log WHERE action LIKE 'project.theme.%' ORDER BY at").all<{ action: string; detail: string }>();
+  assert.ok(events.results.some(event => event.action === "project.theme.define"));
+  assert.ok(events.results.some(event => event.action === "project.theme.default.set"));
+  assert.ok(events.results.some(event => event.action === "project.theme.brand-lock.set"));
+  assert.ok(events.results.some(event => event.action === "project.theme.read" && event.detail.includes('"outcome":"failure"')));
+  assert.ok(events.results.some(event => event.action === "project.theme.define" && event.detail.includes('"outcome":"failure"')));
+  assert.ok(events.results.some(event => event.action === "project.theme.delete" && event.detail.includes('"outcome":"success"')));
+  assert.equal(JSON.stringify(events.results).includes("system-ui"), false);
+});
+test("project theme routes map parsing and revision conflicts to documented client responses", async () => {
+  const env = await environment();
+  const headers = { authorization: `Bearer ${env.master}`, "content-type": "application/json" };
+  const call = (body: string, extra: Record<string, string> = {}) => env.direct(new Request(
+    "https://example.test/_api/projects/acme/themes/brand", { method: "PUT", headers: { ...headers, ...extra }, body },
+  ), env.projectFiles);
+  const malformed = await call("{");
+  assert.equal(malformed.status, 422);
+  assert.equal((await malformed.json<ErrorResponse>()).error.code, "validation");
+  const oversized = await call(JSON.stringify({ name: "x".repeat(65 * 1024) }));
+  assert.equal(oversized.status, 413);
+  assert.equal((await oversized.json<ErrorResponse>()).error.code, "too-large");
+  const created = await env.api("projects/acme/themes/brand", { method: "PUT", body: validThemeDefinition("brand") });
+  assert.equal(created.status, 201);
+  const conflict = await call(JSON.stringify({ ...validThemeDefinition("brand"), name: "Stale" }), { "if-revision": "0" });
+  assert.equal(conflict.status, 409);
+  assert.equal((await conflict.json<{ error: { details?: { currentRevision?: number } } }>()).error.details?.currentRevision, 1);
+});
+test("theme font provider outages return unavailable rather than invalid-definition", async () => {
+  const env = await environment();
+  const themes = openProjectThemes({ db: env.DB, masterKeyHex: MASTER, fetcher: async () => { throw new Error("provider offline"); } });
+  const definition = { ...validThemeDefinition("offline-font"), fontSources: [THEME_FONT_SOURCE] };
+  definition.fonts.heading = { family: "Example", stack: '"Example", system-ui, sans-serif' };
+  const response = await env.direct(new Request("https://example.test/_api/projects/acme/themes/offline-font", {
+    method: "PUT", headers: { authorization: `Bearer ${env.master}`, "content-type": "application/json" },
+    body: JSON.stringify(definition),
+  }), env.projectFiles, themes);
+  assert.equal(response.status, 503);
+  assert.equal((await response.json<ErrorResponse>()).error.code, "unavailable");
 });

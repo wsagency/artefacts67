@@ -36,6 +36,7 @@ import { artifactObject } from "./r2keys.js";
 import { mintPathId, normalizePath, pathTaken } from "./paths.js";
 import { FONT_LIMITS, openArtifactService, prepareArtifactHtml } from "./fonts.js";
 import { validatePageFragment, type PageDocument } from "./page-validation.js";
+import type { ThemeRef } from "./themes.js";
 
 const enc = new TextEncoder();
 const nowIso = () => new Date().toISOString();
@@ -83,18 +84,18 @@ export interface ArtifactVersion {
 }
 export interface ArtifactCiphertext { v: 1; iv: string; ct: string }
 export interface GatePayload { wrap: PasswordWrap; content: ArtifactCiphertext }
-export interface ThemeReference { scope: "platform"; slug: string }
+export type { ThemeRef } from "./themes.js";
 export interface CreateArtifact {
   ownerId: string; folderId?: string | null; title?: unknown; lang?: unknown; html: unknown;
   password?: unknown; slug?: string | null; authorType?: AuthorType; authorId: string;
-  note?: string | null; prepared?: unknown; type?: "site" | "page"; theme?: ThemeReference | null;
+  note?: string | null; prepared?: unknown; type?: "site" | "page"; theme?: ThemeRef | null;
   themeId?: string | null; themeOverrides?: unknown; themeOverridesSealed?: string | null; brandLock?: boolean;
   validatedPage?: PageDocument;
 }
 export interface PublishArtifact {
   artifactId: string; html: unknown; authorType?: AuthorType; authorId: string;
   note?: string | null; password?: unknown; title?: unknown; lang?: unknown; prepared?: unknown; ifVersion?: number;
-  type?: "site" | "page"; theme?: ThemeReference | null; themeId?: string | null;
+  type?: "site" | "page"; theme?: ThemeRef | null; themeId?: string | null;
   themeOverrides?: unknown; themeOverridesSealed?: string | null; brandLock?: boolean; validatedPage?: PageDocument;
 }
 export interface DuplicateArtifact extends Omit<CreateArtifact, "html" | "prepared" | "validatedPage"> { artifactId: string }
@@ -147,9 +148,11 @@ interface Provenance { size: number; sha256: string }
 interface WriteVersion {
   keyHex: string; authorType: AuthorType; authorId: string; note: string | null;
   captured?: Capture; provenance?: Provenance | null; changes?: D1Statement[]; ifVersion?: number;
-  type?: "site" | "page"; theme?: ThemeReference | null; themeId?: string | null;
+  type?: "site" | "page"; theme?: ThemeRef | null; themeId?: string | null;
   themeOverrides?: unknown; themeOverridesSealed?: string | null; brandLock?: boolean;
 }
+const themeRefOf = (row: Pick<ArtifactVersionRow, "theme_scope" | "theme_slug">): ThemeRef | null =>
+  row.theme_scope && row.theme_slug ? { scope: row.theme_scope, slug: row.theme_slug } : null;
 
 function toArtifact(row: ArtifactRow): Artifact;
 function toArtifact(row: ArtifactRow | null | undefined): Artifact | null;
@@ -506,14 +509,31 @@ export function openArtifacts({ db, bucket, masterKeyHex, settings, iterations =
         .bind(clean, artifactId, nowIso()).run());
       return clean;
     }),
-    duplicate: Effect.fn(function* ({ artifactId, ownerId, folderId = null, title, slug = null, password = null,
+    duplicate: Effect.fn(function* ({ artifactId, ownerId, folderId, title, slug = null, password = null,
       authorType = "user", authorId, note = null }: DuplicateArtifact) {
       const source = yield* required(artifactId);
       const { row } = yield* retained(source, source.currentVersion);
       const html = yield* self.document(source);
-      return yield* create({ ownerId, folderId, title: title ?? (yield* self.title(source)), slug, password,
-        lang: source.lang, html, authorType, authorId, note, type: row.type ?? "site",
-        theme: row.theme_scope === "platform" && row.theme_slug ? { scope: "platform", slug: row.theme_slug } : null,
+      const theme = themeRefOf(row);
+      const destinationFolder = folderId === undefined
+        ? (theme?.scope === "project" ? source.folderId : null)
+        : folderId;
+      if (theme?.scope === "project") {
+        const projectId = (candidate: string | null) => {
+          if (candidate === null) return Effect.succeed(null);
+          return io(() => db.prepare(`WITH RECURSIVE chain(id,parent_id) AS (
+            SELECT id,parent_id FROM folders WHERE id=?
+            UNION ALL SELECT f.id,f.parent_id FROM folders f JOIN chain ON f.id=chain.parent_id
+          ) SELECT id FROM chain WHERE parent_id IS NULL LIMIT 1`).bind(candidate).first<{ id: string }>());
+        };
+        const [sourceProject, destinationProject] = yield* Effect.all([
+          projectId(source.folderId), projectId(destinationFolder),
+        ]);
+        if (!sourceProject || sourceProject.id !== destinationProject?.id)
+          return yield* Effect.fail(coded("theme-project-mismatch", "A project-themed artefact can only be duplicated within its project."));
+      }
+      return yield* create({ ownerId, folderId: destinationFolder, title: title ?? (yield* self.title(source)), slug, password,
+        lang: source.lang, html, authorType, authorId, note, type: row.type ?? "site", theme,
         themeId: row.theme_id ?? null, themeOverridesSealed: row.theme_overrides_sealed ?? null,
         brandLock: Boolean(row.brand_lock) }, yield* Effect.try({ try: () => storedCapture(html), catch: asCodeError }), row);
     }),
@@ -522,8 +542,7 @@ export function openArtifacts({ db, bucket, masterKeyHex, settings, iterations =
       const html = yield* self.document(artifact, version);
       const result = yield* writeVersion(artifact, html, { keyHex: yield* self.contentKey(artifact),
         authorType, authorId, note, ifVersion, type: row.type ?? "site",
-        theme: row.theme_scope === "platform" && row.theme_slug ? { scope: "platform", slug: row.theme_slug } : null,
-        themeId: row.theme_id ?? null, themeOverridesSealed: row.theme_overrides_sealed ?? null,
+        theme: themeRefOf(row), themeId: row.theme_id ?? null, themeOverridesSealed: row.theme_overrides_sealed ?? null,
         brandLock: Boolean(row.brand_lock),
         captured: yield* Effect.try({ try: () => storedCapture(html), catch: asCodeError }), provenance: row });
       yield* changed(artifact.id);

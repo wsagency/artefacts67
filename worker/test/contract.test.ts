@@ -70,6 +70,24 @@ test("contract distinguishes raw page source copying from composed page download
   assert.ok(body.includes("Composed page downloads exclude the hosted SDK, live persistence, and application data;"));
 });
 
+test("contract defines M3 project-theme references, defaults, access, and fallback", async () => {
+  const body = (await contract().text()).replace(/\s+/g, " ");
+  for (const statement of [
+    "ThemeRef`, an object with exactly two properties, `scope` (`platform` or `project`) and `slug`",
+    "Project defaults accept only a registered platform theme or a project theme from that same project",
+    "the project theme identity for project scope; `null` selects the platform `report` theme",
+    "Theme definitions may include `extends`, which must be a `ThemeRef` with exactly `scope` (`platform` or `project`) and `slug`",
+    "A project theme's `extends` parent must be a registered platform theme or an existing project theme in its defining project",
+    "Children inherit resolved color tokens, font stacks, scales, and recipes; child-supplied values override inherited values",
+    "Editors may list, read, define, revise, and delete project themes and set defaults; Managers and Owners may also change the project brand lock",
+    "Pages refer to the theme identity, not a pinned revision: reads and publication composition resolve its current revision",
+    "A move does not create an artefact version or rewrite its ThemeRef. If a page's project-scoped theme is not available in its destination project, the reader resolves the destination project's default, then platform `report`",
+    "Content reads return and audit `themeResolution` as `explicit` or `fallback`",
+  ]) {
+    assert.ok(body.includes(statement), `contract is missing: ${statement}`);
+  }
+});
+
 test("contract specifies page grammar and the shipped unknown-theme fallback", async () => {
   const body = (await contract().text()).replace(/\s+/g, " ");
   for (const statement of [

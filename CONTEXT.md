@@ -10,8 +10,19 @@ Publishing private-by-default versioned HTML artefacts into folders. Ordinary pa
 A versioned `site` document or `page` fragment published into one folder. A site is a complete HTML document; a page uses the constrained fragment grammar and checked page runtime. It owns its presentation; application data is separate from its published source. Existing and omitted publication `type` values remain `site`.
 _Avoid_: document, file, asset, deliverable
 **Page artefact**:
-An opt-in artefact published as `type: "page"`: validated HTML/SVG/CSS fragment content with optional checked platform `ThemeRef`, composed in the isolated page viewer. Its fragment is not a standalone complete document.
+An opt-in artefact published as `type: "page"`: validated HTML/SVG/CSS fragment content with an
+optional `ThemeRef` to a checked platform theme or a theme in its top-level project, composed in
+the isolated page viewer. Its fragment is not a standalone complete document.
 _Avoid_: site, asset, subpage
+
+**Project theme**:
+A validated presentation definition scoped to one top-level folder. Editors may define, revise,
+delete, and choose its project default; Managers and Owners may also lock reader theme switching.
+Fonts are captured when a definition is saved, revisions are immutable, and page reads resolve
+the current revision. Nested folders inherit their top-level project's theme context. A move to
+another project keeps the page's reference; if unavailable there, the destination default and
+then platform `report` are used and reported as a fallback.
+_Avoid_: global theme, page version
 
 **Folder**:
 The container an artefact is published into. A member may use one for a client, a project, or anything else — the platform takes no view on which (ADR 0021).

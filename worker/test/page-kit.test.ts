@@ -1016,19 +1016,21 @@ test("visitor-share frames exclude record-write authority even for signed-in edi
     else Reflect.deleteProperty(globalThis, "location");
   }
 });
-test("opening fallback page accepts the checked compiled theme with retained unavailable identity", async () => {
+test("opening a page with a removed platform theme receives the Report fallback", async () => {
   const originalFetch = globalThis.fetch;
   const locationDescriptor = Object.getOwnPropertyDescriptor(globalThis, "location");
   const fallback = PLATFORM_THEMES.find(theme => theme.slug === "report")!;
   Object.defineProperty(globalThis, "location", { configurable: true, value: { origin: "https://example.test" } });
-  let selected = "unavailable";
+  let selected = "report";
   globalThis.fetch = async () => new Response(JSON.stringify({
     html: "<p>Reader</p>", runtime: { grant: "grant" },
-    page: { type: "page", theme: { scope: "platform", slug: selected }, brandLock: false, compiledTheme: fallback },
+    page: { type: "page", theme: { scope: "platform", slug: selected }, themeResolution: selected === "report" ? "fallback" : "explicit",
+      brandLock: false, compiledTheme: fallback },
   }), { status: 200, headers: { "Content-Type": "application/json" } });
   try {
     const opened = await openArtifact({ loadUrl: "/_runtime/load", runtime: { kind: "public", path: "app-one" }, permissions: { write: false } });
-    assert.equal(opened.page?.theme?.slug, "unavailable");
+    assert.equal(opened.page?.theme?.slug, "report");
+    assert.equal(opened.page?.themeResolution, "fallback");
     assert.equal(opened.page?.compiledTheme?.slug, "report");
     selected = "launch";
     await assert.rejects(

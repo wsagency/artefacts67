@@ -8,6 +8,7 @@ import { memoryBucket, rateLimitBinding } from "./doubles.js";
 import { openStore } from "../src/store.js";
 import { openKeys } from "../src/keys.js";
 import { openAccess } from "../src/access.js";
+import { validThemeDefinition } from "./theme-fixtures.js";
 
 const MASTER = "6465762d6d61737465722d6b65792d4e4f542d464f522d70726f642d75736521";
 const HTML = `<!doctype html><html lang="en"><head><meta charset="utf-8"><title>Form</title></head><body><h1>Form</h1></body></html>`;
@@ -16,6 +17,8 @@ const HTML = `<!doctype html><html lang="en"><head><meta charset="utf-8"><title>
 interface Structured {
   artifact: { id: string; version: number }; html: string; collection: { kind: string };
   error: { code: string; details?: { currentVersion: number } };
+  theme: { scope: string; slug: string; revision?: number; definition?: unknown; brandLock?: boolean };
+  themes: Array<{ slug: string }>;
   record: { id: string; version: number; data: unknown }; records: Array<{ id: string }>;
   collections: Array<{ name: string }>; folders: unknown[]; artifacts: unknown[];
   upload: { id: string; partPath: string; received: unknown[] }; file: { id: string; size: number; downloadPath: string };
@@ -100,15 +103,16 @@ test("tools/list publishes every tool with an input schema", async () => {
     inputSchema: { type: string; properties?: Record<string, object>; required?: string[] };
   }>;
   assert.deepEqual(tools.map((tool) => tool.name), [
-    "list_folders", "list_artifacts", "get_artifact", "publish_artifact", "list_collections", "define_collection", "delete_collection",
-    "list_records", "get_record", "create_record", "update_record", "delete_record",
-    "start_upload", "get_upload", "complete_upload", "cancel_upload", "get_file",
+    "list_folders", "list_artifacts", "get_artifact", "publish_artifact",
+    "list_themes", "get_theme", "define_theme", "delete_theme", "set_project_default_theme", "set_project_brand_lock",
+    "list_collections", "define_collection", "delete_collection", "list_records", "get_record", "create_record",
+    "update_record", "delete_record", "start_upload", "get_upload", "complete_upload", "cancel_upload", "get_file",
   ]);
   for (const tool of tools) {
     assert.equal(tool.inputSchema.type, "object", tool.name);
     assert.ok(tool.description.length > 0, tool.name);
   }
-  for (const tool of tools.slice(12)) {
+  for (const tool of tools.slice(18)) {
     assert.match(tool.description, /partPath|downloadPath/, tool.name);
     assert.match(tool.description, /Authorization: Bearer/, tool.name);
   }
@@ -118,7 +122,10 @@ test("tools/list publishes every tool with an input schema", async () => {
     type: "integer", minimum: 1, description: "Only publish when the current version matches.",
   });
   assert.equal(publish.inputSchema.required?.includes("ifVersion"), false);
-  assert.deepEqual(publish.inputSchema.properties?.type, { type: "string", enum: ["site", "page"] });
+  assert.deepEqual(publish.inputSchema.properties?.html, { type: "string", description: "Complete HTML document or page fragment." });
+  assert.deepEqual(publish.inputSchema.properties?.type, {
+    type: "string", enum: ["site", "page"], description: "Omitted or site preserves legacy documents; page validates a semantic fragment.",
+  });
 });
 
 test("tools/call uploads a file whose bytes travel over HTTP", async () => {
@@ -323,4 +330,42 @@ test("MCP conditional publish cannot create a missing artefact or folder", async
   assert.equal((await env.DB.prepare("SELECT COUNT(*) AS count FROM folders").first<{ count: number }>())?.count, 0);
   assert.equal((await env.DB.prepare("SELECT COUNT(*) AS count FROM artifacts").first<{ count: number }>())?.count, 0);
   assert.equal(env.bucket.objects.size, 0);
+});
+test("project theme MCP operations share HTTP references, null defaults, and errors", async () => {
+  const env = await environment();
+  await env.call("publish_artifact", { folder: "acme", slug: "form", title: "Form", html: HTML });
+
+  const definition = validThemeDefinition("brand");
+  const created = await env.call("define_theme", { project: "acme", slug: "brand", definition });
+  assert.equal(created.isError, false);
+  assert.equal(created.structuredContent.theme.revision, 1);
+  const listed = await env.call("list_themes", { project: "acme" });
+  assert.equal(listed.structuredContent.themes[0]?.slug, "brand");
+  const read = await env.call("get_theme", { project: "acme", theme: { scope: "project", slug: "brand" } });
+  assert.deepEqual(read.structuredContent.theme.definition, definition);
+
+  assert.equal((await env.call("set_project_default_theme", {
+    project: "acme", theme: { scope: "project", slug: "brand" },
+  })).isError, false);
+  assert.equal((await env.call("set_project_brand_lock", { project: "acme", brandLock: true })).isError, false);
+  assert.equal((await env.call("set_project_default_theme", { project: "acme", theme: null })).isError, false);
+
+  const invalid = await env.call("set_project_default_theme", { project: "acme", theme: "launch" });
+  assert.equal(invalid.isError, true);
+  assert.equal(invalid.structuredContent.error.code, "validation");
+  const missingProject = await env.rpc({
+    jsonrpc: "2.0", id: 77, method: "tools/call",
+    params: { name: "get_theme", arguments: { theme: { scope: "project", slug: "brand" } } },
+  });
+  assert.equal((await missingProject.json<RpcResponse>()).error?.code, -32602);
+  const invalidRefs = [
+    { slug: "report" },
+    { scope: "invalid", slug: "report" },
+    { scope: "platform", slug: "report", extra: true },
+  ];
+  for (const theme of invalidRefs) {
+    const invalid = await env.rpc({ jsonrpc: "2.0", id: 78, method: "tools/call",
+      params: { name: "get_theme", arguments: { theme } } });
+    assert.equal((await invalid.json<RpcResponse>()).error?.code, -32602);
+  }
 });

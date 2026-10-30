@@ -98,7 +98,7 @@ export function validatePublishBody(value: unknown): BodyValidation {
     const theme = body.theme;
     if (typeof theme !== "object" || theme === null || Array.isArray(theme) ||
         !("scope" in theme) || !("slug" in theme) ||
-        theme.scope !== "platform" ||
+        !(theme.scope === "platform" || theme.scope === "project") ||
         typeof theme.slug !== "string" || !/^[a-z][a-z0-9-]{0,47}$/.test(theme.slug)) {
       flag("invalid-theme", "theme must be a {scope, slug} reference", "theme");
     }

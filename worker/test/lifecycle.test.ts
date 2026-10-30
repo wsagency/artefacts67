@@ -9,6 +9,7 @@ import { openD1Shim } from "./db.js";
 import { memoryBucket, rateLimitBinding } from "./doubles.js";
 import { openStore } from "../src/store.js";
 import { PURGE_LIMITS, openArtifacts } from "../src/artifacts.js";
+import { openProjectThemes } from "../src/themes.js";
 import { openFolders } from "../src/folders.js";
 import { openProjectData } from "../src/project-data.js";
 import { openProjectFiles } from "../src/project-files.js";
@@ -18,9 +19,10 @@ import { handleApi } from "../src/api.js";
 import { scalarSeal, sealBlob, sha256hex } from "../src/crypto.js";
 import { openRuntimeState } from "../src/runtime-state.js";
 import { openReports } from "../src/reports.js";
+import { validThemeDefinition } from "./theme-fixtures.js";
 
 interface ArtifactResponse { artifact: { id: string; gated: boolean; folder: { slug: string | null } | null } }
-interface ValidationFailureResponse { error: { details: Array<{ code: string }> } }
+interface ValidationFailureResponse { error: { code?: string; details?: Array<{ code: string }> } }
 
 const MASTER = "6465762d6d61737465722d6b65792d4e4f542d464f522d70726f642d75736521";
 const HTML = "<!doctype html><html><head><title>Original</title></head><body>First</body></html>";
@@ -34,14 +36,215 @@ async function services(fontFetch: FontFetcher = async () => new Response("unava
   const artifacts = openArtifacts({ db, bucket, masterKeyHex: MASTER, settings: store.settings, fontFetch });
   const folders = openFolders({ db, masterKeyHex: MASTER });
   const master = await Effect.runPromise(keys.mint({ userId: owner.id, kind: "master", scopes: "master" }));
-  const ctx = { db, store, bucket, owner, access, keys, artifacts, folders, projectData: openProjectData({ db, masterKeyHex: MASTER }),
-    projectFiles: openProjectFiles({ db, bucket, masterKeyHex: MASTER }), publicOrigin: "https://example.test",
+  const ctx = { db, store, bucket, owner, access, keys, artifacts, folders,
+    projectData: openProjectData({ db, masterKeyHex: MASTER }),
+    projectFiles: openProjectFiles({ db, bucket, masterKeyHex: MASTER }),
+    themes: openProjectThemes({ db, masterKeyHex: MASTER }), publicOrigin: "https://example.test",
     limiter: openRateLimiter({ RATELIMIT: rateLimitBinding() }), contract };
   const api = (rest: string, body: object) => Effect.runPromise(handleApi(new Request(`https://example.test/_api/${rest}`, {
     method: "POST", headers: { authorization: `Bearer ${master.key}`, "content-type": "application/json" }, body: JSON.stringify(body),
   }), ctx, { rest }));
   return { ...ctx, api, master };
 }
+test("version theme identity is scope plus slug and project ID, never a revision pin", async () => {
+  const { artifacts, owner, db } = await services();
+  const folder = await Effect.runPromise(openFolders({ db, masterKeyHex: MASTER }).create({ ownerId: owner.id, name: "Project" }));
+  const themes = openProjectThemes({ db, masterKeyHex: MASTER });
+  const theme = await Effect.runPromise(themes.define({
+    folderId: folder.id, slug: "brand", definition: validThemeDefinition("brand"), actorId: owner.id,
+  }));
+  const artifact = await Effect.runPromise(artifacts.create({
+    ownerId: owner.id, folderId: folder.id, html: "<main><p>First</p></main>", authorId: owner.id, type: "page",
+    theme: { scope: "project", slug: "brand" }, themeId: theme.id,
+  }));
+  await Effect.runPromise(themes.define({
+    folderId: folder.id, slug: "brand", definition: { ...validThemeDefinition("brand"), name: "Second" }, actorId: owner.id, ifRevision: 1,
+  }));
+  const identity = await db.prepare(
+    "SELECT theme_scope,theme_slug,theme_id FROM artifact_versions WHERE artifact_id=? AND version=1",
+  ).bind(artifact.id).first<{ theme_scope: string; theme_slug: string; theme_id: string }>();
+  assert.deepEqual({ ...identity }, { theme_scope: "project", theme_slug: "brand", theme_id: theme.id });
+  await assert.rejects(Effect.runPromise(themes.delete({ folderId: folder.id, slug: "brand", actorId: owner.id })),
+    error => typeof error === "object" && error !== null && "code" in error && error.code === "theme-referenced");
+  const columns = await db.prepare("PRAGMA table_info(artifact_versions)").all<{ name: string }>();
+  assert.equal(columns.results.some(column => column.name.toLowerCase().includes("revision")), false);
+});
+
+test("database guard prevents deleting a theme with an artefact reference", async () => {
+  const { artifacts, owner, db } = await services();
+  const folder = await Effect.runPromise(openFolders({ db, masterKeyHex: MASTER }).create({ ownerId: owner.id, name: "Referenced project" }));
+  const themes = openProjectThemes({ db, masterKeyHex: MASTER });
+  const theme = await Effect.runPromise(themes.define({
+    folderId: folder.id, slug: "brand", definition: validThemeDefinition("brand"), actorId: owner.id,
+  }));
+  await Effect.runPromise(artifacts.create({
+    ownerId: owner.id, folderId: folder.id, html: "<main><p>Page</p></main>", authorId: owner.id, type: "page",
+    theme: { scope: "project", slug: "brand" }, themeId: theme.id,
+  }));
+  assert.throws(() => db.prepare("DELETE FROM project_themes WHERE id=?").bind(theme.id).run(), /project-theme-referenced/);
+});
+
+test("theme reads resolve current revision and destination defaults after moves", async () => {
+  const { db, owner, folders } = await services();
+  const source = await Effect.runPromise(folders.create({ ownerId: owner.id, name: "Source project" }));
+  const destination = await Effect.runPromise(folders.create({ ownerId: owner.id, name: "Destination project" }));
+  const themes = openProjectThemes({ db, masterKeyHex: MASTER });
+  const sourceTheme = await Effect.runPromise(themes.define({
+    folderId: source.id, slug: "brand", definition: validThemeDefinition("brand"), actorId: owner.id,
+  }));
+  await Effect.runPromise(themes.setDefault({ folderId: source.id, theme: { scope: "project", slug: "brand" }, actorId: owner.id }));
+  await Effect.runPromise(themes.define({
+    folderId: source.id, slug: "brand", definition: { ...validThemeDefinition("brand"), name: "Revised brand" },
+    actorId: owner.id, ifRevision: 1,
+  }));
+  const current = await Effect.runPromise(themes.resolveForRead({
+    folderId: source.id, theme: { scope: "project", slug: "brand" }, themeId: sourceTheme.id,
+  }));
+  assert.equal(current.compiledTheme.name, "Revised brand");
+  assert.equal(current.themeResolution, "explicit");
+
+  await Effect.runPromise(themes.setDefault({ folderId: destination.id, theme: { scope: "platform", slug: "editorial" }, actorId: owner.id }));
+  const destinationDefault = await Effect.runPromise(themes.resolveForRead({ folderId: destination.id, theme: null }));
+  assert.equal(destinationDefault.theme.slug, "editorial");
+  assert.equal(destinationDefault.themeResolution, "explicit");
+  const moved = await Effect.runPromise(themes.resolveForRead({
+    folderId: destination.id, theme: { scope: "project", slug: "brand" }, themeId: sourceTheme.id,
+  }));
+  assert.deepEqual(moved.theme, { scope: "platform", slug: "editorial" });
+  assert.equal(moved.themeResolution, "fallback");
+  const unavailablePlatform = await Effect.runPromise(themes.resolveForRead({
+    folderId: destination.id, theme: { scope: "platform", slug: "removed-platform-theme" },
+  }));
+  assert.deepEqual(unavailablePlatform.theme, { scope: "platform", slug: "report" });
+
+  await Effect.runPromise(themes.setDefault({ folderId: destination.id, theme: null, actorId: owner.id }));
+  const reportFallback = await Effect.runPromise(themes.resolveForRead({
+    folderId: destination.id, theme: { scope: "project", slug: "brand" }, themeId: sourceTheme.id,
+  }));
+  assert.deepEqual(reportFallback.theme, { scope: "platform", slug: "report" });
+  assert.equal(reportFallback.themeResolution, "fallback");
+  const removedPlatform = await Effect.runPromise(themes.resolveForRead({
+    folderId: destination.id, theme: { scope: "platform", slug: "removed-platform-theme" },
+  }));
+  assert.deepEqual(removedPlatform.theme, { scope: "platform", slug: "report" });
+  assert.equal(removedPlatform.themeResolution, "fallback");
+});
+
+test("a theme-owning project cannot be nested by a concurrent folder move", async () => {
+  const { db, owner, folders } = await services();
+  const project = await Effect.runPromise(folders.create({ ownerId: owner.id, name: "Theme owner" }));
+  const parent = await Effect.runPromise(folders.create({ ownerId: owner.id, name: "Parent" }));
+  await Effect.runPromise(openProjectThemes({ db, masterKeyHex: MASTER }).define({
+    folderId: project.id, slug: "brand", definition: validThemeDefinition("brand"), actorId: owner.id,
+  }));
+  await assert.rejects(Effect.runPromise(folders.setParent(project.id, parent.id)),
+    error => typeof error === "object" && error !== null && "code" in error && error.code === "project-data");
+  assert.equal((await Effect.runPromise(folders.byId(project.id)))?.parentId, null);
+});
+
+test("database rejects a project reference created after theme deletion", async () => {
+  const { artifacts, owner, db } = await services();
+  const folder = await Effect.runPromise(openFolders({ db, masterKeyHex: MASTER }).create({ ownerId: owner.id, name: "Late reference project" }));
+  const themes = openProjectThemes({ db, masterKeyHex: MASTER });
+  const theme = await Effect.runPromise(themes.define({
+    folderId: folder.id, slug: "brand", definition: validThemeDefinition("brand"), actorId: owner.id,
+  }));
+  const artifact = await Effect.runPromise(artifacts.create({
+    ownerId: owner.id, folderId: folder.id, html: "<main><p>Page</p></main>", authorId: owner.id, type: "page",
+  }));
+  await Effect.runPromise(themes.delete({ folderId: folder.id, slug: "brand", actorId: owner.id }));
+  const insert = db.prepare(`INSERT INTO artifact_versions
+    (artifact_id,version,r2_key,size,sha256,author_type,author_id,note,created_at,theme_scope,theme_id,theme_slug)
+    SELECT artifact_id,2,r2_key,size,sha256,author_type,author_id,note,created_at,'project',?,'brand'
+    FROM artifact_versions WHERE artifact_id=? AND version=1`);
+  assert.throws(() => insert.bind(theme.id, artifact.id).run(), /project-theme-missing/);
+  const dangling = await db.prepare("SELECT 1 FROM artifact_versions WHERE artifact_id=? AND version=2").bind(artifact.id).first();
+  assert.equal(dangling, null);
+});
+
+
+test("recursive project deletion withdraws themed artifacts and removes their theme references", async () => {
+  const { artifacts, owner, db, folders } = await services();
+  const folder = await Effect.runPromise(folders.create({ ownerId: owner.id, name: "Theme deletion project" }));
+  const theme = await Effect.runPromise(openProjectThemes({ db, masterKeyHex: MASTER }).define({
+    folderId: folder.id, slug: "brand", definition: validThemeDefinition("brand"), actorId: owner.id,
+  }));
+  const artifact = await Effect.runPromise(artifacts.create({
+    ownerId: owner.id, folderId: folder.id, html: "<main><p>Project page</p></main>", authorId: owner.id, type: "page",
+    theme: { scope: "project", slug: "brand" }, themeId: theme.id,
+  }));
+  const { snapshot } = await Effect.runPromise(folders.contents(folder.id));
+  await Effect.runPromise(folders.remove(folder.id, { snapshot, actorId: owner.id }));
+  assert.equal(await Effect.runPromise(folders.byId(folder.id)), null);
+  assert.ok((await Effect.runPromise(artifacts.byId(artifact.id)))?.deletedAt);
+  const version = await db.prepare("SELECT theme_scope,theme_slug,theme_id FROM artifact_versions WHERE artifact_id=? AND version=1")
+    .bind(artifact.id).first<{ theme_scope: string | null; theme_slug: string | null; theme_id: string | null }>();
+  assert.deepEqual({ ...version }, { theme_scope: null, theme_slug: null, theme_id: null });
+});
+
+test("recursive project deletion clears references from a previously withdrawn artifact", async () => {
+  const { artifacts, owner, db, folders, bucket } = await services();
+  const folder = await Effect.runPromise(folders.create({ ownerId: owner.id, name: "Pending purge project" }));
+  const theme = await Effect.runPromise(openProjectThemes({ db, masterKeyHex: MASTER }).define({
+    folderId: folder.id, slug: "brand", definition: validThemeDefinition("brand"), actorId: owner.id,
+  }));
+  const artifact = await Effect.runPromise(artifacts.create({
+    ownerId: owner.id, folderId: folder.id, html: "<main><p>Withdrawn project page</p></main>", authorId: owner.id, type: "page",
+    theme: { scope: "project", slug: "brand" }, themeId: theme.id,
+  }));
+  const deleteObject = bucket.delete;
+  bucket.delete = async () => { throw new Error("storage unavailable"); };
+  try {
+    await assert.rejects(Effect.runPromise(artifacts.remove(artifact.id, { authorId: owner.id })), { code: "purge-failed" });
+  } finally {
+    bucket.delete = deleteObject;
+  }
+  assert.equal((await db.prepare("SELECT COUNT(*) AS n FROM artifact_versions WHERE artifact_id=?").bind(artifact.id).first<{ n: number }>())?.n, 1);
+  assert.equal((await Effect.runPromise(artifacts.byId(artifact.id)))?.folderId, folder.id);
+  const { snapshot } = await Effect.runPromise(folders.contents(folder.id));
+  await Effect.runPromise(folders.remove(folder.id, { snapshot, actorId: owner.id }));
+  const reference = await db.prepare("SELECT theme_scope,theme_id FROM artifact_versions WHERE artifact_id=? AND version=1")
+    .bind(artifact.id).first<{ theme_scope: string | null; theme_id: string | null }>();
+  assert.deepEqual({ ...reference }, { theme_scope: null, theme_id: null });
+});
+test("restore and duplicate preserve project theme identity", async () => {
+  const { artifacts, owner, db } = await services();
+  const folder = await Effect.runPromise(openFolders({ db, masterKeyHex: MASTER }).create({ ownerId: owner.id, name: "Copy project" }));
+  const themes = openProjectThemes({ db, masterKeyHex: MASTER });
+  const theme = await Effect.runPromise(themes.define({
+    folderId: folder.id, slug: "brand", definition: validThemeDefinition("brand"), actorId: owner.id,
+  }));
+  const artifact = await Effect.runPromise(artifacts.create({
+    ownerId: owner.id, folderId: folder.id, html: "<main><p>Project design</p></main>", authorId: owner.id, type: "page",
+    theme: { scope: "project", slug: "brand" }, themeId: theme.id,
+  }));
+  await Effect.runPromise(artifacts.restore({ artifactId: artifact.id, version: 1, authorId: owner.id }));
+  let identity = await db.prepare("SELECT theme_scope,theme_slug,theme_id FROM artifact_versions WHERE artifact_id=? AND version=2")
+    .bind(artifact.id).first<{ theme_scope: string; theme_slug: string; theme_id: string }>();
+  assert.equal(identity?.theme_scope, "project");
+  assert.equal(identity?.theme_slug, "brand");
+  assert.equal(identity?.theme_id, theme.id);
+  const duplicate = await Effect.runPromise(artifacts.duplicate({ artifactId: artifact.id, ownerId: owner.id, authorId: owner.id }));
+  identity = await db.prepare("SELECT theme_scope,theme_slug,theme_id FROM artifact_versions WHERE artifact_id=? AND version=1")
+    .bind(duplicate.id).first<{ theme_scope: string; theme_slug: string; theme_id: string }>();
+  assert.equal(duplicate.folderId, folder.id);
+  assert.equal(identity?.theme_scope, "project");
+  assert.equal(identity?.theme_slug, "brand");
+  assert.equal(identity?.theme_id, theme.id);
+  const folders = openFolders({ db, masterKeyHex: MASTER });
+  const sibling = await Effect.runPromise(folders.create({ ownerId: owner.id, name: "Sibling project" }));
+  const nested = await Effect.runPromise(folders.create({ ownerId: owner.id, name: "Nested destination", parentId: folder.id }));
+  await assert.rejects(Effect.runPromise(artifacts.duplicate({ artifactId: artifact.id, ownerId: owner.id, folderId: sibling.id, authorId: owner.id })),
+    error => typeof error === "object" && error !== null && "code" in error && error.code === "theme-project-mismatch");
+  const nestedDuplicate = await Effect.runPromise(artifacts.duplicate({
+    artifactId: artifact.id, ownerId: owner.id, folderId: nested.id, authorId: owner.id,
+  }));
+  assert.equal(nestedDuplicate.folderId, nested.id);
+  const nestedIdentity = await db.prepare("SELECT theme_scope,theme_slug,theme_id FROM artifact_versions WHERE artifact_id=? AND version=1")
+    .bind(nestedDuplicate.id).first<{ theme_scope: string; theme_slug: string; theme_id: string }>();
+  assert.deepEqual({ scope: nestedIdentity?.theme_scope, slug: nestedIdentity?.theme_slug, id: nestedIdentity?.theme_id },
+    { scope: "project", slug: "brand", id: theme.id });
+});
 test("existing and omitted-type versions default to site without changing stored content", async () => {
   const { artifacts, owner, db } = await services();
   const created = await Effect.runPromise(artifacts.create({ ownerId: owner.id, html: HTML, authorId: owner.id }));
@@ -162,8 +365,8 @@ test("API font capture failure leaves content, metadata and gate unchanged on pu
   for (const [path, body] of [["artifacts", { ...base, title: "Changed", html: FONT_HTML, password: "new-password" }],
     ["artifacts/rotate", { artifact: id, html: FONT_HTML, password: null }]] satisfies Array<[string, object]>) {
     const failure = await api(path, body);
-    assert.equal(failure.status, 422);
-    assert.equal((await failure.json() as ValidationFailureResponse).error.details[0].code, "font-fetch");
+    assert.equal(failure.status, 503);
+    assert.equal((await failure.json() as ValidationFailureResponse).error.code, "unavailable");
     const current = await Effect.runPromise(artifacts.byId(id));
     assert.ok(current);
     assert.equal(current.currentVersion, 1);
@@ -356,8 +559,8 @@ test("API capture failure creates no folder and successful publication captures 
   });
   // A capture failure must not leave a fresh folder behind.
   const failing = await api("artifacts", { folder: "fresh", slug: "capture-fail", title: "Capture", html: FONT_HTML });
-  assert.equal(failing.status, 422);
-  assert.equal((await failing.json() as ValidationFailureResponse).error.details[0].code, "font-fetch");
+  assert.equal(failing.status, 503);
+  assert.equal((await failing.json() as ValidationFailureResponse).error.code, "unavailable");
   assert.equal(await Effect.runPromise(folders.byPath("fresh")), null);
   // Once capture succeeds, the folder is created and the model consumes the token without a
   // second fetch: two calls, the stylesheet and its font, for the whole request.

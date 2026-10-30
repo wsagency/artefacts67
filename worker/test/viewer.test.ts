@@ -390,7 +390,7 @@ test("gate failures stay closed while reset alone is best-effort", async () => {
         grants += 1;
         return yield* runtime.issue(request, context, input);
       }),
-      presentation: version => runtime.presentation(version),
+      presentation: (version, lang, folderId) => runtime.presentation(version, lang, folderId),
     },
     limiter, gate: { threshold: 4, lockMs: 3600000 }, store: env.store,
   };

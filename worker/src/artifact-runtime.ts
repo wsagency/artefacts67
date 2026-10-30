@@ -13,6 +13,7 @@ import type { RateLimiter } from "./ratelimit.js";
 import { asCodeError, type CodeError, type DatabaseLike } from "./types.js";
 import type { CompiledTheme } from "../../frontend/src/theme-compiler.js";
 import { compileThemeOverrides } from "../../frontend/src/theme-overrides.js";
+import { openProjectThemes } from "./themes.js";
 import { getPlatformTheme } from "../../frontend/src/platform-themes.js";
 
 const LIFETIME = 60 * 60 * 1000;
@@ -25,7 +26,7 @@ const statuses: Readonly<Record<string, number | undefined>> = {
   "not-utf8": 400, "invalid-content": 400, "invalid-version": 400, "invalid-owner": 400,
   "font-provider": 400, "font-fetch": 502, "font-format": 400, "font-css": 400,
   "font-limit": 413, "font-timeout": 504, "publish-conflict": 409, "not-found": 404,
-  conflict: 409, "no-project": 409, "wrong-kind": 400,
+  conflict: 409, "no-project": 409, "wrong-kind": 400, "theme-project-mismatch": 400,
 };
 const cookieName = (request: Request) => new URL(request.url).protocol === "https:" ? "__Host-artefacts-reader" : "artefacts-reader";
 /** The runtime error envelope; a refusal that knows when to retry (transfer slot, limiter) says so. */
@@ -119,7 +120,7 @@ export interface IssueRuntimeInput { artifact: Artifact; share?: VisitorShare | 
 export interface ArtifactRuntime {
   issue(request: Request, ctx: RuntimeReadContext, input: IssueRuntimeInput): Effect.Effect<IssuedRuntime, CodeError>;
   authorize(request: Request, ctx: RuntimeReadContext, token: unknown): Effect.Effect<AuthorizedRuntime, CodeError>;
-  presentation(version: ArtifactVersion, lang?: string): Effect.Effect<PagePresentation | null, CodeError>;
+  presentation(version: ArtifactVersion, lang: string | undefined, folderId: string | null): Effect.Effect<PagePresentation | null, CodeError>;
   handle(request: Request, ctx: RuntimeContext, params: { action?: string }): Effect.Effect<Response, CodeError>;
   /** Binary project file transfers (ADR 0035): part uploads and downloads under `/_runtime/files/`. */
   files(request: Request, ctx: RuntimeContext, params: { rest?: string }): Effect.Effect<Response, CodeError>;
@@ -127,8 +128,10 @@ export interface ArtifactRuntime {
 export interface PagePresentation {
   type: "page";
   theme: { scope: "platform" | "project"; slug: string } | null;
+  themeResolution: "explicit" | "fallback";
   brandLock: boolean;
   lang: string;
+  fontsCss?: string;
   compiledTheme?: CompiledTheme;
 }
 interface RuntimeRequestBody extends DuplicateValues {
@@ -216,6 +219,7 @@ export function duplicateReadable(ctx: DuplicateContext, active: { user: User } 
 }
 
 export function openArtifactRuntime({ db, masterKeyHex, now = Date.now }: { db: DatabaseLike; masterKeyHex: string; now?: () => number }): ArtifactRuntime {
+  const themes = openProjectThemes({ db, masterKeyHex });
   const ipKey = (request: Request) => sha256hex(`${masterKeyHex}:runtime-ip:${clientIp(request)}`);
   const limitAnonymous = (request: Request, ctx: RuntimeReadContext, purpose: string, limit: number) => Effect.gen(function* () {
     const result = yield* ctx.limiter.hit(`runtime-ip:${purpose}:${yield* ipKey(request)}`, { limit, windowMs: 60000 });
@@ -254,19 +258,29 @@ export function openArtifactRuntime({ db, masterKeyHex, now = Date.now }: { db: 
     // Owner suspension does not withdraw live visitor shares; reader suspension ends direct access.
     return { artifact, share, active };
   });
-  const presentation = (version: ArtifactVersion, lang = "en"): Effect.Effect<PagePresentation | null, CodeError> => Effect.gen(function* () {
+  const presentation = (version: ArtifactVersion, lang: string | undefined, folderId: string | null): Effect.Effect<PagePresentation | null, CodeError> => Effect.gen(function* () {
     if (version.type !== "page") return null;
+    const effectiveLang = lang ?? "en";
     const theme = version.themeScope && version.themeSlug ? { scope: version.themeScope, slug: version.themeSlug } : null;
-    const base = theme?.scope === "platform"
-      ? getPlatformTheme(theme.slug) ?? getPlatformTheme("report")
-      : theme === null ? getPlatformTheme("report") : null;
-    if (!base) return { type: "page", theme, brandLock: version.brandLock, lang };
+    let resolved: { theme: { scope: "platform" | "project"; slug: string }; themeResolution: "explicit" | "fallback";
+      compiledTheme: CompiledTheme; fontsCss: string; brandLock: boolean };
+    if (folderId) {
+      resolved = yield* themes.resolveForRead({ folderId, theme, themeId: version.themeId });
+    } else {
+      const selected = theme?.scope === "platform" ? getPlatformTheme(theme.slug) : null;
+      const compiledTheme = selected ?? getPlatformTheme("report")!;
+      resolved = { theme: selected ? theme! : { scope: "platform", slug: "report" },
+        themeResolution: selected || theme === null ? "explicit" : "fallback",
+        compiledTheme, fontsCss: "", brandLock: false };
+    }
     let compiledTheme: CompiledTheme | undefined;
     if (version.themeOverridesSealed) {
       const sealed = yield* scalarUnseal<{ v: unknown }>(masterKeyHex, version.themeOverridesSealed);
-      compiledTheme = yield* Effect.try({ try: () => compileThemeOverrides(base, sealed?.v), catch: error => fail("invalid-theme-overrides", error instanceof Error ? error.message : "Stored page theme overrides are invalid.") });
+      compiledTheme = yield* Effect.try({ try: () => compileThemeOverrides(resolved.compiledTheme, sealed?.v), catch: error => fail("invalid-theme-overrides", error instanceof Error ? error.message : "Stored page theme overrides are invalid.") });
     }
-    return { type: "page", theme, brandLock: version.brandLock, lang, ...(compiledTheme ? { compiledTheme } : {}) };
+    return { type: "page", theme: resolved.theme, themeResolution: resolved.themeResolution,
+      brandLock: version.brandLock || resolved.brandLock, lang: effectiveLang, fontsCss: resolved.fontsCss,
+      ...(compiledTheme ? { compiledTheme } : { compiledTheme: resolved.compiledTheme }) };
   });
   const revision = (artifact: Artifact, share: VisitorShare | null | undefined, source: RuntimeSource) => Effect.gen(function* () {
     if (source.kind === "public") return yield* sha256hex(JSON.stringify(artifact.wrapPassword ?? null));
@@ -417,7 +431,7 @@ export function openArtifactRuntime({ db, masterKeyHex, now = Date.now }: { db: 
         if ((source.kind === "public" && ctx.artifacts.gated(resolved.artifact)) || resolved.share?.gated) return yield* Effect.fail(fail("password-required", "Enter the password to open this artefact."));
         const issued = yield* issue(request, ctx, { ...resolved, source });
         const content = yield* ctx.artifacts.readContent(resolved.artifact);
-        const page = yield* presentation(content.version, resolved.artifact.lang);
+        const page = yield* presentation(content.version, resolved.artifact.lang, resolved.artifact.folderId);
         return json({ html: content.html, ...(page ? { page } : {}), runtime: issued.runtime, observation: issued.observation }, 200, issued.cookie ? { "Set-Cookie": issued.cookie } : {});
       }
       const authorized = yield* authorize(request, ctx, body.grant);

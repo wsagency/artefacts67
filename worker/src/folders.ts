@@ -220,19 +220,25 @@ export function openFolders({ db, masterKeyHex, onChange = null }: {
         if (!parent) return yield* Effect.fail(coded("not-found", "no such parent folder"));
         if (parent.ownerId !== folder.ownerId) return yield* Effect.fail(coded("forbidden", "a folder nests only inside its owner's estate"));
       }
-      // The cycle predicate, project-data guard and move are atomic even for concurrent opposite moves.
-      // A project is a top-level folder (ADR 0032); nesting one would orphan its collections.
+      // Ownership guards and the move are atomic: a top-level project cannot be nested while it owns
+      // collections, project themes, or theme settings.
       const result = yield* io(() => db.prepare(
         "WITH RECURSIVE descendants(id) AS (" +
         " SELECT id FROM folders WHERE id = ? UNION" +
         " SELECT f.id FROM folders f JOIN descendants d ON f.parent_id = d.id)" +
         " UPDATE folders SET parent_id = ?, updated_at = ? WHERE id = ?" +
         " AND (? IS NULL OR ? NOT IN (SELECT id FROM descendants))" +
-        " AND (? IS NULL OR NOT EXISTS (SELECT 1 FROM project_collections WHERE folder_id = ?))",
-      ).bind(folder.id, parent?.id ?? null, nowIso(), folder.id, parent?.id ?? null, parent?.id ?? null, parent?.id ?? null, folder.id).run());
+        " AND (? IS NULL OR (NOT EXISTS (SELECT 1 FROM project_collections WHERE folder_id = ?)" +
+        " AND NOT EXISTS (SELECT 1 FROM project_themes WHERE folder_id = ?)" +
+        " AND NOT EXISTS (SELECT 1 FROM project_theme_settings WHERE folder_id = ?)))",
+      ).bind(folder.id, parent?.id ?? null, nowIso(), folder.id, parent?.id ?? null, parent?.id ?? null,
+        parent?.id ?? null, folder.id, folder.id, folder.id).run());
       if (!result.meta?.changes) {
-        const owns = yield* io(() => db.prepare("SELECT 1 AS owns FROM project_collections WHERE folder_id = ? LIMIT 1").bind(folder.id).first());
-        if (owns) return yield* Effect.fail(coded("project-data", "This folder owns project data collections; delete them before nesting it."));
+        const owns = yield* io(() => db.prepare(`SELECT 1 AS owns FROM project_collections WHERE folder_id = ?
+          UNION ALL SELECT 1 FROM project_themes WHERE folder_id = ?
+          UNION ALL SELECT 1 FROM project_theme_settings WHERE folder_id = ? LIMIT 1`)
+          .bind(folder.id, folder.id, folder.id).first());
+        if (owns) return yield* Effect.fail(coded("project-data", "This folder owns project data or themes; delete them before nesting it."));
         return yield* Effect.fail(coded("folder-cycle", "a folder cannot live inside itself"));
       }
       yield* changed(folder.id);
@@ -334,6 +340,11 @@ export function openFolders({ db, masterKeyHex, onChange = null }: {
         bind("UPDATE artifacts SET deleted_at = ?2, deleted_by = ?5, purged_at = NULL, current_version = 0, password_salt = NULL," +
           " password_verifier = NULL, key_wrap_password = NULL, key_wrap_master = NULL, updated_at = ?2" +
           ` WHERE id ${IN_ARTEFACTS} AND deleted_at IS NULL AND ${DECIDED}`),
+        // Clear identity from every still-filed artifact, including previously withdrawn tombstones
+        // omitted from the live-content snapshot, before cascading project theme deletion.
+        bind(`UPDATE artifact_versions SET theme_scope = NULL, theme_slug = NULL, theme_id = NULL` +
+          ` WHERE artifact_id IN (SELECT id FROM artifacts WHERE folder_id ${IN_FOLDERS})` +
+          ` AND theme_scope = 'project' AND ${DECIDED}`),
         bind(`UPDATE artifacts SET folder_id = NULL WHERE folder_id ${IN_FOLDERS} AND ${DECIDED}`),
         bind(`DELETE FROM folders WHERE id ${IN_FOLDERS} AND ${DECIDED}`),
         // After the folder statement: the project's files go to the sweep only once the folder is gone.

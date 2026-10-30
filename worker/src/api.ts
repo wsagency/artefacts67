@@ -9,7 +9,8 @@ import { fileResponse, json, readJson } from "./http.js";
 import { normalizePath } from "./paths.js";
 import { validateArtefactHtml, validatePublishBody, validateRotateBody, type ValidationIssue } from "./validate.js";
 import type { Access } from "./access.js";
-import type { Artifact, Artifacts, AuthorType, ThemeReference } from "./artifacts.js";
+import type { Artifact, Artifacts, AuthorType } from "./artifacts.js";
+import type { ProjectThemeModel, ThemeRef } from "./themes.js";
 import type { Folder, Folders } from "./folders.js";
 import type { Key, KeyAuthentication, KeyResource, Keys } from "./keys.js";
 import type { RateLimiter } from "./ratelimit.js";
@@ -31,6 +32,7 @@ export interface ApiContext {
   access: Pick<Access, "foldersFor" | "role">;
   limiter: Pick<RateLimiter, "hit">;
   store: { audit: Pick<Audit, "write" | "writeRequired"> };
+  themes: ProjectThemeModel;
   projectData: ProjectData;
   projectFiles: ProjectFiles;
   publicOrigin: string;
@@ -41,8 +43,9 @@ export interface ApiContext {
 interface ApiBody {
   folder?: unknown; folderName?: unknown; slug?: unknown; title?: unknown; lang?: unknown;
   html?: unknown; password?: unknown; note?: unknown; allow_weak_password?: unknown; ifVersion?: unknown;
-  artifact?: unknown; paths?: unknown; scopes?: unknown; label?: unknown; id?: unknown;
   can_read_content?: unknown; type?: unknown; theme?: unknown; themeOverrides?: unknown;
+  definition?: unknown; ifRevision?: unknown; brandLock?: unknown;
+  artifact?: unknown; paths?: unknown; scopes?: unknown; label?: unknown; id?: unknown;
 }
 const isApiBody = (value: unknown): value is ApiBody => value !== null && typeof value === "object";
 const objectBody = (value: unknown): ApiBody => isApiBody(value) ? value : {};
@@ -130,8 +133,17 @@ export function handleApi(request: Request, ctx: ApiContext, { rest = "" }: { re
       case "POST keys": return yield* mintKey(request, ctx, who);
       case "GET keys": return yield* listKeys(ctx, who);
       case "POST keys/rotate": return yield* rotateKey(request, ctx, who);
-      default: break;
+      case "GET themes": return json({ themes: PLATFORM_THEMES.map(({ slug, name, description }) => ({ scope: "platform", slug, name, description })) });
     }
+    const platformTheme = /^themes\/([^/]+)$/.exec(path);
+    if (platformTheme && method === "GET") {
+      const slug = decoded(platformTheme[1]);
+      const theme = slug === null ? null : getPlatformTheme(slug);
+      return theme ? json({ theme: { scope: "platform", slug, definition: theme } }) :
+        envelope("not-found", "No such platform theme.");
+    }
+    const themes = /^projects\/([^/]+)\/(themes(?:\/([^/]+))?|theme-default|theme-brand-lock)$/.exec(path);
+    if (themes) return yield* projectThemeRoute(request, ctx, who, themes);
     const content = /^artifacts\/([^/]+)\/content$/.exec(path);
     if (content && method === "GET") {
       let reference: string;
@@ -149,11 +161,21 @@ export function handleApi(request: Request, ctx: ApiContext, { rest = "" }: { re
   }).pipe(Effect.catchCause((cause) => {
     if (Cause.hasInterrupts(cause)) return Effect.failCause(cause);
     const error = asCodeError(Cause.squash(cause));
+    if (error.code === "too-large") return Effect.succeed(envelope("too-large", error.message));
+    if (error.code === "bad-json") return Effect.succeed(envelope("validation", "Request body is not valid JSON."));
+    if (error.code === "font-fetch" || error.code === "font-timeout")
+      return Effect.succeed(envelope("unavailable", "The font provider is temporarily unavailable."));
     if (error.code === "validation" || (typeof error.code === "string" && error.code.startsWith("font-")) || error.code === "external-reference") {
       return Effect.succeed(envelope("validation", error.message,
         (error.issues ?? [{ code: error.code, message: error.message }]).map(issue => ({ ...issue, field: "html" }))));
     }
     if (error.code === "not-found") return Effect.succeed(envelope("not-found", error.message));
+    if (["invalid-theme", "invalid-project"].includes(error.code ?? "")) return Effect.succeed(envelope("validation", error.message));
+    if (["revision-conflict", "theme-referenced"].includes(error.code ?? "")) {
+      const currentRevision = "currentRevision" in error && typeof error.currentRevision === "number" ? error.currentRevision : undefined;
+      return Effect.succeed(envelope("conflict", error.message, currentRevision === undefined ? undefined : { currentRevision }));
+    }
+    if (error.code === "forbidden") return Effect.succeed(envelope("forbidden", error.message));
     if (error.code === "version-conflict" && "currentVersion" in error && typeof error.currentVersion === "number") {
       return Effect.succeed(envelope("conflict", error.message, { currentVersion: error.currentVersion }));
     }
@@ -240,12 +262,24 @@ function publish(request: Request, ctx: ApiContext, who: KeyAuthentication) {
       if (doc.errors.length) return envelope("validation", "Request rejected by validation.", doc.errors.map(issue => ({ ...issue, field: "html" })));
       warnings = doc.warnings.map(issue => ({ ...issue, field: "html" }));
     }
-    let theme: ThemeReference | null = null;
-    if (typeof body.theme === "object" && body.theme !== null && "scope" in body.theme && "slug" in body.theme &&
-        body.theme.scope === "platform" && typeof body.theme.slug === "string")
+    let theme: ThemeRef | null = null;
+    if (body.theme !== undefined && body.theme !== null) {
+      if (typeof body.theme !== "object" || Array.isArray(body.theme) || !("scope" in body.theme) || !("slug" in body.theme) ||
+          (body.theme.scope !== "platform" && body.theme.scope !== "project") || typeof body.theme.slug !== "string" ||
+          Object.keys(body.theme).some(key => key !== "scope" && key !== "slug"))
+        return envelope("validation", "Theme must be a ThemeRef object.");
       theme = { scope: body.theme.scope, slug: body.theme.slug };
+    }
+    let themeId: string | null = null;
     const folder = yield* findFolder(ctx, who, body.folder);
     if ("error" in folder) return folder.error;
+    const projectFolderId = folder.value ? yield* ctx.projectData.projectOf(folder.value.id) : null;
+    if (theme?.scope === "project") {
+      if (!projectFolderId) return envelope("validation", "A project theme requires an existing project folder.");
+      const projectTheme = yield* ctx.themes.get({ folderId: projectFolderId, theme });
+      if (!("id" in projectTheme)) return envelope("validation", "Project theme reference is unavailable.");
+      themeId = projectTheme.id;
+    }
     const existing = yield* ctx.artifacts.bySlug(body.slug);
     if (existing?.deletedAt) return envelope("conflict", "That path is permanently retired.");
     if (existing && existing.folderId !== folder.value?.id) return envelope("conflict", `The path "${body.slug}" already belongs to another artefact.`);
@@ -266,10 +300,18 @@ function publish(request: Request, ctx: ApiContext, who: KeyAuthentication) {
       return envelope("conflict", `Artefact has changed since version ${ifVersion}.`, { currentVersion: 0 });
     }
     if (type === "page") {
-      const baseTheme = getPlatformTheme(theme?.scope === "platform" ? theme.slug : "report") ?? getPlatformTheme("report");
+      let baseTheme = getPlatformTheme(theme?.scope === "platform" ? theme.slug : "report") ?? getPlatformTheme("report")!;
+      let fontsCss = "";
+      let projectCompiledTheme: CompiledTheme | undefined;
+      if (projectFolderId && folder.value) {
+        const resolvedTheme = yield* ctx.themes.resolveForRead({ folderId: projectFolderId, theme, themeId });
+        baseTheme = resolvedTheme.compiledTheme;
+        fontsCss = resolvedTheme.fontsCss;
+        if (resolvedTheme.theme.scope === "project") projectCompiledTheme = resolvedTheme.compiledTheme;
+      }
       let compiledOverride: CompiledTheme | undefined;
       if (body.themeOverrides != null) {
-        try { compiledOverride = compileThemeOverrides(baseTheme!, body.themeOverrides); }
+        try { compiledOverride = compileThemeOverrides(baseTheme, body.themeOverrides); }
         catch (cause) {
           return envelope("validation", "Request rejected by validation.", [{
             code: "invalid-theme-overrides",
@@ -278,7 +320,8 @@ function publish(request: Request, ctx: ApiContext, who: KeyAuthentication) {
           }]);
         }
       }
-      if (worstPageDocumentLength(body.html as string, PLATFORM_THEMES, ctx.publicOrigin, lang, compiledOverride) > PAGE_DOCUMENT_MAX_LENGTH) {
+      if (worstPageDocumentLength(body.html as string, PLATFORM_THEMES, ctx.publicOrigin, lang, compiledOverride,
+        projectCompiledTheme ? { compiledTheme: projectCompiledTheme, fontsCss } : undefined) > PAGE_DOCUMENT_MAX_LENGTH) {
         return envelope("validation", "Request rejected by validation.", [{
           code: "composed-too-large",
           field: "html",
@@ -293,7 +336,7 @@ function publish(request: Request, ctx: ApiContext, who: KeyAuthentication) {
     if (existing) {
       yield* ctx.artifacts.publish({ artifactId: existing.id, html: body.html, note, ...authorOf(who),
         title: body.title, lang: body.lang, password: body.password ?? undefined, prepared, ifVersion,
-        type, theme, themeOverrides: body.themeOverrides, validatedPage });
+        type, theme, themeId, themeOverrides: body.themeOverrides, validatedPage });
       const updated = yield* ctx.artifacts.byId(existing.id);
       if (!updated) return yield* Effect.fail(new Error("The published artefact could not be read."));
       yield* audit(ctx, who, "artifact.publish", updated.id, writeDetail({ version: updated.currentVersion }, weakUsed));
@@ -301,7 +344,7 @@ function publish(request: Request, ctx: ApiContext, who: KeyAuthentication) {
     }
     const created = yield* ctx.artifacts.create({ ownerId: destination.ownerId, folderId: destination.id,
       slug: body.slug, title: body.title, lang: body.lang ?? "en", html: body.html, password: body.password ?? null,
-      note, prepared, type, theme, themeOverrides: body.themeOverrides, validatedPage, ...authorOf(who) });
+      note, prepared, type, theme, themeId, themeOverrides: body.themeOverrides, validatedPage, ...authorOf(who) });
     yield* audit(ctx, who, "artifact.create", created.id, writeDetail({ version: created.currentVersion }, weakUsed));
     return json({ artifact: yield* view(ctx, created, destination), warnings }, 201);
   });
@@ -344,7 +387,19 @@ function readArtifactContent(request: Request, ctx: ApiContext, who: KeyAuthenti
     const content = yield* Effect.gen(function* () {
       const selected = yield* ctx.artifacts.readContent(artifact, version);
       const title = yield* ctx.artifacts.title(artifact);
-      return { selected, title };
+      let themeResolution: "explicit" | "fallback" | undefined;
+      if (selected.version.type === "page") {
+        const theme = selected.version.themeScope && selected.version.themeSlug
+          ? { scope: selected.version.themeScope, slug: selected.version.themeSlug } : null;
+        if (artifact.folderId) {
+          themeResolution = (yield* ctx.themes.resolveForRead({
+            folderId: artifact.folderId, theme, themeId: selected.version.themeId,
+          })).themeResolution;
+        } else {
+          themeResolution = theme?.scope === "platform" && getPlatformTheme(theme.slug) ? "explicit" : theme === null ? "explicit" : "fallback";
+        }
+      }
+      return { selected, title, themeResolution };
     }).pipe(Effect.catch((error) => Effect.gen(function* () {
       yield* auditContentRead(ctx, who, artifact.id, {
         version: version ?? null, allowed: true, success: false,
@@ -352,13 +407,14 @@ function readArtifactContent(request: Request, ctx: ApiContext, who: KeyAuthenti
       });
       return yield* Effect.fail(error);
     })));
-    const { selected, title } = content;
+    const { selected, title, themeResolution } = content;
     yield* auditContentRead(ctx, who, artifact.id, {
-      version: selected.version.version, allowed: true, success: true,
+      version: selected.version.version, allowed: true, success: true, ...(themeResolution ? { themeResolution } : {}),
     });
     return json({
       artifact: { id: artifact.id, slug: artifact.slug, version: selected.version.version },
       version: selected.version.version, type: "text/html", title, language: artifact.lang, html: selected.html,
+      ...(themeResolution ? { themeResolution } : {}),
     });
   });
 }
@@ -621,6 +677,107 @@ function projectFolder(ctx: ApiContext, who: KeyAuthentication, rawFolder: strin
       return envelope("validation", message, [{ field: "folder", message }]);
     }
     return { folder, target };
+  });
+}
+function projectThemeRoute(request: Request, ctx: ApiContext, who: KeyAuthentication, match: RegExpExecArray) {
+  return Effect.gen(function* () {
+    const method = request.method.toUpperCase();
+    const rawFolder = match[1];
+    const route = match[2]!;
+    const slug = match[3] === undefined ? null : decoded(match[3]);
+    if (match[3] !== undefined && slug === null) return envelope("not-found", "No such project theme.");
+    const place = yield* projectFolder(ctx, who, rawFolder);
+    if (place instanceof Response) return place;
+    const { folder } = place;
+    const role = yield* ctx.access.role(who.key.userId, folder.id);
+    const rank = role === "owner" ? 4 : role === "manager" ? 3 : role === "editor" ? 2 : role === "viewer" ? 1 : 0;
+    if (!rank) return envelope("forbidden", "You cannot reach that project.");
+    const log = (action: string, detail: Record<string, unknown>) => ctx.store.audit.writeRequired({
+      actorType: "api_key", actorId: who.key.id, action, artifactId: null, detail: { folderId: folder.id, ...detail },
+    });
+    const audited = <A>(action: string, detail: Record<string, unknown>, operation: Effect.Effect<A, CodeError>) =>
+      operation.pipe(Effect.tapError(error => log(action, { ...detail, outcome: "failure", errorCode: asCodeError(error).code })));
+    if (route === "themes" && method === "GET") {
+      const themes = yield* audited("project.theme.list", {}, ctx.themes.list({ folderId: folder.id }));
+      yield* log("project.theme.list", { outcome: "success", count: themes.length });
+      return json({ themes: themes.map(theme => ({ scope: "project", slug: theme.slug, revision: theme.currentRevision,
+        id: theme.id, createdAt: theme.createdAt, updatedAt: theme.updatedAt })) });
+    }
+    if (route.startsWith("themes/") && slug && method === "GET") {
+      const snapshot = yield* audited("project.theme.read", { slug }, ctx.themes.get({ folderId: folder.id, theme: { scope: "project", slug } }));
+      if (!("definition" in snapshot)) {
+        yield* log("project.theme.read", { outcome: "failure", slug, errorCode: "not-found" });
+        return envelope("not-found", "No such project theme.");
+      }
+      yield* log("project.theme.read", { outcome: "success", slug, revision: snapshot.revision });
+      return json({ theme: { scope: "project", slug, revision: snapshot.revision, definition: snapshot.definition } });
+    }
+    if (route === "themes" && method !== "GET") return envelope("not-found", "Unknown project theme endpoint.");
+    if (route.startsWith("themes/") && slug && method === "PUT") {
+      if (rank < 2) {
+        yield* log("project.theme.define", { outcome: "failure", slug, errorCode: "forbidden" });
+        return envelope("forbidden", "Editor authority is required to define project themes.");
+      }
+      const definition = yield* readJson(request);
+      const rawRevision = request.headers.get("if-revision");
+      const ifRevision = rawRevision === null ? undefined : Number(rawRevision);
+      if (ifRevision !== undefined && (!Number.isSafeInteger(ifRevision) || ifRevision < 0)) {
+        yield* log("project.theme.define", { outcome: "failure", slug, errorCode: "validation" });
+        return envelope("validation", "If-Revision must be a non-negative integer.");
+      }
+      const result = yield* audited(ifRevision !== undefined && ifRevision > 0 ? "project.theme.revise" : "project.theme.define",
+        { slug }, ctx.themes.define({ folderId: folder.id, slug, definition, actorId: who.key.userId, ifRevision }));
+      const action = result.revision === 1 ? "project.theme.define" : "project.theme.revise";
+      yield* log(action, { outcome: "success", slug, revision: result.revision });
+      return json({ theme: { scope: "project", slug, revision: result.revision, currentRevision: result.currentRevision } },
+        result.revision === 1 ? 201 : 200);
+    }
+    if (route.startsWith("themes/") && slug && method === "DELETE") {
+      if (rank < 2) {
+        yield* log("project.theme.delete", { outcome: "failure", slug, errorCode: "forbidden" });
+        return envelope("forbidden", "Editor authority is required to delete project themes.");
+      }
+      yield* audited("project.theme.delete", { slug }, ctx.themes.delete({ folderId: folder.id, slug, actorId: who.key.userId }));
+      yield* log("project.theme.delete", { outcome: "success", slug });
+      return json({ ok: true, slug });
+    }
+    if (route === "theme-default" && method === "PUT") {
+      if (rank < 2) {
+        yield* log("project.theme.default.set", { outcome: "failure", errorCode: "forbidden" });
+        return envelope("forbidden", "Editor authority is required to set a project default.");
+      }
+      const body = objectBody(yield* readJson(request));
+      if (body.theme !== null && (!body.theme || typeof body.theme !== "object" || Array.isArray(body.theme) ||
+          !("scope" in body.theme) || !("slug" in body.theme) ||
+          (body.theme.scope !== "platform" && body.theme.scope !== "project") || typeof body.theme.slug !== "string" ||
+          Object.keys(body.theme).some(key => key !== "scope" && key !== "slug"))) {
+        yield* log("project.theme.default.set", { outcome: "failure", errorCode: "validation" });
+        return envelope("validation", "Theme must be null or a ThemeRef object.");
+      }
+      const theme = body.theme as ThemeRef | null | undefined;
+      if (theme === undefined) {
+        yield* log("project.theme.default.set", { outcome: "failure", errorCode: "validation" });
+        return envelope("validation", "Theme is required.");
+      }
+      yield* audited("project.theme.default.set", {}, ctx.themes.setDefault({ folderId: folder.id, theme, actorId: who.key.userId }));
+      yield* log("project.theme.default.set", { outcome: "success", theme: theme ?? { scope: "platform", slug: "report" } });
+      return json({ ok: true });
+    }
+    if (route === "theme-brand-lock" && method === "PUT") {
+      if (rank < 3) {
+        yield* log("project.theme.brand-lock.set", { outcome: "failure", errorCode: "forbidden" });
+        return envelope("forbidden", "Manager authority is required to change the project brand lock.");
+      }
+      const body = objectBody(yield* readJson(request));
+      if (typeof body.brandLock !== "boolean") {
+        yield* log("project.theme.brand-lock.set", { outcome: "failure", errorCode: "validation" });
+        return envelope("validation", "brandLock must be a boolean.");
+      }
+      yield* audited("project.theme.brand-lock.set", {}, ctx.themes.setBrandLock({ folderId: folder.id, brandLock: body.brandLock, actorId: who.key.userId }));
+      yield* log("project.theme.brand-lock.set", { outcome: "success", brandLock: body.brandLock });
+      return json({ ok: true, brandLock: body.brandLock });
+    }
+    return envelope("not-found", "Unknown project theme endpoint.");
   });
 }
 

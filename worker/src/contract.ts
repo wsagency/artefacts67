@@ -393,15 +393,46 @@ and quote delimiters in attributes. Comments may appear between nodes as \`<!-- 
 not be unclosed, contain \`--\`, or hide source tokens.
 External SVG/resource references are rejected.
 
-Theme references use \`ThemeRef\`, an object with \`scope: "platform"\` and a \`slug\` matching
-\`^[a-z][a-z0-9-]{0,47}$\`; malformed \`ThemeRef\` shapes, non-platform scopes, and invalid slug
-syntax are rejected.
+Theme references use \`ThemeRef\`, an object with exactly two properties, \`scope\` (\`platform\` or
+\`project\`) and \`slug\`, matching \`^[a-z][a-z0-9-]{0,47}$\`; malformed shapes, additional properties,
+and invalid slug syntax are rejected. A \`platform\` reference must not be confused with an
+unregistered but syntactically valid platform slug, which follows the fallback behavior below.
 Platform themes are \`report\`, \`editorial\`, and \`launch\`; they are currently registered and shown
 together at \`/themes\`. A syntactically valid platform slug that is not registered is retained in
 metadata; viewer rendering falls back to \`report\`. Optional \`themeOverrides\` can customize only
 supported \`tokens\` and \`recipes\` within the contract's size and value constraints; they do not
 admit arbitrary CSS or a project-scoped theme. The checked compiler validates contrast,
 composition and logo data before scoped CSS or a resolved logo token reaches the page runtime.
+
+M3 project themes extend the page \`ThemeRef\` union without changing the registered platform themes:
+the wire object has exactly \`scope\` (\`"platform"\` or \`"project"\`) and \`slug\` properties. A project
+reference names a theme defined in the page's top-level project folder. Project defaults accept
+only a registered platform theme or a project theme from that same project. The default's stored
+tuple comprises its scope and slug, plus the project theme identity for project scope; \`null\`
+selects the platform \`report\` theme. A default is presentation context, not an authored page
+reference.
+
+
+Theme definitions may include \`extends\`, which must be a \`ThemeRef\` with exactly \`scope\`
+(\`platform\` or \`project\`) and \`slug\`. A project theme's \`extends\` parent must be a registered
+platform theme or an existing project theme in its defining project. Children inherit resolved
+color tokens, font stacks, scales, and recipes; child-supplied values override inherited values.
+Project parent chains resolve within that same project.
+Project theme definitions are validated and compiled when defined or revised. Supported Google
+Fonts are captured at definition time, embedded in sealed theme data, and resolved with the
+theme; readers do not contact the provider. Revisions append immutable, audited history. Pages
+refer to the theme identity, not a pinned revision: reads and publication composition resolve its
+current revision. The API/MCP permission table below describes live authority: Editors may list,
+read, define, revise, and delete project themes and set defaults; Managers and Owners may also
+change the project brand lock. Changing the lock controls reader theme switching and does not
+change the theme reference.
+
+Theme context is inherited from an artefact's current top-level project, including when it is
+stored in a nested folder. A move does not create an artefact version or rewrite its ThemeRef.
+If a page's project-scoped theme is not available in its destination project, the reader resolves
+the destination project's default, then platform \`report\`. Content reads return and audit
+\`themeResolution\` as \`explicit\` or \`fallback\`, so callers can distinguish that resolution from
+the page's saved reference.
 
 The trusted inline page kit supplies registered semantic components and CSS tokens inside the
 opaque sandbox; authored source cannot load an external kit. The composed viewer and gallery Content
@@ -767,8 +798,11 @@ Authority is the key user's current role on the project's top-level folder:
 | Operation | API tier |
 |---|---|
 | List collections; list/get records in a \`records\` collection | \`read\` (Viewer) |
+| List project themes; read a project theme | \`read\` (Viewer) |
 | Define a collection; create/update/delete records; delete a \`records\` collection | \`write\` (Editor) |
 | List/get/delete records in a \`responses\` collection; delete a \`responses\` collection | \`manage\` (Manager) |
+| Define/revise/delete project themes; set project default | \`write\` (Editor) |
+| Change project brand lock | \`manage\` (Manager) |
 | Create or update a response | never (\`403 forbidden\`) |
 
 Through the viewer SDK:
@@ -808,6 +842,12 @@ Authority is rechecked live on every part, status, complete, cancel and download
 | \`PUT\` | \`/_api/projects/<folder>/collections/<name>\` | \`{ "kind", "fields", "visitors"? }\` | \`201\`/\`200 { "collection" }\` |
 | \`DELETE\` | \`/_api/projects/<folder>/collections/<name>\` | — | \`{ "ok": true, "name" }\` (its records go too) |
 | \`GET\` | \`…/collections/<name>/records?limit=&cursor=\` | — | \`{ "records", "cursor" }\` |
+| \`GET\` | \`/_api/projects/<folder>/themes\` | — | \`{ "themes": [ { "scope": "project", "slug", "revision", "id", "createdAt", "updatedAt" } ] }\` (metadata only) |
+| \`GET\` | \`/_api/projects/<folder>/themes/<slug>\` | — | \`{ "theme": { "scope": "project", "slug", "revision", "definition" } }\` |
+| \`PUT\` | \`/_api/projects/<folder>/themes/<slug>\` | definition object; optional \`If-Revision: <integer>\` | \`201\`/\`200 { "theme": { "scope", "slug", "revision", "currentRevision" } }\` |
+| \`DELETE\` | \`/_api/projects/<folder>/themes/<slug>\` | — | \`{ "ok": true, "slug" }\` (only when unreferenced) |
+| \`PUT\` | \`/_api/projects/<folder>/theme-default\` | \`{ "theme": ThemeRef | null }\` | \`{ "ok": true }\` |
+| \`PUT\` | \`/_api/projects/<folder>/theme-brand-lock\` | \`{ "brandLock": boolean }\` | \`{ "ok": true, "brandLock" }\` (Manager) |
 | \`POST\` | \`…/collections/<name>/records\` | \`{ "data" }\` | \`201 { "record" }\` (\`records\` only) |
 | \`GET\` | \`…/collections/<name>/records/<id>\` | — | \`{ "record" }\` |
 | \`PUT\` | \`…/collections/<name>/records/<id>\` | \`{ "data", "ifVersion"? }\` | \`{ "record" }\` (\`records\` only) |

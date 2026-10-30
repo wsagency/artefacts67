@@ -190,7 +190,9 @@ export async function openArtifact(viewer: ViewerDescriptor, { password, signal 
   let page: PagePresentation | undefined;
   if (pageData !== undefined) {
     if (!pageData || typeof pageData !== 'object' || Array.isArray(pageData) || !('type' in pageData) || pageData.type !== 'page' ||
-      !('brandLock' in pageData) || typeof pageData.brandLock !== 'boolean' || !('theme' in pageData)) throw new Error('The server returned invalid page metadata.');
+      !('brandLock' in pageData) || typeof pageData.brandLock !== 'boolean' || !('theme' in pageData) ||
+      !('themeResolution' in pageData) || (pageData.themeResolution !== 'explicit' && pageData.themeResolution !== 'fallback') ||
+      ('fontsCss' in pageData && typeof pageData.fontsCss !== 'string')) throw new Error('The server returned invalid page metadata.');
     const lang = 'lang' in pageData && typeof pageData.lang === 'string' ? pageData.lang : undefined;
     const selected = pageData.theme;
     let selectedTheme: PagePresentation['theme'];
@@ -218,9 +220,12 @@ export async function openArtifact(viewer: ViewerDescriptor, { password, signal 
       } catch {
         throw new Error('The server returned invalid page theme metadata.');
       }
-      if (selectedTheme && (selectedTheme.scope !== 'platform' || (getPlatformTheme(selectedTheme.slug) && compiledTheme.slug !== selectedTheme.slug))) throw new Error('The server returned mismatched page theme metadata.');
+      if (selectedTheme && compiledTheme.slug !== selectedTheme.slug) throw new Error('The server returned mismatched page theme metadata.');
     }
-    page = { type: 'page', theme: selectedTheme, brandLock: pageData.brandLock, ...(lang === undefined ? {} : { lang }), ...(compiledTheme ? { compiledTheme } : {}) };
+    page = { type: 'page', theme: selectedTheme, themeResolution: pageData.themeResolution as PagePresentation['themeResolution'],
+      brandLock: pageData.brandLock, ...(lang === undefined ? {} : { lang }),
+      ...('fontsCss' in pageData && typeof pageData.fontsCss === 'string' ? { fontsCss: pageData.fontsCss } : {}),
+      ...(compiledTheme ? { compiledTheme } : {}) };
   }
   const opened: RuntimeOpened = Object.freeze({ html, permissions, ...(page ? { page } : {}) });
   openedState.set(opened, Object.freeze({ grant: runtime.grant, observation: payload.observation && typeof payload.observation === 'object' ? Object.freeze({ ...(payload.observation as Record<string, unknown>) }) : null }));
@@ -230,13 +235,14 @@ export async function openArtifact(viewer: ViewerDescriptor, { password, signal 
 // Standalone source text, not Function.toString(): bundler helpers must never enter srcdoc.
 
 export type ArtifactTheme = 'light' | 'dark';
+type PageThemeRef = { scope: 'platform' | 'project'; slug: string };
 const frameThemes = new WeakMap<HTMLIFrameElement, (theme: ArtifactTheme) => void>();
-const framePageThemes = new WeakMap<HTMLIFrameElement, (theme: CompiledTheme) => void>();
+const framePageThemes = new WeakMap<HTMLIFrameElement, (theme: CompiledTheme, reference: PageThemeRef) => void>();
 const frameTextSizes = new WeakMap<HTMLIFrameElement, (size: 's' | 'm' | 'l') => void>();
 
 /** Replace a compiled theme through the authenticated, versioned frame channel. */
-export function setArtifactFramePageTheme(iframe: HTMLIFrameElement, theme: CompiledTheme): void {
-  framePageThemes.get(iframe)?.(theme);
+export function setArtifactFramePageTheme(iframe: HTMLIFrameElement, theme: CompiledTheme, reference: PageThemeRef = { scope: 'platform', slug: theme.slug }): void {
+  framePageThemes.get(iframe)?.(theme, reference);
 }
 
 /** Adjust page root type without replacing its document or kit runtime. */
@@ -258,7 +264,7 @@ export function mountArtifactFrame(iframe: HTMLIFrameElement, opened: OpenedArti
     ?? (opened.page.theme?.scope === 'platform' ? getPlatformTheme(opened.page.theme.slug) : null)
     ?? getPlatformTheme('report')! : undefined;
   const hostedPage = effectivePageTheme
-    ? composeHostedPageDocument(opened.html, effectivePageTheme, initialTheme, origin, textSize, opened.page?.lang ?? "en", nonce, opened.permissions.write === true)
+    ? composeHostedPageDocument(opened.html, effectivePageTheme, initialTheme, origin, textSize, opened.page?.lang ?? "en", nonce, opened.permissions.write === true, opened.page?.fontsCss ?? "", opened.page?.theme?.scope ?? "platform")
     : undefined;
   iframe.setAttribute('sandbox', 'allow-scripts');
   iframe.setAttribute('referrerpolicy', 'no-referrer');
@@ -268,11 +274,11 @@ export function mountArtifactFrame(iframe: HTMLIFrameElement, opened: OpenedArti
   let disconnect: (() => void) | undefined;
   let lastObservation = 0;
   let observedActive = 0;
+  let pageThemeVersion = 0;
   let theme = initialTheme;
   let themed = false;
   let themePort: MessagePort | undefined;
-  let pageThemeVersion = 0;
-  let pendingPageTheme: CompiledTheme | undefined;
+  let pendingPageTheme: { compiledTheme: CompiledTheme; reference: PageThemeRef } | undefined;
   let pendingTextSize = textSize;
   frameThemes.set(iframe, next => {
     theme = next;
@@ -280,11 +286,11 @@ export function mountArtifactFrame(iframe: HTMLIFrameElement, opened: OpenedArti
     themePort?.postMessage({ type: 'theme', theme: next });
   });
   if (effectivePageTheme) {
-    framePageThemes.set(iframe, next => {
-      pendingPageTheme = next;
+    framePageThemes.set(iframe, (next, reference) => {
+      pendingPageTheme = { compiledTheme: next, reference };
       pageThemeVersion++;
       themePort?.postMessage({ type: 'page-theme', source: 'parent', nonce, version: pageThemeVersion,
-        theme: { scope: 'platform', slug: next.slug }, css: next.css });
+        theme: reference, css: next.css, logo: next.logo });
     });
     frameTextSizes.set(iframe, size => {
       pendingTextSize = size;
@@ -375,9 +381,9 @@ export function mountArtifactFrame(iframe: HTMLIFrameElement, opened: OpenedArti
     channel.port1.start();
     themePort = channel.port1;
     if (effectivePageTheme) {
-      const selected = pendingPageTheme ?? effectivePageTheme;
+      const selected = pendingPageTheme ?? { compiledTheme: effectivePageTheme, reference: opened.page?.theme ?? { scope: 'platform', slug: effectivePageTheme.slug } };
       themePort.postMessage({ type: 'page-theme', source: 'parent', nonce, version: ++pageThemeVersion,
-        theme: { scope: 'platform', slug: selected.slug }, css: selected.css });
+        theme: selected.reference, css: selected.compiledTheme.css, logo: selected.compiledTheme.logo });
       themePort.postMessage({ type: 'text-size', source: 'parent', nonce, size: pendingTextSize });
     }
     clearTimeout(connectionTimer);
@@ -426,7 +432,7 @@ export async function downloadArtifact(viewer: Pick<ViewerDescriptor, 'title' | 
   const source = await readArtifactSource(opened);
   const compiledTheme = opened.page ? pageTheme ?? opened.page.compiledTheme ?? getPlatformTheme(opened.page.theme?.slug ?? 'report') : null;
   const document = compiledTheme
-    ? composePageDownload(source, compiledTheme, mode, viewer.documentOrigin ?? location.origin, textSize, opened.page?.lang)
+    ? composePageDownload(source, compiledTheme, mode, viewer.documentOrigin ?? location.origin, textSize, opened.page?.lang, opened.page?.fontsCss ?? "", opened.page?.theme?.scope ?? "platform")
     : source;
   saveBlob(new Blob([document], { type: 'text/html;charset=utf-8' }), filename || `${viewer.title || 'artefact'}.html`);
 }

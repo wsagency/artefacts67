@@ -10,7 +10,7 @@ import type { CodeError } from "./types.js";
 export const MCP_VERSIONS = ["2025-06-18", "2025-03-26"] as const;
 
 type Args = Record<string, unknown>;
-interface ApiCall { method: string; rest: string; query?: Record<string, unknown>; body?: unknown }
+interface ApiCall { method: string; rest: string; query?: Record<string, unknown>; body?: unknown; headers?: Record<string, string> }
 interface Tool { name: string; description: string; inputSchema: { type: "object"; properties: Record<string, object>; required?: string[] }; call(args: Args): ApiCall }
 
 const string = (description: string) => ({ type: "string", description });
@@ -29,6 +29,9 @@ const uploadPath = (args: Args) => `${inCollection(args)}/uploads/${segment(args
 const recordArgs = { folder: FOLDER, collection: string("Collection name."), id: string("Record id.") };
 const uploadArgs = { folder: FOLDER, collection: recordArgs.collection, uploadId: string("Upload id from start_upload.") };
 const HTTP_ONLY = "Bytes never travel through MCP; use HTTP with the same Authorization: Bearer key.";
+const THEMEREF = { type: "object", properties: {
+  scope: { type: "string", enum: ["platform", "project"] }, slug: string("Theme slug."),
+}, required: ["scope", "slug"], additionalProperties: false };
 
 const TOOLS: Tool[] = [
   { name: "list_folders", description: "List folders this key can reach.",
@@ -43,9 +46,9 @@ const TOOLS: Tool[] = [
   { name: "publish_artifact", description: "Publish a complete HTML site or semantic page fragment in a folder.",
     inputSchema: { type: "object", properties: {
       folder: string("Folder slug; created when missing."), slug: string("Artefact slug."), title: string("Title."),
-      html: string("Complete HTML document for site, or a body fragment for page."), type: { type: "string", enum: ["site", "page"] },
-      theme: { type: "object", properties: { scope: { type: "string", enum: ["platform"] }, slug: string("Theme slug.") },
-        required: ["scope", "slug"], additionalProperties: false },
+      html: string("Complete HTML document or page fragment."),
+      type: { type: "string", enum: ["site", "page"], description: "Omitted or site preserves legacy documents; page validates a semantic fragment." },
+      theme: THEMEREF,
       themeOverrides: { type: "object", properties: { tokens: { type: "object" }, recipes: { type: "object" } },
         additionalProperties: false },
       folderName: string("Display name for a new folder."),
@@ -53,6 +56,37 @@ const TOOLS: Tool[] = [
       ifVersion: { type: "integer", minimum: 1, description: "Only publish when the current version matches." },
     }, required: ["folder", "slug", "title", "html"] },
     call: (args) => ({ method: "POST", rest: "artifacts", body: args }) },
+  { name: "list_themes", description: "List project themes or platform themes when project is omitted.",
+    inputSchema: { type: "object", properties: { project: FOLDER } },
+    call: (args) => ({ method: "GET", rest: args.project === undefined ? "themes" : `projects/${segment(args.project)}/themes` }) },
+  { name: "get_theme", description: "Read a project theme or a platform theme by its explicit ThemeRef.",
+    inputSchema: { type: "object", properties: { project: FOLDER, theme: THEMEREF }, required: ["theme"] },
+    call: (args) => {
+      const theme = args.theme as Args;
+      if (theme.scope === "project" && args.project === undefined)
+        return { method: "GET", rest: `projects/unknown-project/themes/${segment(theme.slug)}` };
+      return { method: "GET", rest: theme.scope === "project"
+        ? `projects/${segment(args.project)}/themes/${segment(theme.slug)}` : `themes/${segment(theme.slug)}` };
+    } },
+  { name: "define_theme", description: "Define or revise a project theme using its appendix JSON definition.",
+    inputSchema: { type: "object", properties: {
+      project: FOLDER, slug: string("Project theme slug."), definition: { type: "object" },
+      ifRevision: { type: "integer", minimum: 0 },
+    }, required: ["project", "slug", "definition"] },
+    call: (args) => ({ method: "PUT", rest: `projects/${segment(args.project)}/themes/${segment(args.slug)}`,
+      body: args.definition, headers: args.ifRevision === undefined ? undefined : { "if-revision": String(args.ifRevision) } }) },
+  { name: "delete_theme", description: "Delete an unreferenced project theme.",
+    inputSchema: { type: "object", properties: { project: FOLDER, slug: string("Project theme slug.") }, required: ["project", "slug"] },
+    call: (args) => ({ method: "DELETE", rest: `projects/${segment(args.project)}/themes/${segment(args.slug)}` }) },
+  { name: "set_project_default_theme", description: "Set the default project ThemeRef, or null for platform report.",
+    inputSchema: { type: "object", properties: {
+      project: FOLDER, theme: { anyOf: [THEMEREF, { type: "null" }] },
+    }, required: ["project", "theme"] },
+    call: (args) => ({ method: "PUT", rest: `projects/${segment(args.project)}/theme-default`, body: { theme: args.theme } }) },
+  { name: "set_project_brand_lock", description: "Set whether reader theme switching is locked for this project.",
+    inputSchema: { type: "object", properties: { project: FOLDER, brandLock: { type: "boolean" } },
+      required: ["project", "brandLock"] },
+    call: (args) => ({ method: "PUT", rest: `projects/${segment(args.project)}/theme-brand-lock`, body: { brandLock: args.brandLock } }) },
   { name: "list_collections", description: "List a project's data collections.",
     inputSchema: { type: "object", properties: { folder: FOLDER }, required: ["folder"] },
     call: (args) => ({ method: "GET", rest: `projects/${segment(args.folder)}/collections` }) },
@@ -175,15 +209,25 @@ export function handleMcp(request: Request, ctx: ApiContext): Effect.Effect<Resp
         const tool = TOOLS.find((candidate) => candidate.name === params.name);
         if (!tool) return rpcError(id, -32602, `Unknown tool ${String(params.name)}.`);
         const args = isObject(params.arguments) ? params.arguments : {};
-        const missing = (tool.inputSchema.required ?? []).filter((key) => args[key] === undefined || args[key] === null);
+        const missing = (tool.inputSchema.required ?? []).filter((key) => args[key] === undefined ||
+          (args[key] === null && !(tool.name === "set_project_default_theme" && key === "theme")));
         if (missing.length) return rpcError(id, -32602, `Missing arguments: ${missing.join(", ")}.`);
+        if (tool.name === "get_theme") {
+          const theme = args.theme;
+          if (!isObject(theme) || Object.keys(theme).length !== 2 ||
+            (theme.scope !== "platform" && theme.scope !== "project") ||
+            typeof theme.slug !== "string" || !/^[a-z][a-z0-9-]{0,47}$/.test(theme.slug))
+            return rpcError(id, -32602, "theme must be an exact ThemeRef with platform/project scope and a valid slug.");
+          if (theme.scope === "project" && args.project === undefined)
+            return rpcError(id, -32602, "Missing arguments: project.");
+        }
         const call = tool.call(args);
         const query = new URLSearchParams();
         for (const [key, value] of Object.entries(call.query ?? {})) if (value !== undefined && value !== null) query.set(key, String(value));
         const search = query.size ? `?${query}` : "";
         const synthetic = new Request(new URL(`/_api/${call.rest}${search}`, request.url), {
           method: call.method,
-          headers: { authorization, "content-type": "application/json" },
+          headers: { authorization, "content-type": "application/json", ...(call.headers ?? {}) },
           body: call.body === undefined ? undefined : JSON.stringify(call.body),
         });
         const response = yield* handleApi(synthetic, ctx, { rest: call.rest });

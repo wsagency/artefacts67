@@ -11,6 +11,7 @@ import { setTimeout as delay } from 'node:timers/promises';
 import { register } from '../../worker/node_modules/tsx/dist/esm/api/index.mjs';
 register({ tsconfig: new URL('../../worker/tsconfig.json', import.meta.url).pathname });
 const { PLATFORM_THEMES } = await import('../src/platform-themes.ts');
+const { COLOR_TOKENS } = await import('../src/theme-compiler.ts');
 const { PAGE_KIT_CSS: kitCss, PAGE_KIT_RUNTIME: kitRuntime, themeConfigurationScript } = await import('../src/page-kit.ts');
 
 const axeTags = ['wcag2a', 'wcag2aa', 'wcag21a', 'wcag21aa', 'wcag22aa'];
@@ -86,6 +87,7 @@ try {
   const runtimeFileResponses = [];
   let kitSessionId;
   const kitRequests = [], kitConsoleErrors = [], kitExceptions = [], kitCspViolations = [];
+  const projectThemeReaderRequests = [];
   const diagnosticsBySession = new Map();
   const autoAttachHandlers = new Map();
   const call = (method, params = {}, sessionId) => new Promise((resolve, reject) => { const id = ++sequence; requests.set(id, { resolve, reject, method, contextId: params.contextId, expression: typeof params.expression === 'string' ? params.expression.slice(0, 140) : '' }); socket.send(JSON.stringify({ id, method, params, ...(sessionId ? { sessionId } : {}) })); });
@@ -113,6 +115,21 @@ try {
   const autoAttachFrames = async (targetId, retainedSessionIds) => {
     const sessions = new Map(), setups = new Map(), targetInfos = new Map(), setupErrors = [];
     autoAttachHandlers.set(undefined, message => {
+      if (message.method === 'Target.detachedFromTarget') {
+        const detachedSessionId = message.params.sessionId;
+        const detachedTargetId = message.params.targetId ?? [...sessions.entries()]
+          .find(([, sessionId]) => sessionId === detachedSessionId)?.[0];
+        if (detachedTargetId) {
+          sessions.delete(detachedTargetId);
+          setups.delete(detachedTargetId);
+          targetInfos.delete(detachedTargetId);
+        }
+        if (detachedSessionId) {
+          diagnosticsBySession.delete(detachedSessionId);
+          retainedSessionIds?.delete(detachedSessionId);
+        }
+        return;
+      }
       const { sessionId, targetInfo, waitingForDebugger } = message.params;
       targetInfos.set(targetInfo.targetId, targetInfo);
       if (targetInfo.type === 'iframe') retainedSessionIds?.add(sessionId);
@@ -140,8 +157,9 @@ try {
       if (message.method === 'Runtime.exceptionThrown') diagnostic.exceptions.push(message.params.exceptionDetails.exception?.description ?? message.params.exceptionDetails.text);
       if (message.method === 'Log.entryAdded' && (message.params.entry.source === 'security' || /content security policy/i.test(message.params.entry.text))) diagnostic.cspViolations.push(message.params.entry.text);
     }
-    const autoAttachHandler = autoAttachHandlers.get(message.sessionId);
-    if (message.method === 'Target.attachedToTarget' && autoAttachHandler) autoAttachHandler(message);
+    const autoAttachHandler = autoAttachHandlers.get(message.sessionId) ?? autoAttachHandlers.get(undefined);
+    if (message.method === 'Target.attachedToTarget' || message.method === 'Target.detachedFromTarget')
+      autoAttachHandler?.(message);
     if (message.sessionId === kitSessionId) {
       if (message.method === 'Network.requestWillBeSent') kitRequests.push(message.params.request.url);
       if (message.method === 'Runtime.consoleAPICalled' && message.params.type === 'error') kitConsoleErrors.push(message.params.args.map(arg => arg.value ?? arg.description).join(' '));
@@ -1210,6 +1228,273 @@ document.getElementById('offer').addEventListener('submit', async (event) => {
     const siteSlug = `smoke-site-compat-${run}`;
     const siteHtml = '<!doctype html><html lang="en"><head><meta charset="utf-8"><title>Legacy site</title></head><body><main><h1>Legacy site bytes</h1></main></body></html>';
     const publishHeaders = { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json' };
+    // Task 3 project themes are part of the default full reader smoke.
+    {
+      const key = settingsMasterKey;
+      assert(key?.startsWith('wak_'), 'Task 3 project-theme calls must use the master key minted through Settings.');
+      const themeHeaders = { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json' };
+      const projectThemeSlug = `smoke-theme-${run}`;
+      const reportTheme = PLATFORM_THEMES.find(theme => theme.slug === 'report');
+      assert(reportTheme, 'The report platform theme must be registered.');
+      const projectThemeDefinition = {
+        slug: projectThemeSlug,
+        name: 'Project theme smoke',
+        extends: { scope: 'platform', slug: 'report' },
+        tokens: {
+          light: Object.fromEntries(COLOR_TOKENS.map(token => [token, reportTheme.tokens.light[token]])),
+          dark: Object.fromEntries(COLOR_TOKENS.map(token => [token, reportTheme.tokens.dark[token]])),
+        },
+        fonts: {
+          heading: { family: 'Roboto', stack: '"Roboto", system-ui, sans-serif' },
+          body: { family: 'system-ui', stack: 'system-ui, sans-serif' },
+          mono: { family: 'ui-monospace', stack: 'ui-monospace, monospace' },
+        },
+        scales: { radius: 'md', density: 1, shadow: 'soft' },
+        fontSources: ['https://fonts.googleapis.com/css2?family=Roboto:wght@400&display=swap'],
+      };
+      const themePath = `/_api/projects/${encodeURIComponent(project.folder)}/themes/${encodeURIComponent(projectThemeSlug)}`;
+      const projectThemeResponse = await fetch(new URL(themePath, viewer.origin), {
+        method: 'PUT', headers: themeHeaders, body: JSON.stringify(projectThemeDefinition),
+      });
+      assert([200, 201].includes(projectThemeResponse.status), `Project theme definition must succeed: ${await projectThemeResponse.text()}`);
+      const projectDefaultResponse = await fetch(new URL(`/_api/projects/${encodeURIComponent(project.folder)}/theme-default`, viewer.origin), {
+        method: 'PUT', headers: themeHeaders,
+        body: JSON.stringify({ theme: { scope: 'platform', slug: 'editorial' } }),
+      });
+      assert.equal(projectDefaultResponse.status, 200, `Project default must accept platform editorial: ${await projectDefaultResponse.text()}`);
+      const metadataResponse = await fetch(new URL(`/_api/projects/${encodeURIComponent(project.folder)}/themes`, viewer.origin), {
+        headers: { Authorization: `Bearer ${key}` },
+      });
+      assert.equal(metadataResponse.status, 200, 'Project theme metadata must be readable.');
+      const metadataBody = await metadataResponse.json();
+      const projectThemeMetadata = metadataBody.themes.find(theme => theme.slug === projectThemeSlug);
+      assert(projectThemeMetadata?.id, 'Project theme metadata must expose its identity.');
+      assert.equal(projectThemeMetadata.currentRevision ?? projectThemeMetadata.revision, 1, 'Project theme metadata must expose revision identity.');
+      assert.equal('definition' in projectThemeMetadata, false, 'Project theme metadata must not expose the definition.');
+      assert.equal('fonts' in projectThemeMetadata || 'fontBytes' in projectThemeMetadata, false, 'Project theme metadata must not expose font bytes.');
+      const invalidTokenSlug = `${projectThemeSlug}-unknown-token`;
+      const invalidToken = structuredClone(projectThemeDefinition);
+      invalidToken.slug = invalidTokenSlug;
+      invalidToken.tokens.light.unknown = '#000000';
+      const invalidTokenResponse = await fetch(new URL(`/_api/projects/${encodeURIComponent(project.folder)}/themes/${encodeURIComponent(invalidTokenSlug)}`, viewer.origin), {
+        method: 'PUT', headers: themeHeaders, body: JSON.stringify(invalidToken),
+      });
+      assert.equal(invalidTokenResponse.status, 422, 'An unknown theme token must be rejected as validation.');
+      const crossProjectSlug = `${projectThemeSlug}-cross-project`;
+      const crossProjectDefinition = { ...structuredClone(projectThemeDefinition), slug: crossProjectSlug,
+        extends: { scope: 'project', slug: `foreign-${run}` } };
+      const crossProjectResponse = await fetch(new URL(`/_api/projects/${encodeURIComponent(project.folder)}/themes/${encodeURIComponent(crossProjectSlug)}`, viewer.origin), {
+        method: 'PUT', headers: themeHeaders, body: JSON.stringify(crossProjectDefinition),
+      });
+      assert.equal(crossProjectResponse.status, 422, 'An unavailable project parent outside this project must be rejected as validation.');
+      const projectThemePageSlug = `smoke-project-theme-${run}`;
+      const projectThemePage = await fetch(new URL('/_api/artifacts', viewer.origin), {
+        method: 'POST', headers: themeHeaders,
+        body: JSON.stringify({ ...project, slug: projectThemePageSlug, title: 'Project theme font smoke', type: 'page',
+          theme: { scope: 'project', slug: projectThemeSlug }, html: '<main><h1>Captured font smoke</h1></main>' }),
+      });
+      assert.equal(projectThemePage.status, 201, 'A page selecting the project theme must publish.');
+      const projectThemePageBody = await projectThemePage.json();
+      const projectThemePageId = projectThemePageBody.artifact.id;
+      created.artifacts.push(projectThemePageSlug);
+      const projectThemeAutoAttach = await autoAttachFrames(targetId);
+      try {
+        projectThemeReaderRequests.length = 0;
+        await command('Page.navigate', { url: new URL(`/app/a/${projectThemePageSlug}/view`, viewer.origin).href });
+        await until('!!document.querySelector("iframe.artifact-frame")?.srcdoc');
+        await evaluate('new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)))');
+        const { frameTree } = await command('Page.getFrameTree');
+        const frameDeadline = Date.now() + 15000;
+        let readerTarget;
+        do {
+          const liveTargets = (await call('Target.getTargets')).targetInfos;
+          await Promise.all(projectThemeAutoAttach.setups.values());
+          readerTarget = liveTargets.find(info =>
+            info.type === 'iframe' && info.parentFrameId === frameTree.frame.id && info.url === 'about:srcdoc' &&
+            projectThemeAutoAttach.sessions.has(info.targetId) &&
+            projectThemeAutoAttach.targetInfos.get(info.targetId)?.parentFrameId === frameTree.frame.id);
+          if (readerTarget) break;
+          await delay(50);
+        } while (Date.now() < frameDeadline);
+        assert(readerTarget, 'The live project-themed reader iframe must have an attached child target.');
+        const readerTargetId = readerTarget.targetId;
+        const childSessionId = projectThemeAutoAttach.sessions.get(readerTargetId);
+        assert(childSessionId, 'The live project-themed reader iframe session must be retained.');
+        await projectThemeAutoAttach.setups.get(readerTargetId);
+        const childDiagnostics = diagnosticsBySession.get(childSessionId);
+        assert(childDiagnostics?.captureReady, 'Network must be enabled for the project-themed reader iframe before it resumes.');
+        const childCommand = (method, params) => call(method, params, childSessionId);
+        const { frameTree: childTree } = await childCommand('Page.getFrameTree');
+        assert.equal(childTree.frame.url, 'about:srcdoc', 'The inspected CDP target must be the live project reader srcdoc.');
+        const childFrameId = childTree.frame.id;
+        const { executionContextId } = await childCommand('Page.createIsolatedWorld', { frameId: childFrameId, worldName: 'project-theme-font-check' });
+        await until('document.readyState === "complete"', executionContextId, childCommand);
+        const inProjectThemeFrame = expression => evaluate(expression, executionContextId, childCommand);
+        await inProjectThemeFrame('document.fonts.load(\'16px "Roboto"\', "Captured font smoke")');
+        const projectFontState = await inProjectThemeFrame(`(() => ({
+          family: getComputedStyle(document.querySelector("h1")).fontFamily,
+          embedded: document.documentElement.innerHTML.includes("data:font/woff2;base64,"),
+          loaded: document.fonts.check('16px "Roboto"', "Captured font smoke"),
+        }))()`);
+        assert(projectFontState.family.includes('Roboto'), 'The reader must use the selected project theme font family.');
+        assert.equal(projectFontState.embedded, true, 'The reader document must use the captured WOFF2 face.');
+        assert.equal(projectFontState.loaded, true, 'The project theme WOFF2 face must load from embedded bytes.');
+        await delay(100);
+        projectThemeReaderRequests.push(...childDiagnostics.requests);
+        assert.deepEqual(projectThemeReaderRequests.filter(url => /fonts\.(?:googleapis|gstatic)\.com/.test(url)), [],
+          'The project-themed reader iframe must never request Google Fonts at render time.');
+      } finally {
+        await call('Target.setAutoAttach', { autoAttach: false, waitForDebuggerOnStart: false, flatten: true });
+        autoAttachHandlers.delete(undefined);
+        const childSessionIds = new Set(projectThemeAutoAttach.sessions.values());
+        for (const childSessionId of childSessionIds) {
+          await call('Target.detachFromTarget', { sessionId: childSessionId }).catch(() => {});
+          diagnosticsBySession.delete(childSessionId);
+        }
+        projectThemeAutoAttach.sessions.clear();
+        projectThemeAutoAttach.setups.clear();
+        projectThemeAutoAttach.targetInfos.clear();
+      }
+      const revisedDefinition = structuredClone(projectThemeDefinition);
+      revisedDefinition.name = 'Revised project theme smoke';
+      const reviseResponse = await fetch(new URL(`/_api/projects/${encodeURIComponent(project.folder)}/themes/${encodeURIComponent(projectThemeSlug)}`, viewer.origin), {
+        method: 'PUT', headers: { ...themeHeaders, 'If-Revision': '1' }, body: JSON.stringify(revisedDefinition),
+      });
+      assert.equal(reviseResponse.status, 200, 'A live project theme revision must succeed.');
+      assert.equal((await reviseResponse.json()).theme.revision, 2, 'Theme revisions must advance independently of artifact versions.');
+      const beforeMoveContent = await fetch(new URL(`/_api/artifacts/${encodeURIComponent(projectThemePageId)}/content`, viewer.origin), {
+        headers: { Authorization: `Bearer ${key}` },
+      });
+      assert.equal(beforeMoveContent.status, 200);
+      assert.equal((await beforeMoveContent.json()).version, 1, 'A theme revision must not publish a new artifact version.');
+
+      const destinationName = `smoke-theme-destination-${run}`;
+      const destinationAnchor = `smoke-theme-destination-anchor-${run}`;
+      const ownerSession = process.env.WS_SMOKE_OWNER_SESSION;
+      assert(ownerSession, 'The existing Owner A session is required to create and grant the destination project.');
+      const ownerCookie = `wsa_session=${ownerSession}`;
+      const ownerAppResponse = await fetch(new URL('/app', viewer.origin), { headers: { Cookie: ownerCookie } });
+      assert.equal(ownerAppResponse.status, 200, 'Owner A must have an active local console session.');
+      const ownerBootstrap = await ownerAppResponse.text();
+      const ownerPayload = ownerBootstrap.match(/<script id="ws-bootstrap" type="application\/json">([^<]+)<\/script>/)?.[1];
+      assert(ownerPayload, 'Owner A console bootstrap must provide its CSRF token.');
+      const ownerProps = JSON.parse(ownerPayload).props;
+      const viewerAppResponse = await fetch(new URL('/app', viewer.origin), { headers: { Cookie: `wsa_session=${process.env.WS_SMOKE_SESSION}` } });
+      const viewerBootstrap = await viewerAppResponse.text();
+      const viewerPayload = viewerBootstrap.match(/<script id="ws-bootstrap" type="application\/json">([^<]+)<\/script>/)?.[1];
+      assert(viewerPayload, 'B console bootstrap must provide the exact active account email for the owner grant.');
+      const viewerEmail = JSON.parse(viewerPayload).props.me.email;
+      const createDestination = await fetch(new URL('/app/folders/new', viewer.origin), {
+        method: 'POST', redirect: 'manual', headers: { Cookie: ownerCookie, Origin: viewer.origin, 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: new URLSearchParams({ csrf: ownerProps.me.csrf, name: destinationName }),
+      });
+      assert.equal(createDestination.status, 303, `Owner A must create the destination project: ${await createDestination.text()}`);
+      const destinationRef = new URL(createDestination.headers.get('location'), viewer.origin).pathname.match(/^\/app\/f\/([^/]+)$/)?.[1];
+      assert(destinationRef, 'Owner A destination creation must redirect to its folder.');
+      const grantDestination = await fetch(new URL(`/app/f/${encodeURIComponent(destinationRef)}/grant`, viewer.origin), {
+        method: 'POST', redirect: 'manual', headers: { Cookie: ownerCookie, Origin: viewer.origin, 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: new URLSearchParams({ csrf: ownerProps.me.csrf, email: viewerEmail, role: 'manager' }),
+      });
+      assert.equal(grantDestination.status, 200, `Owner A must grant B Manager access through the existing folder workflow: ${await grantDestination.text()}`);
+      const destinationFolder = decodeURIComponent(destinationRef);
+      const destinationCreated = await fetch(new URL('/_api/artifacts', viewer.origin), {
+        method: 'POST', headers: themeHeaders,
+        body: JSON.stringify({ folder: destinationFolder, slug: destinationAnchor, title: 'Theme move destination',
+          html: '<!doctype html><html><head><title>Destination</title></head><body>Destination</body></html>' }),
+      });
+      assert.equal(destinationCreated.status, 201, `B's Settings master key must publish in the granted destination project: ${await destinationCreated.text()}`);
+      created.artifacts.push(destinationAnchor);
+      const setDestinationDefault = async theme => {
+        const response = await fetch(new URL(`/_api/projects/${encodeURIComponent(destinationFolder)}/theme-default`, viewer.origin), {
+          method: 'PUT', headers: themeHeaders, body: JSON.stringify({ theme }),
+        });
+        assert.equal(response.status, 200, `Destination default must update: ${await response.text()}`);
+      };
+      await setDestinationDefault({ scope: 'platform', slug: 'editorial' });
+      const moveResponse = await consolePost(`/app/a/${encodeURIComponent(projectThemePageSlug)}/move`, { folder: destinationFolder });
+      assert.equal(moveResponse.status, 200, 'Moving the page into the destination project must succeed.');
+
+      const readMovedThemeResolution = async () => {
+        const response = await fetch(new URL(`/_api/artifacts/${encodeURIComponent(projectThemePageId)}/content`, viewer.origin), {
+          headers: { Authorization: `Bearer ${key}` },
+        });
+        assert.equal(response.status, 200, 'The moved page remains readable through the content API.');
+        const body = await response.json();
+        assert.equal(body.version, 1, 'Moving a page must not create an artifact version.');
+        assert.equal(body.themeResolution, 'fallback', 'A former-project theme must be reported as a fallback in its new project.');
+      };
+      await readMovedThemeResolution();
+      await setDestinationDefault({ scope: 'platform', slug: 'launch' });
+      await readMovedThemeResolution();
+      await setDestinationDefault(null);
+      await readMovedThemeResolution();
+
+      const inspectMovedFrame = async expectedTheme => {
+        const movedAutoAttach = await autoAttachFrames(targetId);
+        try {
+          projectThemeReaderRequests.length = 0;
+          await command('Page.navigate', { url: new URL(`/app/a/${projectThemePageSlug}/view`, viewer.origin).href });
+          await until('!!document.querySelector("iframe.artifact-frame")?.srcdoc');
+          await evaluate('new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)))');
+          const { frameTree: movedTree } = await command('Page.getFrameTree');
+          const movedDeadline = Date.now() + 15000;
+          let movedTarget;
+          do {
+            const liveTargets = (await call('Target.getTargets')).targetInfos;
+            await Promise.all(movedAutoAttach.setups.values());
+            movedTarget = liveTargets.find(info => info.type === 'iframe' && info.parentFrameId === movedTree.frame.id &&
+              info.url === 'about:srcdoc' && movedAutoAttach.sessions.has(info.targetId));
+            if (movedTarget) break;
+            await delay(50);
+          } while (Date.now() < movedDeadline);
+          assert(movedTarget, 'The moved page must open in a live reader iframe.');
+          const childSessionId = movedAutoAttach.sessions.get(movedTarget.targetId);
+          assert(childSessionId, 'The moved reader target must have a retained CDP session.');
+          await movedAutoAttach.setups.get(movedTarget.targetId);
+          const movedCommand = (method, params) => call(method, params, childSessionId);
+          const { frameTree: movedChildTree } = await movedCommand('Page.getFrameTree');
+          const { executionContextId } = await movedCommand('Page.createIsolatedWorld', {
+            frameId: movedChildTree.frame.id, worldName: `moved-project-theme-${expectedTheme}`,
+          });
+          await until('document.readyState === "complete"', executionContextId, movedCommand);
+          const movedState = await evaluate(`(() => ({
+            scope: document.querySelector("#a67-page-theme")?.dataset.themeScope,
+            slug: document.querySelector("#a67-page-theme")?.dataset.themeSlug,
+            oldFontStyle: !!document.querySelector("#a67-page-fonts"),
+            oldFontBytes: document.documentElement.innerHTML.includes("data:font/woff2;base64,"),
+          }))()`, executionContextId, movedCommand);
+          assert.equal(movedState.scope, 'platform');
+          assert.equal(movedState.slug, expectedTheme, `A moved page must use destination ${expectedTheme}.`);
+          assert.equal(movedState.oldFontStyle, false, 'The moved page must not retain source-project captured font CSS.');
+          assert.equal(movedState.oldFontBytes, false, 'The moved page must not load source-project font bytes.');
+          await delay(100);
+          projectThemeReaderRequests.push(...diagnosticsBySession.get(childSessionId).requests);
+          assert.deepEqual(projectThemeReaderRequests.filter(url => /fonts\.(?:googleapis|gstatic)\.com/.test(url)), [],
+            'The moved project reader must not request former-project fonts externally.');
+        } finally {
+          await call('Target.setAutoAttach', { autoAttach: false, waitForDebuggerOnStart: false, flatten: true });
+          autoAttachHandlers.delete(undefined);
+          for (const childSessionId of new Set(movedAutoAttach.sessions.values())) {
+            await call('Target.detachFromTarget', { sessionId: childSessionId }).catch(() => {});
+            diagnosticsBySession.delete(childSessionId);
+          }
+        }
+      };
+      await setDestinationDefault({ scope: 'platform', slug: 'editorial' });
+      await inspectMovedFrame('editorial');
+      await setDestinationDefault({ scope: 'platform', slug: 'launch' });
+      await inspectMovedFrame('launch');
+      await setDestinationDefault(null);
+      await inspectMovedFrame('report');
+      const finalMetadataResponse = await fetch(new URL(`/_api/projects/${encodeURIComponent(project.folder)}/themes`, viewer.origin), {
+        headers: { Authorization: `Bearer ${key}` },
+      });
+      assert.equal(finalMetadataResponse.status, 200, 'Project theme metadata remains readable after failed definitions.');
+      const finalThemeMetadata = (await finalMetadataResponse.json()).themes;
+      assert.equal(finalThemeMetadata.some(theme => theme.slug === invalidTokenSlug || theme.slug === crossProjectSlug), false,
+        'Rejected definitions must not append project theme revisions.');
+      console.log('project theme smoke: created sealed theme metadata, set platform editorial default, and opened an embedded-font project theme');
+    }
     const pageInvalid = await fetch(new URL('/_api/artifacts', viewer.origin), {
       method: 'POST', headers: publishHeaders,
       body: JSON.stringify({ ...project, slug: `smoke-page-invalid-${run}`, title: 'Invalid page image', type: 'page',
@@ -1563,7 +1848,7 @@ $('probe-upload').addEventListener('click', () => {
     return select.value;
   })()`);
   await until('typeof window.__pagePendingReady==="function"');
-  await changeControl('Theme', 'editorial');
+  await changeControl('Theme', 'platform:editorial');
   await changeControl('Text size', 's');
   const pendingReady = await evaluate('window.__pagePendingReady(); window.__pagePendingReadyData');
   await evaluate(`parent.postMessage(${JSON.stringify(pendingReady)}, '*'); true`, controlFrame.executionContextId, controlFrame.frameCommand);
@@ -1577,7 +1862,7 @@ $('probe-upload').addEventListener('click', () => {
   await inControlFrame('document.querySelector("#reader-tab-one").click(); true');
   await until('document.querySelector("#reader-tab-one").getAttribute("aria-selected")==="true"', controlFrame.executionContextId, controlFrame.frameCommand);
   for (const slug of ['report', 'editorial', 'launch']) {
-    await changeControl('Theme', slug);
+    await changeControl('Theme', `platform:${slug}`);
     await until(`document.getElementById("a67-page-theme")?.dataset.themeSlug===${JSON.stringify(slug)}`, controlFrame.executionContextId, controlFrame.frameCommand);
     const retained = await inControlFrame('({ value: document.getElementById("reader-state").value, state: document.documentElement.dataset.readerSmokeState, sameRoot: document.documentElement === globalThis.controlRoot, sameStyle: document.getElementById("a67-page-theme") === globalThis.controlThemeStyle, scope: document.documentElement.dataset.a67Theme, accent: getComputedStyle(document.documentElement).getPropertyValue("--a67-accent").trim() })');
     assert.equal(retained.scope, slug, `Changing to ${slug} must update the actual theme selector scope.`);
@@ -1613,12 +1898,12 @@ $('probe-upload').addEventListener('click', () => {
   assert.equal(await evaluate('document===globalThis.pageReaderDocument && document.querySelector("iframe.artifact-frame")===globalThis.readerFrame'), true, 'Theme/mode/size changes must not navigate the reader.');
   await command('Page.navigate', { url: controlsUrl.href });
   await until('document.querySelectorAll(".viewer-page-controls select").length===2');
-  assert.equal(await evaluate(`[...document.querySelectorAll('.viewer-page-controls select')].find(item => item.labels[0]?.textContent.trim() === 'Theme').value`), 'launch', 'Theme preference persists globally per browser.');
+  assert.equal(await evaluate(`[...document.querySelectorAll('.viewer-page-controls select')].find(item => item.labels[0]?.textContent.trim() === 'Theme').value`), 'platform:launch', 'Theme preference persists globally per browser.');
   assert.equal(await evaluate(`[...document.querySelectorAll('.viewer-page-controls select')].find(item => item.labels[0]?.textContent.trim() === 'Text size').value`), 'l', 'Text-size preference persists globally per browser.');
   await command('Page.navigate', { url: new URL(`/app/a/${lockedPageSlug}/view`, viewer.origin).href });
   await until('document.querySelectorAll(".viewer-page-controls select").length===2');
   const lockedControl = await evaluate(`(() => { const select = [...document.querySelectorAll('.viewer-page-controls select')].find(item => item.labels[0]?.textContent.trim() === 'Theme'); return { disabled: select.disabled, value: select.value }; })()`);
-  assert.deepEqual(lockedControl, { disabled: true, value: 'launch' }, 'Brand lock disables theme selection but displays the effective theme.');
+  assert.deepEqual(lockedControl, { disabled: true, value: 'platform:launch' }, 'Brand lock disables theme selection but displays the effective theme.');
   await until('document.querySelector("iframe.artifact-frame")?.srcdoc.length > 0');
   const lockedFrame = await openFrame();
   assert.equal(await evaluate('getComputedStyle(document.documentElement).getPropertyValue("--a67-accent").trim()', lockedFrame.executionContextId, lockedFrame.frameCommand), '#8f5e00', 'A brand-locked token override must affect the rendered page.');
@@ -1753,11 +2038,13 @@ $('probe-upload').addEventListener('click', () => {
     await galleryCommand('Page.navigate', { url: new URL(`/app/a/${pageSlug}/view`, viewer.origin).href });
     await galleryUntil('!!document.querySelector("button[aria-label=\\"Download HTML\\"]:not(:disabled)") && !!document.querySelector("iframe.artifact-frame")?.srcdoc');
     const themeControl = await galleryEvaluate(`(() => { const select=[...document.querySelectorAll('.viewer-page-controls select')].find(item=>item.labels[0]?.textContent.trim()==='Theme'); return { disabled:select.disabled,value:select.value }; })()`);
-    if (!themeControl.disabled) await galleryEvaluate(`(() => { const select=[...document.querySelectorAll('.viewer-page-controls select')].find(item=>item.labels[0]?.textContent.trim()==='Theme'); select.value='editorial'; select.dispatchEvent(new Event('change',{bubbles:true})); return true; })()`);
+    if (!themeControl.disabled) await galleryEvaluate(`(() => { const select=[...document.querySelectorAll('.viewer-page-controls select')].find(item=>item.labels[0]?.textContent.trim()==='Theme'); select.value='platform:editorial'; select.dispatchEvent(new Event('change',{bubbles:true})); return true; })()`);
     const downloadTheme = await galleryEvaluate(`[...document.querySelectorAll('.viewer-page-controls select')].find(item=>item.labels[0]?.textContent.trim()==='Theme').value`);
-    if (!themeControl.disabled) assert.equal(downloadTheme, 'editorial');
+    if (!themeControl.disabled) assert.equal(downloadTheme, 'platform:editorial');
+    const downloadThemeSlug = downloadTheme.slice(downloadTheme.indexOf(':') + 1);
+    if (!themeControl.disabled) assert.equal(downloadThemeSlug, 'editorial');
     const photoFrame = await openFrame(galleryCommand);
-    await until(`document.documentElement.dataset.a67Theme===${JSON.stringify(downloadTheme)}`, photoFrame.executionContextId, photoFrame.frameCommand);
+    await until(`document.documentElement.dataset.a67Theme===${JSON.stringify(downloadThemeSlug)}`, photoFrame.executionContextId, photoFrame.frameCommand);
     await galleryEvaluate(`(() => {
       const create=URL.createObjectURL.bind(URL);
       URL.createObjectURL=blob=>{ window.__downloadCapture=blob.text(); return create(blob); };
@@ -1788,7 +2075,7 @@ $('probe-upload').addEventListener('click', () => {
       };
     })()`);
     assert(standalone.doctype, 'Downloaded page must parse as a complete standalone HTML document.');
-    assert.equal(standalone.slug, downloadTheme);
+    assert.equal(standalone.slug, downloadThemeSlug);
     assert(standalone.kit && standalone.theme, 'The downloaded page must include the page kit and resolved theme.');
     assert(standalone.photo && standalone.png, 'The original validated data-image sources must survive byte-for-byte.');
     assert(standalone.noAuthority && standalone.noGrant && standalone.noPrivateData, 'The standalone document must contain no live SDK authority or private state.');

@@ -214,11 +214,13 @@ const CHILD = String.raw`(() => {
         const style = document.getElementById('a67-page-theme');
         if (data.source !== 'parent' || data.nonce !== nonce || !Number.isSafeInteger(data.version) || data.version <= pageThemeVersion ||
           !data.theme || !['platform', 'project'].includes(data.theme.scope) || !/^[a-z][a-z0-9-]{0,47}$/.test(data.theme.slug) ||
-          typeof data.css !== 'string' || data.css.length > 131072 || !(style instanceof HTMLStyleElement)) return;
+          typeof data.css !== 'string' || data.css.length > 131072 || !(data.logo === null || typeof data.logo === 'string') ||
+          !(style instanceof HTMLStyleElement)) return;
         style.textContent = data.css;
         style.dataset.themeScope = data.theme.scope;
         style.dataset.themeSlug = data.theme.slug;
         document.documentElement.dataset.a67Theme = data.theme.slug;
+        pageKit.configure({ logo: data.logo });
         pageThemeVersion = data.version;
         return;
       }

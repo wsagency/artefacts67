@@ -66,18 +66,27 @@ strongly-consistent counters). You run your own instance: see [First deploy](#fi
 
 - **Site and page artefacts.** Existing publishes and requests that omit `type` remain `site`:
   complete HTML documents with their established source bytes and analytics behavior. Opt into
-  `type: "page"` for a fragment with a constrained HTML/SVG/CSS grammar, a checked platform theme,
-  and a sandboxed composed viewer. The site path is unchanged. Browse the checked themes at
-  `/themes`; the write API accepts `{ "scope": "platform", "slug": "report" | "editorial" | "launch" }`
-  as `theme`, with optional validated `themeOverrides` for page-only customization. Page fragments
+  `type: "page"` for a fragment with a constrained HTML/SVG/CSS grammar, a checked platform or
+  project theme, and a sandboxed composed viewer. The site path is unchanged. Browse the checked
+  platform themes at `/themes`; the write API accepts `ThemeRef` as `{ "scope": "platform", "slug":
+  "report" | "editorial" | "launch" }` or `{ "scope": "project", "slug": "<project theme slug>" }`
+  as `theme`, with optional validated `themeOverrides` for page customization. Page fragments
   retain local `#id` navigation. The toolbar's Copy HTML action returns the authored source. For
   pages with a registered theme, Download HTML composes a standalone document with the trusted
-  inline kit, selected theme, runtime, and CSP; an unregistered theme slug falls back to `report` in
-  the viewer and leaves the downloaded page as the authored fragment. Composed downloads omit the
+  inline kit, selected theme, runtime, and CSP; an unregistered platform theme slug falls back to
+  `report` in the viewer and leaves the downloaded page as the authored fragment. Composed downloads omit the
   hosted SDK, live persistence, and application data. See the [contract](dev-docs/artefact-contract.md)
   for the accepted grammar and security boundary. The `/themes` gallery compares all three checked
   themes on one common sample; it does not publish pages or expose a design editor. The page
   runtime does not permit external scripts, stylesheets, images or network requests.
+  Project themes are scoped to the top-level folder: pages may reference either a registered
+  platform ThemeRef or a theme defined in that project, including from nested folders. Editors
+  may define, revise, and delete project themes, and set the project default (a registered
+  platform theme or a theme from that project; `null` means `report`). Managers and Owners
+  can also set the project brand lock. Definitions capture supported fonts at definition time,
+  and immutable revisions are resolved live rather than pinned to page versions. A moved page
+  whose project theme is not available in its destination falls back to that project's default
+  and then `report`; content reads expose `themeResolution` as `explicit` or `fallback`.
   Fragment-only links stay inside the document and preserve its form and JavaScript state.
   The automated page accessibility gate audits shipped experiences against WCAG 2.2 A/AA rules;
   axe incomplete findings are reported separately, and this is not a certification of arbitrary
@@ -289,9 +298,13 @@ cookie value for the collaborator, Chrome executable, a local content-read `wak_
 a separate key without `can_read_content` (a `wak_` master or a fixture-scoped `waa_` key);
 never use production credentials. Use a collaborator session with no master key and manager access
 to the fixture folder; both API keys belong to the fixture owner.
-With the collaborator session above, `WS_SMOKE_OWNER_SESSION` is required: it is the owner's local
-session cookie used only for cleanup of artefacts created through the master key. Omit it only
-for same-owner runs, where cleanup uses `WS_SMOKE_SESSION`:
+With the collaborator session above, `WS_SMOKE_OWNER_SESSION` is required for the full smoke:
+Owner A uses it only in the existing folder-create/grant flow for the moved-page theme regression
+and to clean up artefacts created through B's master key. The project-theme block runs by default.
+`WS_SMOKE_SESSION` remains B's browser session, and B's opted-in master key is minted through
+Settings during the smoke; no additional fixture users or production credentials are used.
+The moved-page regression expects the console move route's successful response status to remain
+HTTP 200.
 
 ```sh
 WS_SMOKE_VIEWER='http://localhost:8788/app/a/<smoke-slug>/view' \
@@ -303,20 +316,26 @@ WS_SMOKE_NOREAD_API_KEY='<local key without can_read_content>' \
 node frontend/scripts/smoke-reader.mjs
 ```
 
-For isolated local development, put a development-only master key in `worker/.dev.vars`, apply
-the local migrations and start Wrangler on the reserved smoke port (Wrangler persists to
-`worker/.wrangler/state`):
+For an isolated real-browser smoke, create a fresh private persistence directory for each run;
+never copy or reuse a previous local state. Put a freshly generated development-only
+`ARTEFACTS_MASTER_KEY` in `<state>/.dev.vars` with mode `0600`, and use that same state for
+migrations and Wrangler through `--persist-to`. Confirm the migrated database has a `sessions`
+table before provisioning the local A/B accounts. Do not print or commit the key, session cookies,
+or API keys.
 
 ```sh
-echo "ARTEFACTS_MASTER_KEY=$(openssl rand -hex 32)" > worker/.dev.vars
-npm run migrate:local
-npm --prefix worker exec -- wrangler -c worker/wrangler.jsonc dev --port 8788
+STATE="$(mktemp -d /tmp/a67-smoke.XXXXXX)"
+chmod 700 "$STATE"
+(umask 077; printf 'ARTEFACTS_MASTER_KEY=%s\n' "$(openssl rand -hex 32)" > "$STATE/.dev.vars")
+npm run migrate:local -- --persist-to "$STATE"
+cd worker && npm exec -- wrangler -c wrangler.jsonc --env-file "$STATE/.dev.vars" \
+  dev --port 8788 --persist-to "$STATE"
 ```
 
-The public `worker/wrangler.jsonc` sets no vars, so `PUBLIC_ORIGIN` and `WEBAUTHN_RP_ID` derive
-from the request (for example `http://localhost:8788`). Keep imported snapshots separate and select
-their persistence root explicitly; never run root `npm run migrate` for local setup, because it
-targets remote D1. Never reuse or regenerate a production master key for a smoke run.
+Do not pass the key on a command line; keep it only in this private file. The public
+`worker/wrangler.jsonc` sets no vars, so `PUBLIC_ORIGIN` and `WEBAUTHN_RP_ID` derive from the
+request (for example `http://localhost:8788`). Never run root `npm run migrate` for local setup,
+because it targets remote D1. Never reuse or regenerate a production master key for a smoke run.
 
 - **Deploy:** see [First deploy](#first-deploy); later deploys are `npm run migrate` followed by
   `npm run deploy`.

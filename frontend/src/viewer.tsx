@@ -128,18 +128,28 @@ export function ArtifactViewer(props: { viewer: ViewerDescriptor | null; title?:
   const systemScheme = matchMedia('(prefers-color-scheme: dark)');
   const [systemTheme, setSystemTheme] = createSignal<ArtifactTheme>(systemScheme.matches ? 'dark' : 'light');
   const theme = (): ArtifactTheme => { const chosen = storedTheme(); return chosen === 'light' || chosen === 'dark' ? chosen : systemTheme(); };
-  const pageThemeSlug = (): string | null => {
+  const assignedPageTheme = () => {
+    const reference = opened()?.page?.theme;
+    return reference ? `${reference.scope}:${reference.slug}` : 'platform:report';
+  };
+  const selectedPageTheme = () => {
     const current = opened();
-    if (!current?.page) return null;
-    const assigned = current.page.theme?.scope === 'platform' ? current.page.theme.slug : 'report';
-    const selected = current.page.brandLock ? assigned : storedPageTheme() ?? assigned;
-    return PLATFORM_THEMES.find(item => item.slug === selected)?.slug ?? assigned;
+    const stored = storedPageTheme();
+    const assigned = assignedPageTheme();
+    if (!current?.page || current.page.brandLock || !stored) return assigned;
+    const selection = stored.includes(':') ? stored : `platform:${stored}`;
+    if (selection.startsWith('project:')) return selection === assigned ? selection : assigned;
+    const slug = selection.slice('platform:'.length);
+    return PLATFORM_THEMES.some(item => item.slug === slug) ? selection : assigned;
   };
   const pageTheme = () => {
     const current = opened();
-    const selected = pageThemeSlug();
-    if (current?.page?.compiledTheme && selected === (current.page.theme?.scope === 'platform' ? current.page.theme.slug : 'report')) return current.page.compiledTheme;
-    return PLATFORM_THEMES.find(item => item.slug === selected) ?? null;
+    const selected = selectedPageTheme();
+    if (!current?.page) return null;
+    if (selected === assignedPageTheme()) return current.page.compiledTheme ?? null;
+    const [scope, slug] = selected.split(':', 2);
+    return scope === 'platform' ? PLATFORM_THEMES.find(item => item.slug === slug) ?? current.page.compiledTheme ?? null
+      : current.page.compiledTheme ?? null;
   };
   const [themed, setThemed] = createSignal(false);
   const passwords = new Map<string, string>();
@@ -264,8 +274,12 @@ export function ArtifactViewer(props: { viewer: ViewerDescriptor | null; title?:
     ({ frame, scheme }) => { if (frame) setArtifactFrameTheme(frame, scheme); },
   );
   createEffect(
-    () => ({ frame: frameElement(), artifact: opened(), selected: pageTheme() }),
-    ({ frame, artifact, selected }) => { if (frame && artifact?.page && selected) setArtifactFramePageTheme(frame, selected); },
+    () => ({ frame: frameElement(), artifact: opened(), selected: pageTheme(), selection: selectedPageTheme() }),
+    ({ frame, artifact, selected, selection }) => {
+      const [scope, slug] = selection.split(':', 2);
+      if (frame && artifact?.page && selected && (scope === 'platform' || scope === 'project') && slug)
+        setArtifactFramePageTheme(frame, selected, { scope, slug });
+    },
   );
 
   createEffect(
@@ -352,7 +366,10 @@ export function ArtifactViewer(props: { viewer: ViewerDescriptor | null; title?:
       <div class="viewer-actions">
         {viewer()?.data && <DataStatus data={viewer()!.data!} />}
         {opened()?.page && <div class="viewer-page-controls">
-          <Choice label="Theme" options={PLATFORM_THEMES.map(item => [item.slug, item.name])} value={pageTheme()?.slug ?? 'report'}
+          <Choice label="Theme" options={[
+            ...PLATFORM_THEMES.map(item => [`platform:${item.slug}`, item.name] as [string, string]),
+            ...(opened()?.page?.theme?.scope === 'project' ? [[`project:${opened()!.page!.theme!.slug}`, `Project · ${opened()!.page!.compiledTheme?.name ?? opened()!.page!.theme!.slug}`] as [string, string]] : []),
+          ]} value={selectedPageTheme()}
             disabled={opened()?.page?.brandLock || busy()} onChange={setStoredPageTheme} />
           <Choice label="Text size" options={ [['s', 'S'], ['m', 'M'], ['l', 'L']] } value={textSize()} onChange={value => { if (value === 's' || value === 'm' || value === 'l') setTextSize(value); }} />
         </div>}

@@ -33,6 +33,7 @@ import { openArtifactRuntime, type ArtifactRuntime } from "./artifact-runtime.js
 import { openRuntimeState, type RuntimeState } from "./runtime-state.js";
 import { openProjectData, type ProjectData } from "./project-data.js";
 import { openProjectFiles, type ProjectFiles } from "./project-files.js";
+import { openProjectThemes, type ProjectThemeModel } from "./themes.js";
 import { openReports, type Reports } from "./reports.js";
 
 export { RateLimit };
@@ -42,7 +43,7 @@ interface CachedRuntime {
   store: Store; auth: Auth; webauthn: WebAuthn; mailer: Mailer; limiter: RateLimiter;
   artifacts: Artifacts; folders: Folders; keys: Keys; access: Access; shares: Shares;
   artifactRuntime: ArtifactRuntime; runtimeState: RuntimeState; reports: Reports; analytics: Analytics;
-  projectData: ProjectData; projectFiles: ProjectFiles;
+  projectData: ProjectData; projectFiles: ProjectFiles; themes: ProjectThemeModel;
   analyticsClient: { ANALYTICS_CLIENT: string; instrumentDocument: typeof instrumentDocument };
   publicOrigin: string; rpName: string; rpId: string; gate: { threshold: number; lockMs: number };
   contract(): Response; neutral(): Response;
@@ -107,8 +108,9 @@ function runtimeFor(env: WorkerEnv, request: Request, cache = true): RuntimeCont
       shares,
       artifactRuntime: openArtifactRuntime({ db: env.DB, masterKeyHex }),
       runtimeState: openRuntimeState({ db: env.DB, masterKeyHex }),
-      projectData: openProjectData({ db: env.DB, masterKeyHex }),
+      themes: openProjectThemes({ db: env.DB, masterKeyHex }),
       projectFiles: openProjectFiles({ db: env.DB, bucket: env.ARTIFACTS, masterKeyHex }),
+      projectData: openProjectData({ db: env.DB, masterKeyHex }),
       reports: openReports({ db: env.DB, masterKeyHex }),
       analytics: openAnalytics({ db: env.DB, shares, access, masterKeyHex, limiter }),
       analyticsClient: { ANALYTICS_CLIENT, instrumentDocument },

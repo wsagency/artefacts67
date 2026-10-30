@@ -151,7 +151,7 @@ function unlocked(request: Request, ctx: ShareViewerContext, { path, token, shar
         cookie: undefined,
         index: yield* Effect.forEach(artefacts, item => Effect.gen(function* () {
           const version = (yield* ctx.artifacts.versions(item.id)).find(current => current.version === item.currentVersion);
-          const page = version?.type === "page" ? yield* ctx.artifactRuntime.presentation(version, item.lang) : null;
+          const page = version?.type === "page" ? yield* ctx.artifactRuntime.presentation(version, item.lang, item.folderId) : null;
           return { title: (yield* ctx.artifacts.title(item)) || item.id, page,
             viewer: viewerView(yield* viewerDescriptor(request, ctx, {
               artifact: item, source: { kind: "share", path, token, artifactId: item.id },
@@ -166,7 +166,7 @@ function unlocked(request: Request, ctx: ShareViewerContext, { path, token, shar
       artifact, share, source: { kind: "share", path, token, artifactId: artifact.id },
     });
     const version = (yield* ctx.artifacts.versions(artifact.id)).find(current => current.version === artifact.currentVersion);
-    const page = version?.type === "page" ? yield* ctx.artifactRuntime.presentation(version, artifact.lang) : null;
+    const page = version?.type === "page" ? yield* ctx.artifactRuntime.presentation(version, artifact.lang, artifact.folderId) : null;
     return { ...payload, ...issued, ...(page ? { page } : {}) };
   });
 }

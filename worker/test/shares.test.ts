@@ -25,6 +25,7 @@ import { openProjectData } from "../src/project-data.js";
 import { openProjectFiles } from "../src/project-files.js";
 import { openRateLimiter, type RateLimiter } from "../src/ratelimit.js";
 import { validatePageFragment } from "../src/page-validation.js";
+import { openProjectThemes } from "../src/themes.js";
 
 const MASTER = "6465762d6d61737465722d6b65792d4e4f542d464f522d70726f642d75736521";
 // The sentinels are what a document says and a gate page never may: asserting on the title
@@ -778,13 +779,16 @@ test("moving a shared folder succeeds when its subtree contains a deleted artefa
   const moved = await Effect.runPromise(env.folders.setParent(folder.id, destination.id));
   assert.equal(moved.parentId, destination.id);
 });
-test("password-protected visitor share unlocks expose checked page presentation for artifacts and folder children", async () => {
+test("password-protected visitor share unlocks retain project presentation for artifacts and folder children", async () => {
   const env = await environment();
+  const themes = openProjectThemes({ db: env.DB, masterKeyHex: MASTER });
   const fragment = "<main><h1>Shared page</h1></main>";
+  const project = await Effect.runPromise(env.folders.create({ ownerId: env.owner.id, name: "Page project", slug: "page-project" }));
+  await Effect.runPromise(themes.setDefault({ folderId: project.id, theme: { scope: "platform", slug: "editorial" }, actorId: env.owner.id }));
+  await Effect.runPromise(themes.setBrandLock({ folderId: project.id, brandLock: true, actorId: env.owner.id }));
   const page = await Effect.runPromise(env.artifacts.create({
-    ownerId: env.owner.id, title: "Shared page", html: fragment, slug: "shared-page", authorId: env.owner.id,
-    type: "page", theme: { scope: "platform", slug: "report" }, themeOverrides: { tokens: { accent: "#8f5e00" } },
-    validatedPage: validatePageFragment(fragment),
+    ownerId: env.owner.id, folderId: project.id, title: "Shared page", html: fragment, slug: "shared-page", authorId: env.owner.id,
+    type: "page", validatedPage: validatePageFragment(fragment),
   }));
   const pageShare = await Effect.runPromise(env.shares.create({
     actorId: env.owner.id, kind: "artifact", targetId: page.id, name: "Page",
@@ -792,15 +796,17 @@ test("password-protected visitor share unlocks expose checked page presentation 
   }));
   const unlockedPage = await env.unlock(urlPath(pageShare.url), "letmein");
   assert.equal(unlockedPage.status, 200);
-  const pagePayload = await unlockedPage.json() as { page?: { type: string; brandLock: boolean; compiledTheme?: { css: string } } };
+  const pagePayload = await unlockedPage.json() as { page?: { type: string; theme?: { slug: string }; brandLock: boolean } };
   assert.equal(pagePayload.page?.type, "page");
+  assert.equal(pagePayload.page?.theme?.slug, "editorial");
   assert.equal(pagePayload.page?.brandLock, true);
-  assert.match(pagePayload.page?.compiledTheme?.css ?? "", /--a67-accent:#8f5e00/);
 
   const folder = await Effect.runPromise(env.folders.create({ ownerId: env.owner.id, name: "Folder", slug: "shared-folder" }));
-  const child = await Effect.runPromise(env.artifacts.create({
+  await Effect.runPromise(themes.setDefault({ folderId: folder.id, theme: { scope: "platform", slug: "launch" }, actorId: env.owner.id }));
+  await Effect.runPromise(themes.setBrandLock({ folderId: folder.id, brandLock: true, actorId: env.owner.id }));
+  await Effect.runPromise(env.artifacts.create({
     ownerId: env.owner.id, folderId: folder.id, title: "Folder page", html: fragment, slug: "folder-page", authorId: env.owner.id,
-    type: "page", theme: { scope: "platform", slug: "launch" }, validatedPage: validatePageFragment(fragment),
+    type: "page", validatedPage: validatePageFragment(fragment),
   }));
   const folderShare = await Effect.runPromise(env.shares.create({
     actorId: env.owner.id, kind: "folder", targetId: folder.id, name: "Folder",
@@ -808,6 +814,7 @@ test("password-protected visitor share unlocks expose checked page presentation 
   }));
   const unlockedFolder = await env.unlock(urlPath(folderShare.url), "folder-password");
   assert.equal(unlockedFolder.status, 200);
-  const folderPayload = await unlockedFolder.json() as { index?: Array<{ page?: { theme?: { slug: string } } }> };
+  const folderPayload = await unlockedFolder.json() as { index?: Array<{ page?: { theme?: { slug: string }; brandLock: boolean } }> };
   assert.equal(folderPayload.index?.find(item => item.page)?.page?.theme?.slug, "launch");
+  assert.equal(folderPayload.index?.find(item => item.page)?.page?.brandLock, true);
 });

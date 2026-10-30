@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { Clock, Duration, Effect, Exit } from "effect";
-import { prepareArtifactHtml, openArtifactService, FONT_LIMITS } from "../src/fonts.js";
+import { prepareArtifactHtml, openArtifactService, captureThemeFonts, FONT_LIMITS } from "../src/fonts.js";
 import type { FontFetcher } from "../src/fonts.js";
 
 const document = (head: string, body = "<p>Offline</p>"): string => `<!doctype html><html><head>${head}</head><body>${body}</body></html>`;
@@ -159,6 +159,58 @@ test("provider stylesheets remain strict about syntax errors", async () => {
   await assert.rejects(Effect.runPromise(prepareArtifactHtml(document(`<link rel="stylesheet" href="${sheet}">`), {
     fetcher: async () => response("a{filter:progid:X.gradient(#fff,#000)}", "text/css"),
   })), { code: "font-css" });
+});
+
+test("project theme capture schedules only selected Latin WOFF2 face assets", async () => {
+  const themeSheet = "https://fonts.googleapis.com/css2?family=Example:wght@400";
+  const selected = "https://fonts.gstatic.com/s/example/v1/selected.woff2";
+  const calls: string[] = [];
+  const irrelevant = Array.from({ length: FONT_LIMITS.fonts + 2 }, (_, index) =>
+    `/* latin */ @font-face{font-family:'Example';font-weight:700;src:url(https://fonts.gstatic.com/s/example/v1/unused-${index}.woff2)}`);
+  const sourceCss = [...irrelevant, `/* latin */ @font-face{font-family:'Example';font-weight:400;src:url('${selected}') format('woff2')}`].join("\n");
+  const fetcher: FontFetcher = async url => {
+    calls.push(url);
+    if (url === themeSheet) return response(sourceCss, "text/css");
+    if (url === selected) return response(bytes, "font/woff2");
+    throw new Error(`Unselected face must not be fetched: ${url}`);
+  };
+  const captured = await Effect.runPromise(captureThemeFonts([themeSheet], { fetcher, families: ["Example"] }));
+  assert.deepEqual(calls, [themeSheet, selected]);
+  assert.equal(new TextDecoder().decode(captured).includes(selected), false);
+  assert.equal(new TextDecoder().decode(captured).includes("data:font/woff2;base64,"), true);
+});
+test("project theme font capture negotiates Latin WOFF2 faces from Google CSS2", async () => {
+  const themeSheet = "https://fonts.googleapis.com/css2?family=Example:wght@400";
+  const themeCss = `/* latin */ @font-face{font-family:'Example';font-weight:400;src:url('${font}') format('woff2')}`;
+  const fetcher: FontFetcher = async (url, init) => {
+    if (url === themeSheet) {
+      const userAgent = new Headers(init.headers).get("user-agent") ?? "";
+      return response(userAgent.includes("AppleWebKit") ? themeCss : themeCss.replace("/* latin */ ", ""), "text/css");
+    }
+    if (url === font) return response(bytes, "font/woff2");
+    throw new Error(`Unexpected resource ${url}`);
+  };
+  const captured = await Effect.runPromise(captureThemeFonts([themeSheet], { fetcher, families: ["Example"] }));
+  assert.equal(new TextDecoder().decode(captured).includes("data:font/woff2;base64,"), true);
+});
+
+test("project theme CSS redirects remain on Google CSS2 while generic artifact CSS remains compatible", async () => {
+  const legacy = "https://fonts.googleapis.com/css?family=Example:wght@400";
+  let calls = 0;
+  await assert.rejects(Effect.runPromise(captureThemeFonts([sheet], {
+    fetcher: async () => {
+      calls++;
+      return new Response(null, { status: 302, headers: { location: legacy } });
+    },
+  })), { code: "font-provider" });
+  assert.equal(calls, 1);
+  const generic = await Effect.runPromise(prepareArtifactHtml(document(`<link rel="stylesheet" href="${sheet}">`), {
+    fetcher: async url => url === sheet
+      ? new Response(null, { status: 302, headers: { location: legacy } })
+      : url === legacy ? response(css, "text/css") : url === font ? response(bytes, "font/woff2")
+        : (() => { throw new Error(`Unexpected URL: ${url}`); })(),
+  }));
+  assert.equal(generic.html.includes("@font-face"), true);
 });
 
 test("prepared capabilities are service-minted, source-bound and fail closed", async () => {
@@ -323,4 +375,43 @@ test("redirect cleanup aborts only its own connection before waiting for cancell
   assert.equal(cancelled, true);
   assert.equal(redirectBody?.locked, false);
   assert.equal(result.html.includes(`data:font/woff2;base64,${Buffer.from(bytes).toString("base64")}`), true);
+});
+test("project theme font capture stores provider-validated fonts at definition time", async () => {
+  const themeCss = css.replace("400 700", "400");
+  const captured = await Effect.runPromise(captureThemeFonts([sheet], { fetcher: async url =>
+    url === sheet ? response(themeCss, "text/css") : url === font ? response(bytes, "font/woff2") : Promise.reject(new Error("unexpected URL")) }));
+  assert.match(new TextDecoder().decode(captured), /data:font\/woff2;base64,/);
+  assert.ok(captured.byteLength > 0);
+});
+test("project theme capture keeps only Latin subsets and URL-declared weights", async () => {
+  const singleWeightSheet = "https://fonts.googleapis.com/css2?family=Example:wght@400&display=swap";
+  const sourceCss = `/* latin */ @font-face { font-family:'Example'; font-weight:400; src:url('${font}') format('woff2'); }` +
+    `/* latin */ @font-face { font-family:'Example'; font-weight:700; src:url('${font}') format('woff2'); }` +
+    `/* cyrillic */ @font-face { font-family:'Example'; font-weight:400; src:url('${font}') format('woff2'); }`;
+  const captured = await Effect.runPromise(captureThemeFonts([singleWeightSheet], { fetcher: async url =>
+    url === singleWeightSheet ? response(sourceCss, "text/css") : url === font ? response(bytes, "font/woff2") : Promise.reject(new Error("unexpected URL")) }));
+  const text = new TextDecoder().decode(captured);
+  assert.equal((text.match(/@font-face/g) ?? []).length, 1);
+  assert.match(text, /\/\* latin \*\//);
+  assert.doesNotMatch(text, /font-weight:700|cyrillic/);
+  assert.ok(captured.byteLength < 150 * 1024);
+});
+
+test("project theme capture hard-rejects more than 256 KiB of selected WOFF2 faces", async () => {
+  const large = new Uint8Array(256 * 1024 + 1);
+  large.set(new TextEncoder().encode("wOF2"));
+  new DataView(large.buffer).setUint32(8, large.byteLength);
+  const sourceCss = `/* latin */ @font-face { font-family:'Example'; font-weight:400; src:url('${font}') format('woff2'); }`;
+  await assert.rejects(Effect.runPromise(captureThemeFonts([sheet], { fetcher: async url =>
+    url === sheet ? response(sourceCss, "text/css") : url === font ? response(large, "font/woff2") : Promise.reject(new Error("unexpected URL")) })),
+  (error: unknown) => typeof error === "object" && error !== null && "code" in error && error.code === "font-limit");
+});
+test("project theme capture accepts the exact 256 KiB WOFF2 ceiling", async () => {
+  const exact = new Uint8Array(256 * 1024);
+  exact.set(new TextEncoder().encode("wOF2"));
+  new DataView(exact.buffer).setUint32(8, exact.byteLength);
+  const sourceCss = `/* latin */ @font-face { font-family:'Example'; font-weight:400; src:url('${font}') format('woff2'); }`;
+  const captured = await Effect.runPromise(captureThemeFonts([sheet], { fetcher: async url =>
+    url === sheet ? response(sourceCss, "text/css") : url === font ? response(exact, "font/woff2") : Promise.reject(new Error("unexpected URL")) }));
+  assert.ok(captured.byteLength > exact.byteLength);
 });
