@@ -15,7 +15,14 @@ All notable changes to this project are documented in this file. The format is b
 - AI instructions include a native-dialog recipe for recording acknowledgement before an in-artefact download.
 - Console sidebar footer can copy the AI instructions to the clipboard.
 
+- Page artefacts use strict fragment validation, registered inline design tokens, local references, and complete supported image signatures while complete-document site output retains its established analytics instrumentation and source bytes. The page viewer uses the trusted inline kit and embedded assets under its restrictive CSP. Registered-theme page downloads are standalone documents with the platform shell, inline kit/runtime, compiled theme and CSP; they exclude the hosted SDK, live persistence and application data.
+- Code-shipped `report`, `editorial`, and `launch` page themes pass a checked contrast/compositing compiler before scoped CSS or a resolved logo token is exposed; `/themes` previews the three themes against one shared sample. The M2 automated accessibility gate exercises shipped page experiences against WCAG 2.2 A/AA rules and reports axe incomplete checks separately, not as a certification of arbitrary authored content.
+- Page publication sizes the exact hosted document including its runtime bridge across platform themes and compiled overrides; standalone composition enforces the same 1,500,000-character cap without the hosted bridge.
+
 ### Fixed
+- Theme compiler rejects malformed font stacks and unsafe or over-512px logos, contains wrapped aurora content on opaque surfaces, preserves inverse-header foreground pairing without overriding nested inverse tones, preserves explicit SVG text `fill`, and targets generated KPI surfaces; page validation rejects unwrapped direct text in aurora hero figures.
+- Inverse tones cannot nest or appear on/inside table and code surfaces; paired opaque-surface colors and inverse-section headings remain contrast-safe.
+- Page sizing uses the effective stored language when an update omits `lang`; hosted preview/download composition uses the canonical deployment origin without changing copied public links.
 - Gated folder shares ignore individually withdrawn artefacts during key synchronization.
 
 ### Changed

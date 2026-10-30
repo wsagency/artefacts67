@@ -19,3 +19,6 @@ frontend/dist/
 
 # Plaintext sources for archived pre-encrypted artefacts must NEVER be committed.
 *.plain.html
+
+# Local agent workflow scratch (SDD ledgers, briefs, reports, review packages) — never repository content.
+/.superpowers/

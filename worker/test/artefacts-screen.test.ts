@@ -96,6 +96,7 @@ function models(base: TestConsoleContext, { empty = false, createError }: ModelO
     versions: () => Effect.succeed([{
       artifactId: "a1", version: 1, size: HTML.length, authorType: "user", authorId: MEMBER.id,
       r2Key: "art/a1/1.enc", sha256: "", note: null, createdAt: "2026-09-10T10:00:00.000Z",
+      type: "site", themeScope: null, themeId: null, themeSlug: null, themeOverridesSealed: null, brandLock: false,
     }]),
     create: args => Effect.gen(function* () {
       calls.artifactsCreate.push(args);

@@ -118,6 +118,7 @@ test("tools/list publishes every tool with an input schema", async () => {
     type: "integer", minimum: 1, description: "Only publish when the current version matches.",
   });
   assert.equal(publish.inputSchema.required?.includes("ifVersion"), false);
+  assert.deepEqual(publish.inputSchema.properties?.type, { type: "string", enum: ["site", "page"] });
 });
 
 test("tools/call uploads a file whose bytes travel over HTTP", async () => {

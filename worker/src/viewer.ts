@@ -24,8 +24,8 @@ export type ViewerContext = DescriptorContext & {
   neutral(): Response;
 };
 export type GateContext = Omit<RuntimeReadContext, "limiter"> & {
-  artifacts: Pick<Artifacts, "byId" | "byPath" | "live" | "gated" | "verifyPassword" | "gatePayload">;
-  artifactRuntime: Pick<ArtifactRuntime, "issue">;
+  artifacts: Pick<Artifacts, "byId" | "byPath" | "live" | "gated" | "verifyPassword" | "gatePayload" | "versions">;
+  artifactRuntime: Pick<ArtifactRuntime, "issue" | "presentation">;
   limiter: RateLimiter;
   gate: { threshold: number; lockMs: number };
   store: { audit: Pick<Audit, "write"> };
@@ -115,7 +115,9 @@ export function handleGate(request: Request, ctx: GateContext, params: RoutePara
         Cause.hasInterrupts(cause) ? Effect.failCause(cause) : Effect.void));
       const payload = yield* ctx.artifacts.gatePayload(artifact);
       const issued = yield* ctx.artifactRuntime.issue(request, ctx, { artifact, source: { kind: "public", path } });
-      return { response: json({ ...payload, runtime: issued.runtime }, 200, issued.cookie ? { "Set-Cookie": issued.cookie } : {}) };
+      const version = (yield* ctx.artifacts.versions(artifact.id)).find(item => item.version === artifact.currentVersion);
+      const page = version?.type === "page" ? yield* ctx.artifactRuntime.presentation(version, artifact.lang) : null;
+      return { response: json({ ...payload, ...(page ? { page } : {}), runtime: issued.runtime }, 200, issued.cookie ? { "Set-Cookie": issued.cookie } : {}) };
     }
     return { state: yield* ctx.limiter.hit(key, { limit: threshold, windowMs: lockMs }) };
   });

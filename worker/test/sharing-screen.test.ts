@@ -183,7 +183,8 @@ function harness({ as = OWNER, role = "owner", shareError, grantError }: Harness
       aliasesFor: () => Effect.succeed([]),
       versions: () => Effect.succeed([{
         artifactId: "a1", version: 2, size: 120, authorType: "user", authorId: OWNER.id, r2Key: "art/a1/2.enc", sha256: "",
-        note: null, createdAt: "2026-09-10T10:00:00.000Z",
+        note: null, createdAt: "2026-09-10T10:00:00.000Z", type: "site", themeScope: null, themeId: null,
+        themeSlug: null, themeOverridesSealed: null, brandLock: false,
       }]),
       document: artifact => Effect.sync(() => { calls.document.push(artifact?.id ?? ""); return HTML; }),
       publish: args => Effect.sync(() => { calls.publish.push(args); return { version: 3, size: 120, createdAt: "", warnings: [] }; }),

@@ -22,7 +22,7 @@ import { asCodeError, type CodeError } from "./types.js";
 
 export type ShareViewerContext = DescriptorContext & Omit<RuntimeReadContext, "limiter"> & {
   shares: Pick<Shares, "resolve" | "contents" | "verifyPassword" | "gatePayload">;
-  artifactRuntime: Pick<ArtifactRuntime, "issue">;
+  artifactRuntime: Pick<ArtifactRuntime, "issue" | "presentation">;
   limiter: RateLimiter;
   gate: { threshold: number; lockMs: number };
   store: { audit: Pick<Audit, "write"> };
@@ -150,8 +150,9 @@ function unlocked(request: Request, ctx: ShareViewerContext, { path, token, shar
       return {
         cookie: undefined,
         index: yield* Effect.forEach(artefacts, item => Effect.gen(function* () {
-          return { title: (yield* ctx.artifacts.title(item)) || item.id,
-            // Same projection as HTML bootstraps: no version storage/author internals.
+          const version = (yield* ctx.artifacts.versions(item.id)).find(current => current.version === item.currentVersion);
+          const page = version?.type === "page" ? yield* ctx.artifactRuntime.presentation(version, item.lang) : null;
+          return { title: (yield* ctx.artifacts.title(item)) || item.id, page,
             viewer: viewerView(yield* viewerDescriptor(request, ctx, {
               artifact: item, source: { kind: "share", path, token, artifactId: item.id },
               publicUrl: childPath(path, token, item.id), gated: true,
@@ -164,6 +165,8 @@ function unlocked(request: Request, ctx: ShareViewerContext, { path, token, shar
     const issued = yield* ctx.artifactRuntime.issue(request, ctx, {
       artifact, share, source: { kind: "share", path, token, artifactId: artifact.id },
     });
-    return { ...payload, ...issued };
+    const version = (yield* ctx.artifacts.versions(artifact.id)).find(current => current.version === artifact.currentVersion);
+    const page = version?.type === "page" ? yield* ctx.artifactRuntime.presentation(version, artifact.lang) : null;
+    return { ...payload, ...issued, ...(page ? { page } : {}) };
   });
 }

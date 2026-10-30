@@ -26,7 +26,7 @@ export interface HtmlValidationOptions { checkReferences?: boolean; maxChars?: n
 export interface BodyValidation { issues: ValidationIssue[] }
 type PublishFields = {
   folder?: unknown; folderName?: unknown; slug?: unknown; title?: unknown; lang?: unknown;
-  html?: unknown; password?: unknown; note?: unknown;
+  html?: unknown; password?: unknown; note?: unknown; type?: unknown; theme?: unknown; themeOverrides?: unknown;
 };
 type RotateFields = { password?: unknown; html?: unknown };
 
@@ -91,6 +91,31 @@ export function validatePublishBody(value: unknown): BodyValidation {
 
   if (typeof body.html !== "string" || body.html.length === 0)
     flag("missing-html", "html must be a non-empty string containing the artefact document", "html");
+  if (body.type != null && body.type !== "site" && body.type !== "page")
+    flag("invalid-type", "type must be site or page", "type");
+
+  if (body.theme != null) {
+    const theme = body.theme;
+    if (typeof theme !== "object" || theme === null || Array.isArray(theme) ||
+        !("scope" in theme) || !("slug" in theme) ||
+        theme.scope !== "platform" ||
+        typeof theme.slug !== "string" || !/^[a-z][a-z0-9-]{0,47}$/.test(theme.slug)) {
+      flag("invalid-theme", "theme must be a {scope, slug} reference", "theme");
+    }
+  }
+
+  if (body.themeOverrides != null) {
+    const overrides = body.themeOverrides;
+    let encoded = "";
+    try { encoded = JSON.stringify(overrides); } catch { /* invalid below */ }
+    if (typeof overrides !== "object" || overrides === null || Array.isArray(overrides) ||
+        Object.keys(overrides).some(key => !["tokens", "recipes"].includes(key)) ||
+        new TextEncoder().encode(encoded).byteLength > 64 * 1024) {
+      flag("invalid-theme-overrides", "themeOverrides must contain only tokens and recipes within 64 KiB", "themeOverrides");
+    }
+  }
+  if ((body.theme != null || body.themeOverrides != null) && body.type !== "page")
+    flag("page-theme-required", "theme references and overrides are available only for page artefacts", "type");
 
   if (body.password != null && (typeof body.password !== "string" || body.password.length < MIN_PASSWORD))
     flag("weak-password", `password must be at least ${MIN_PASSWORD} characters when provided`, "password");

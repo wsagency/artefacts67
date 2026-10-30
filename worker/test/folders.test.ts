@@ -50,6 +50,30 @@ test("a folder answers on its id until it is named, then on its slug", async () 
   assert.equal(renamed.slug, "zs");
 });
 
+test("the reserved themes route rejects folder claims while legacy holders stay id-addressable", async () => {
+  const { db, owner, folders } = await services();
+  const candidate = await Effect.runPromise(folders.create({ ownerId: owner.id, name: "Candidate", slug: "candidate" }));
+  await assert.rejects(
+    () => Effect.runPromise(folders.create({ ownerId: owner.id, name: "Taken", slug: "themes" })),
+    (error: unknown) => asCodeError(error).code === "slug-taken",
+  );
+  await assert.rejects(
+    () => Effect.runPromise(folders.rename(candidate.id, "themes")),
+    (error: unknown) => asCodeError(error).code === "slug-taken",
+  );
+  await assert.rejects(
+    () => Effect.runPromise(folders.alias("themes", candidate.id)),
+    (error: unknown) => asCodeError(error).code === "slug-taken",
+  );
+
+  const legacy = await Effect.runPromise(folders.create({ ownerId: owner.id, name: "Existing holder", slug: "legacy-holder" }));
+  await db.prepare("UPDATE folders SET slug = ? WHERE id = ?").bind("themes", legacy.id).run();
+  assert.equal((await Effect.runPromise(folders.byPath(legacy.id)))?.id, legacy.id);
+  const renamed = await Effect.runPromise(folders.rename(legacy.id, "legacy-themes-holder"));
+  assert.equal(renamed.id, legacy.id);
+  assert.equal((await Effect.runPromise(folders.byPath(legacy.id)))?.id, legacy.id);
+});
+
 test("a 1.x folder index link survives as an alias", async () => {
   const { owner, folders } = await services();
   const folder = await Effect.runPromise(folders.create({ ownerId: owner.id, name: "Stari klijent" }));

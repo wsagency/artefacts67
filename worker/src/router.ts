@@ -58,6 +58,7 @@ export const routes = [
   { method: "POST", pattern: PASSKEY, handler: "auth" },
   { pattern: CONSOLE, handler: "console" },
   { method: "GET", pattern: SHARE, handler: "share" },
+  { method: "GET", pattern: /^\/themes\/?$/, handler: "themes" },
   { pattern: /^\/_mcp\/?$/, handler: "mcp" },
   { pattern: /^\/_api\/(?<rest>.+)$/, handler: "api" },
   { method: "GET", pattern: LEGACY, handler: "viewer" },

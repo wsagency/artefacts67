@@ -1,4 +1,11 @@
-import type { OpenedArtifact, ViewerDescriptor } from './types';
+import type { OpenedArtifact, PagePresentation, ViewerDescriptor } from './types';
+import { PAGE_KIT_CSS, PAGE_KIT_RUNTIME } from './page-kit';
+import { composeHostedPageDocument, composePageDownload } from './page-composition';
+import { PAGE_FRAME_NONCE_BYTES, buildPageFrameBridge } from './page-frame-bridge';
+import { getPlatformTheme } from './platform-themes';
+import { compileTheme, type CompiledTheme, type PlatformThemeDefinition } from './theme-compiler';
+
+export { PAGE_KIT_CSS, PAGE_KIT_RUNTIME };
 
 type RuntimeResponse = Record<string, unknown>;
 type RuntimeErrorCode = string | undefined;
@@ -173,287 +180,90 @@ async function decrypt(payload: EncryptedPayload, password: string): Promise<str
 export async function openArtifact(viewer: ViewerDescriptor, { password, signal }: { password?: string; signal?: AbortSignal } = {}): Promise<RuntimeOpened> {
   if (viewer.gated && typeof password !== 'string') throw new RuntimeError('Enter the password.', 'password-required');
   const payload = viewer.gated ? await post(viewer.gateUrl ?? '', { password }, { signal }) : await post(viewer.loadUrl ?? '', { source: viewer.runtime }, { signal });
-  if (Array.isArray(payload.index)) return { index: payload.index as Array<{ title: string; viewer: ViewerDescriptor }>, html: '', permissions: Object.freeze({ ...viewer.permissions }) };
+  const permissions = Object.freeze({ ...viewer.permissions, ...(viewer.runtime?.kind === 'share' ? { write: false } : {}) });
+  if (Array.isArray(payload.index)) return { index: payload.index as Array<{ title: string; viewer: ViewerDescriptor }>, html: '', permissions };
   const html = viewer.gated ? await decrypt(payload as unknown as EncryptedPayload, password ?? '') : payload.html;
+  if (typeof html !== 'string') throw new Error('The server did not return an authorized artefact.');
   const runtime = payload.runtime;
-  if (typeof html !== 'string' || typeof runtime !== 'object' || runtime === null || typeof (runtime as { grant?: unknown }).grant !== 'string') throw new Error('The server did not return an authorized artefact.');
-  const opened: RuntimeOpened = Object.freeze({ html, permissions: Object.freeze({ ...viewer.permissions }) });
-  openedState.set(opened, Object.freeze({ grant: (runtime as { grant: string }).grant, observation: payload.observation && typeof payload.observation === 'object' ? Object.freeze({ ...(payload.observation as Record<string, unknown>) }) : null }));
+  if (!runtime || typeof runtime !== 'object' || !('grant' in runtime) || typeof runtime.grant !== 'string') throw new Error('The server did not return an authorized artefact.');
+  const pageData = payload.page;
+  let page: PagePresentation | undefined;
+  if (pageData !== undefined) {
+    if (!pageData || typeof pageData !== 'object' || Array.isArray(pageData) || !('type' in pageData) || pageData.type !== 'page' ||
+      !('brandLock' in pageData) || typeof pageData.brandLock !== 'boolean' || !('theme' in pageData)) throw new Error('The server returned invalid page metadata.');
+    const lang = 'lang' in pageData && typeof pageData.lang === 'string' ? pageData.lang : undefined;
+    const selected = pageData.theme;
+    let selectedTheme: PagePresentation['theme'];
+    if (selected === null) selectedTheme = null;
+    else {
+      if (!selected || typeof selected !== 'object' || Array.isArray(selected) || !('scope' in selected) || !('slug' in selected) ||
+        (selected.scope !== 'platform' && selected.scope !== 'project') || typeof selected.slug !== 'string' || !/^[a-z][a-z0-9-]{0,47}$/.test(selected.slug)) {
+        throw new Error('The server returned invalid page metadata.');
+      }
+      selectedTheme = { scope: selected.scope, slug: selected.slug };
+    }
+    let compiledTheme: CompiledTheme | undefined;
+    if ('compiledTheme' in pageData && pageData.compiledTheme !== undefined) {
+      const candidate = pageData.compiledTheme as Record<string, unknown>;
+      if (!candidate || typeof candidate !== 'object' || Array.isArray(candidate)) throw new Error('The server returned invalid page theme metadata.');
+      try {
+        compiledTheme = compileTheme({
+          slug: candidate.slug as string,
+          name: candidate.name as string,
+          description: candidate.description as string,
+          tokens: candidate.tokens as PlatformThemeDefinition['tokens'],
+          recipes: candidate.recipes as PlatformThemeDefinition['recipes'],
+          logo: candidate.logo as string | null,
+        });
+      } catch {
+        throw new Error('The server returned invalid page theme metadata.');
+      }
+      if (selectedTheme && (selectedTheme.scope !== 'platform' || (getPlatformTheme(selectedTheme.slug) && compiledTheme.slug !== selectedTheme.slug))) throw new Error('The server returned mismatched page theme metadata.');
+    }
+    page = { type: 'page', theme: selectedTheme, brandLock: pageData.brandLock, ...(lang === undefined ? {} : { lang }), ...(compiledTheme ? { compiledTheme } : {}) };
+  }
+  const opened: RuntimeOpened = Object.freeze({ html, permissions, ...(page ? { page } : {}) });
+  openedState.set(opened, Object.freeze({ grant: runtime.grant, observation: payload.observation && typeof payload.observation === 'object' ? Object.freeze({ ...(payload.observation as Record<string, unknown>) }) : null }));
   return opened;
 }
 
 // Standalone source text, not Function.toString(): bundler helpers must never enter srcdoc.
-const CHILD = String.raw`(() => {
-  const script = document.currentScript, nonce = script.dataset.nonce;
-  const pending = new Map();
-  let sequence = 0, port;
-  let resolveReady;
-  const ready = new Promise(resolve => { resolveReady = resolve; });
-  const invalidJson = () => { throw Object.assign(new TypeError('Artefact data accepts JSON values only.'), { code: 'invalid-value' }); };
-  const validateJson = (value, ancestors = new Set()) => {
-    if (value === null || typeof value === 'string' || typeof value === 'boolean') return;
-    if (typeof value === 'number') { if (!Number.isFinite(value)) invalidJson(); return; }
-    if (typeof value !== 'object' || ancestors.has(value)) invalidJson();
-    const array = Array.isArray(value), prototype = Object.getPrototypeOf(value);
-    if (!array && prototype !== Object.prototype && prototype !== null) invalidJson();
-    if (Object.getOwnPropertySymbols(value).length) invalidJson();
-    const keys = Object.keys(value);
-    if (array && keys.length !== value.length) invalidJson();
-    ancestors.add(value);
-    for (let i = 0; i < keys.length; i++) {
-      const key = array ? String(i) : keys[i];
-      const descriptor = Object.getOwnPropertyDescriptor(value, key);
-      if (!descriptor || !Object.hasOwn(descriptor, 'value')) invalidJson();
-      validateJson(descriptor.value, ancestors);
-    }
-    ancestors.delete(value);
-  };
-  const send = async (message, { onProgress, signal } = {}) => {
-    if (pending.size >= 32) throw new Error('Too many pending artefact requests.');
-    if (!port) await new Promise((resolve, reject) => {
-      const timer = setTimeout(() => reject(new Error('Artefact connection unavailable.')), 10000);
-      ready.then(() => { clearTimeout(timer); resolve(); });
-    });
-    if (pending.size >= 32) throw new Error('Too many pending artefact requests.');
-    if (signal?.aborted) throw new DOMException('The upload was aborted.', 'AbortError');
-    const id = ++sequence;
-    return new Promise((resolve, reject) => {
-      // Transfers take as long as they take; every other request keeps the 30 s limit.
-      const untimed = message.type === 'upload' || message.type === 'file' || message.type === 'download';
-      const timer = untimed ? null : setTimeout(() => { pending.delete(id); reject(new Error('Artefact request timed out.')); }, 30000);
-      const onAbort = () => {
-        if (!pending.delete(id)) return;
-        try { port.postMessage({ type: 'cancel', id: ++sequence, upload: id }); } catch { /* port closed: the parent already tore the upload down */ }
-        reject(new DOMException('The upload was aborted.', 'AbortError'));
-      };
-      const done = () => signal?.removeEventListener('abort', onAbort);
-      pending.set(id, { resolve, reject, timer, onProgress, done });
-      signal?.addEventListener('abort', onAbort, { once: true });
-      try { port.postMessage({ ...message, id }); }
-      catch (error) { clearTimeout(timer); done(); pending.delete(id); reject(error); }
-    });
-  };
-  const call = (op, key, value, options = {}) => send({ type: 'storage', op, key, value, scope: options.scope ?? 'personal', prefix: options.prefix ?? '' });
-  const storage = Object.freeze({
-    get: (key, options) => call('get', key, undefined, options),
-    set: async (key, value, options) => { validateJson(value); await call('set', key, value, options); },
-    delete: async (key, options) => { await call('delete', key, undefined, options); },
-    list: (options) => call('list', undefined, undefined, options),
-  });
-  const dataCall = (op, collection, { recordId, data, ifVersion, limit, cursor } = {}) =>
-    send({ type: 'data', op, collection, recordId, data, ifVersion, limit, cursor });
-  const formValue = (form, submitter = null) => {
-    const value = Object.create(null);
-    for (const [name, entry] of new FormData(form, submitter)) {
-      // An unselected <input type="file"> contributes a nameless 0-byte File: absent.
-      if (typeof entry !== 'string' && entry.name === '' && entry.size === 0) continue;
-      const input = form.elements.namedItem(name);
-      if (input instanceof HTMLInputElement && input.type === 'file' && input.multiple) (value[name] ??= []).push(entry);
-      else if (!Object.hasOwn(value, name)) value[name] = entry;
-      else if (Array.isArray(value[name])) value[name].push(entry);
-      else value[name] = [value[name], entry];
-    }
-    return value;
-  };
-  // Uploads top-level File values (or Files in top-level arrays) one by one, then returns the
-  // value with their ids. validateJson sees placeholders first, so bad JSON never costs an upload.
-  const uploadFiles = async (collection, value, onProgress) => {
-    const proto = value !== null && typeof value === 'object' && !Array.isArray(value) ? Object.getPrototypeOf(value) : undefined;
-    if (proto !== Object.prototype && proto !== null) { validateJson(value); return value; }
-    const copy = Object.assign(Object.create(null), value), jobs = [];
-    for (const [field, item] of Object.entries(copy)) {
-      if (item instanceof File) { jobs.push({ field, file: item, put: id => { copy[field] = id; } }); copy[field] = ''; }
-      else if (Array.isArray(item) && item.some(entry => entry instanceof File)) {
-        const list = copy[field] = [...item];
-        list.forEach((entry, index) => { if (entry instanceof File) { jobs.push({ field, file: entry, put: id => { list[index] = id; } }); list[index] = ''; } });
-      }
-    }
-    validateJson(copy);
-    const total = jobs.reduce((sum, job) => sum + job.file.size, 0);
-    let done = 0;
-    for (const job of jobs) {   // sequential, in field order (object insertion / form document order)
-      const ref = await data.upload(collection, job.field, job.file, { onProgress: p => onProgress?.({ field: job.field, loaded: done + p.loaded, total }) });
-      job.put(ref.id); done += job.file.size;
-    }
-    return copy;
-  };
-  const data = Object.freeze({
-    list: (collection, options = {}) => dataCall('list', collection, { limit: options.limit, cursor: options.cursor }),
-    get: (collection, id) => dataCall('get', collection, { recordId: id }),
-    create: async (collection, value, options = {}) => dataCall('create', collection, { data: await uploadFiles(collection, value, options.onProgress) }),
-    update: async (collection, id, value, options = {}) => dataCall('update', collection, { recordId: id, data: await uploadFiles(collection, value, options.onProgress), ifVersion: options.ifVersion }),
-    delete: async (collection, id, options = {}) => { await dataCall('delete', collection, { recordId: id, ifVersion: options.ifVersion }); },
-    submit: async (collection, value, options = {}) => {
-      // A SubmitEvent carries the clicked button, whose name/value FormData then includes.
-      const payload = value instanceof SubmitEvent && value.target instanceof HTMLFormElement ? formValue(value.target, value.submitter)
-        : value instanceof HTMLFormElement ? formValue(value) : value;
-      return dataCall('submit', collection, { data: await uploadFiles(collection, payload, options.onProgress) });
-    },
-    mine: (collection, options = {}) => dataCall('mine', collection, { limit: options.limit, cursor: options.cursor }),
-    upload: async (collection, field, file, options = {}) => {
-      if (!(file instanceof File)) throw Object.assign(new TypeError('upload needs a File.'), { code: 'invalid-value' });
-      return send({ type: 'upload', collection, field, file }, { onProgress: options.onProgress, signal: options.signal });
-    },
-    file: (collection, recordId, fileId) => send({ type: 'file', collection, recordId, fileId }),
-    download: async (collection, recordId, fileId) => { await send({ type: 'download', collection, recordId, fileId }); },
-  });
-  // Opt-in by standard declaration: <meta name="color-scheme" content="light dark">. Parser
-  // mutations are delivered as microtasks, so the scheme lands before the first paint.
-  let theme = script.dataset.initialTheme === 'dark' ? 'dark' : 'light', themed = false;
-  const applyTheme = () => { document.documentElement.dataset.theme = theme; document.documentElement.style.colorScheme = theme; };
-  const setTheme = (next) => {
-    if ((next !== 'light' && next !== 'dark') || next === theme) return;
-    theme = next;
-    if (!themed) return;
-    applyTheme();
-    dispatchEvent(new CustomEvent('artefacts:theme', { detail: { theme } }));
-  };
-  const detectTheme = (meta) => {
-    const words = meta.content.toLowerCase().split(/\s+/);
-    if (themed || meta.name.toLowerCase() !== 'color-scheme' || !words.includes('light') || !words.includes('dark')) return;
-    themed = true;
-    applyTheme();
-    ready.then(() => port.postMessage({ type: 'theme-support' }));
-  };
-  // Only parser-added META nodes are inspected, and only until <body> starts: the declaration belongs in <head>.
-  const themeWatch = new MutationObserver(records => {
-    for (const record of records) for (const node of record.addedNodes) if (node.nodeName === 'META') detectTheme(node);
-    if (themed || document.body) themeWatch.disconnect();
-  });
-  themeWatch.observe(document, { childList: true, subtree: true });
-  Object.defineProperty(window, 'artefacts', { value: Object.freeze({ storage, data, get theme() { return themed ? theme : null; } }), writable: false, configurable: false });
-  // The sandbox (no allow-forms) blocks every native submission before validation and the submit
-  // event, so these hooks restore both without ever navigating; form.submit() stays a no-op.
-  // Submission runs after authored click handlers, as native activation behaviour does, so an
-  // authored preventDefault() on the click cancels it.
-  // ponytail: no formaction/formmethod/formtarget emulation because nothing navigates (so a
-  // submitter's formmethod="dialog" is not honoured); a click whose propagation authored code
-  // stopped submits on the next task instead of synchronously; an authored window-level bubble
-  // click listener runs after the decision, so it cannot cancel, and sees defaultPrevented === true
-  // on submit-button clicks because the shim cancels the blocked native attempt.
-  const isSubmitter = (element) => element instanceof HTMLButtonElement ? element.type === 'submit'
-    : element instanceof HTMLInputElement && (element.type === 'submit' || element.type === 'image');
-  const firing = new WeakSet();
-  const submitForm = (form, submitter) => {
-    // Native "firing submission events": a nested requestSubmit during validation or dispatch is a no-op.
-    if (firing.has(form)) return;
-    firing.add(form);
-    let proceed = false;
-    try {
-      if (!form.noValidate && !submitter?.formNoValidate && !form.reportValidity()) return;
-      proceed = form.dispatchEvent(new SubmitEvent('submit', { bubbles: true, cancelable: true, submitter }));
-    } finally { firing.delete(form); }
-    const dialog = proceed && form.method === 'dialog' ? form.closest('dialog') : null;
-    if (dialog) { if (submitter) dialog.close(submitter.value); else dialog.close(); }
-  };
-  const armedClicks = new WeakMap();
-  const finishClick = (state) => {
-    if (state.done) return;
-    state.done = true;
-    const cancelled = state.event.defaultPrevented;
-    state.event.preventDefault();   // suppresses the sandbox's blocked native attempt
-    if (!cancelled && state.submitter.form) submitForm(state.submitter.form, state.submitter);
-  };
-  addEventListener('click', (event) => {
-    const submitter = event.target instanceof Element ? event.target.closest('button, input[type=submit], input[type=image]') : null;
-    if (!submitter || !isSubmitter(submitter) || submitter.matches(':disabled') || !submitter.form) return;
-    const state = { event, submitter, done: false };
-    armedClicks.set(event, state);
-    setTimeout(() => finishClick(state), 0);
-  }, true);
-  addEventListener('click', (event) => {
-    const state = armedClicks.get(event);
-    if (state) finishClick(state);
-  });
-  const blocksImplicit = (element) => element instanceof HTMLInputElement &&
-    ['text', 'search', 'url', 'tel', 'email', 'password', 'date', 'month', 'week', 'time', 'datetime-local', 'number'].includes(element.type);
-  addEventListener('keydown', (event) => {
-    if (event.key !== 'Enter' || event.isComposing || event.defaultPrevented || !blocksImplicit(event.target)) return;
-    const form = event.target.form;
-    if (!form || Array.from(form.elements).some(isSubmitter) || Array.from(form.elements).filter(blocksImplicit).length !== 1) return;
-    event.preventDefault();
-    submitForm(form, null);
-  });
-  HTMLFormElement.prototype.requestSubmit = function requestSubmit(submitter) {
-    if (submitter != null) {
-      if (!isSubmitter(submitter)) throw new TypeError('The specified element is not a submit button.');
-      if (submitter.form !== this) throw new DOMException('The specified element is not owned by this form element.', 'NotFoundError');
-    }
-    submitForm(this, submitter ?? null);
-  };
-  const connect = (event) => {
-    if (event.source !== parent || event.data?.type !== 'artefacts:connect' || event.data.nonce !== nonce || !event.ports[0]) return;
-    removeEventListener('message', connect);
-    port = event.ports[0];
-    port.onmessage = ({ data }) => {
-      if (data?.type === 'theme') { setTheme(data.theme); return; }
-      const request = pending.get(data?.id);
-      if (!request) return;
-      if (data.progress) { request.onProgress?.(data.progress); return; }
-      pending.delete(data.id); clearTimeout(request.timer); request.done();
-      if (data.error) request.reject(Object.assign(new Error(data.error.message), { code: data.error.code }, Array.isArray(data.error.issues) ? { issues: data.error.issues } : {}));
-      else request.resolve(data.value);
-    };
-    port.start(); resolveReady();
-    setTheme(event.data.theme);
-    if (event.data.observe) observe();
-    if (event.data.commandPalette) addEventListener('keydown', event => {
-      if (!event.isTrusted || !(event.ctrlKey || event.metaKey) || event.altKey || event.shiftKey || event.key.toLowerCase() !== 'k') return;
-      event.preventDefault();
-      if (!event.repeat) port.postMessage({ type: 'command-palette' });
-    }, true);
-  };
-  addEventListener('message', connect);
-  parent.postMessage({ type: 'artefacts:ready', nonce }, '*');
-  // srcdoc inherits the parent URL as its base; resolve fragment links against this document instead.
-  addEventListener('click', (event) => {
-    if (event.defaultPrevented || event.button > 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
-    const link = event.target?.closest?.('a[href]');
-    const href = link?.getAttribute('href').trim();
-    if (!href?.startsWith('#')) return;
-    event.preventDefault();
-    location.hash = href;
-  });
-  function observe() {
-    let activeMs = 0, lastTick = performance.now(), lastActivity = lastTick, scroll = 0;
-    const tick = () => {
-      const now = performance.now();
-      if (document.visibilityState === 'visible' && document.hasFocus() && lastTick - lastActivity < 60000) activeMs += Math.min(now - lastTick, 15000);
-      lastTick = now;
-    };
-    const send = () => {
-      tick();
-      const root = document.scrollingElement || document.documentElement;
-      scroll = Math.max(scroll, Math.floor(Math.min(100, (root.scrollTop + innerHeight) / Math.max(1, root.scrollHeight) * 100) / 25) * 25);
-      port.postMessage({ type: 'observation', activeSeconds: Math.min(14400, Math.floor(activeMs / 1000)), scroll });
-    };
-    const activity = () => { tick(); lastActivity = performance.now(); };
-    for (const type of ['pointerdown', 'pointermove', 'keydown', 'scroll', 'touchstart', 'focus']) addEventListener(type, activity, { passive: true });
-    addEventListener('blur', send); addEventListener('pagehide', send);
-    document.addEventListener('visibilitychange', send);
-    const timer = setInterval(send, 15000);
-    setTimeout(() => clearInterval(timer), 4 * 60 * 60 * 1000);
-    if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', send, { once: true }); else send();
-  }
-})();`;
 
 export type ArtifactTheme = 'light' | 'dark';
 const frameThemes = new WeakMap<HTMLIFrameElement, (theme: ArtifactTheme) => void>();
+const framePageThemes = new WeakMap<HTMLIFrameElement, (theme: CompiledTheme) => void>();
+const frameTextSizes = new WeakMap<HTMLIFrameElement, (size: 's' | 'm' | 'l') => void>();
+
+/** Replace a compiled theme through the authenticated, versioned frame channel. */
+export function setArtifactFramePageTheme(iframe: HTMLIFrameElement, theme: CompiledTheme): void {
+  framePageThemes.get(iframe)?.(theme);
+}
+
+/** Adjust page root type without replacing its document or kit runtime. */
+export function setArtifactFrameTextSize(iframe: HTMLIFrameElement, size: 's' | 'm' | 'l'): void {
+  frameTextSizes.get(iframe)?.(size);
+}
 
 /** Live scheme switch; only a document that opted in (onThemeSupport) applies it. */
 export function setArtifactFrameTheme(iframe: HTMLIFrameElement, theme: ArtifactTheme): void {
   frameThemes.get(iframe)?.(theme);
 }
 
-export function mountArtifactFrame(iframe: HTMLIFrameElement, opened: OpenedArtifact, { onError, theme: initialTheme = 'light', onThemeSupport }: { onError?: (error: Error) => void; theme?: ArtifactTheme; onThemeSupport?: () => void } = {}): () => void {
+export function mountArtifactFrame(iframe: HTMLIFrameElement, opened: OpenedArtifact, { onError, theme: initialTheme = 'light', onThemeSupport, pageTheme, textSize = 'm', origin = location.origin }: { onError?: (error: Error) => void; theme?: ArtifactTheme; onThemeSupport?: () => void; pageTheme?: CompiledTheme; textSize?: 's' | 'm' | 'l'; origin?: string } = {}): () => void {
   const state = openedState.get(opened);
   if (!state || !iframe || iframe.tagName !== 'IFRAME') throw new Error('An authorized artefact and an iframe are required.');
   frameCleanups.get(iframe)?.();
+  const nonce = Array.from(crypto.getRandomValues(new Uint8Array(PAGE_FRAME_NONCE_BYTES)), byte => byte.toString(16).padStart(2, '0')).join('');
+  const effectivePageTheme = opened.page ? pageTheme ?? opened.page.compiledTheme
+    ?? (opened.page.theme?.scope === 'platform' ? getPlatformTheme(opened.page.theme.slug) : null)
+    ?? getPlatformTheme('report')! : undefined;
+  const hostedPage = effectivePageTheme
+    ? composeHostedPageDocument(opened.html, effectivePageTheme, initialTheme, origin, textSize, opened.page?.lang ?? "en", nonce, opened.permissions.write === true)
+    : undefined;
   iframe.setAttribute('sandbox', 'allow-scripts');
   iframe.setAttribute('referrerpolicy', 'no-referrer');
   iframe.removeAttribute('allow');
   iframe.removeAttribute('src');
-  const nonce = Array.from(crypto.getRandomValues(new Uint8Array(24)), byte => byte.toString(16).padStart(2, '0')).join('');
   let closed = false;
   let disconnect: (() => void) | undefined;
   let lastObservation = 0;
@@ -461,13 +271,26 @@ export function mountArtifactFrame(iframe: HTMLIFrameElement, opened: OpenedArti
   let theme = initialTheme;
   let themed = false;
   let themePort: MessagePort | undefined;
-  // The frame element's color-scheme also drives prefers-color-scheme inside the frame (CSS Color
-  // Adjust); it is set only once the document opted in, so light-only artefacts stay untouched.
+  let pageThemeVersion = 0;
+  let pendingPageTheme: CompiledTheme | undefined;
+  let pendingTextSize = textSize;
   frameThemes.set(iframe, next => {
     theme = next;
     if (themed) iframe.style.colorScheme = next;
     themePort?.postMessage({ type: 'theme', theme: next });
   });
+  if (effectivePageTheme) {
+    framePageThemes.set(iframe, next => {
+      pendingPageTheme = next;
+      pageThemeVersion++;
+      themePort?.postMessage({ type: 'page-theme', source: 'parent', nonce, version: pageThemeVersion,
+        theme: { scope: 'platform', slug: next.slug }, css: next.css });
+    });
+    frameTextSizes.set(iframe, size => {
+      pendingTextSize = size;
+      themePort?.postMessage({ type: 'text-size', source: 'parent', nonce, size });
+    });
+  }
   const connectionTimer = setTimeout(() => { if (!closed) onError?.(new Error('The isolated artefact could not connect. Reload it to try again.')); }, 10000);
   const connect = (event: MessageEvent): void => {
     if (closed || event.source !== iframe.contentWindow || event.origin !== 'null' || event.data?.type !== 'artefacts:ready' || event.data.nonce !== nonce) return;
@@ -551,6 +374,12 @@ export function mountArtifactFrame(iframe: HTMLIFrameElement, opened: OpenedArti
     };
     channel.port1.start();
     themePort = channel.port1;
+    if (effectivePageTheme) {
+      const selected = pendingPageTheme ?? effectivePageTheme;
+      themePort.postMessage({ type: 'page-theme', source: 'parent', nonce, version: ++pageThemeVersion,
+        theme: { scope: 'platform', slug: selected.slug }, css: selected.css });
+      themePort.postMessage({ type: 'text-size', source: 'parent', nonce, size: pendingTextSize });
+    }
     clearTimeout(connectionTimer);
     const targetWindow = iframe.contentWindow;
     if (targetWindow) targetWindow.postMessage({ type: 'artefacts:connect', nonce, theme, observe: Boolean(state.observation), commandPalette: Boolean(iframe.closest('.console')) }, '*', [channel.port2]);
@@ -563,16 +392,21 @@ export function mountArtifactFrame(iframe: HTMLIFrameElement, opened: OpenedArti
     disconnect?.();
     window.removeEventListener('message', connect);
     frameCleanups.delete(iframe);
-    frameThemes.delete(iframe);
+    framePageThemes.delete(iframe);
+    frameTextSizes.delete(iframe);
     iframe.style.removeProperty('color-scheme');
     iframe.removeAttribute('srcdoc');
     iframe.removeAttribute('src');
   };
   frameCleanups.set(iframe, cleanup);
-  const images = ['/assets/favicon.ico', '/assets/ws-logo.svg'].map(path => new URL(path, location.origin).href).join(' ');
-  const csp = `default-src 'none'; script-src 'unsafe-inline' 'unsafe-eval' data: blob:; style-src 'unsafe-inline'; img-src data: blob: ${images}; font-src data: blob:; media-src data: blob:; connect-src 'none'; form-action 'none'; base-uri 'none'; object-src 'none'; frame-src 'none'; worker-src 'none'`;
-  const document = opened.html.replace(/^\s*<!doctype[^>]*>/i, '');
-  iframe.srcdoc = `<!doctype html><meta http-equiv="Content-Security-Policy" content="${csp}"><script data-nonce="${nonce}" data-initial-theme="${theme === 'dark' ? 'dark' : 'light'}">${CHILD}</script>${document}`;
+  if (effectivePageTheme) {
+    iframe.srcdoc = hostedPage!;
+  } else {
+    const images = ['/assets/favicon.ico', '/assets/ws-logo.svg'].map(path => new URL(path, location.origin).href).join(' ');
+    const csp = `default-src 'none'; script-src 'unsafe-inline' 'unsafe-eval' data: blob:; style-src 'unsafe-inline'; img-src data: blob: ${images}; font-src data: blob:; media-src data: blob:; connect-src 'none'; form-action 'none'; base-uri 'none'; object-src 'none'; frame-src 'none'; worker-src 'none'`;
+    const document = opened.html.replace(/^\s*<!doctype[^>]*>/i, '');
+    iframe.srcdoc = `<!doctype html><meta http-equiv="Content-Security-Policy" content="${csp}">${buildPageFrameBridge(nonce, theme, opened.permissions.write === true)}${document}`;
+  }
   return cleanup;
 }
 
@@ -588,9 +422,13 @@ export async function readArtifactSource(opened: OpenedArtifact): Promise<string
   return opened.html;
 }
 
-export async function downloadArtifact(viewer: Pick<ViewerDescriptor, 'title'>, opened: OpenedArtifact, { filename }: { filename?: string } = {}): Promise<void> {
+export async function downloadArtifact(viewer: Pick<ViewerDescriptor, 'title' | 'documentOrigin'>, opened: OpenedArtifact, { filename, pageTheme, mode = 'light', textSize = 'm' }: { filename?: string; pageTheme?: CompiledTheme; mode?: 'light' | 'dark'; textSize?: 's' | 'm' | 'l' } = {}): Promise<void> {
   const source = await readArtifactSource(opened);
-  saveBlob(new Blob([source], { type: 'text/html;charset=utf-8' }), filename || `${viewer.title || 'artefact'}.html`);
+  const compiledTheme = opened.page ? pageTheme ?? opened.page.compiledTheme ?? getPlatformTheme(opened.page.theme?.slug ?? 'report') : null;
+  const document = compiledTheme
+    ? composePageDownload(source, compiledTheme, mode, viewer.documentOrigin ?? location.origin, textSize, opened.page?.lang)
+    : source;
+  saveBlob(new Blob([document], { type: 'text/html;charset=utf-8' }), filename || `${viewer.title || 'artefact'}.html`);
 }
 
 export async function reportArtifact(_viewer: ViewerDescriptor, opened: OpenedArtifact, { reason, csrf }: { reason?: FormDataEntryValue | null; csrf?: string } = {}): Promise<void> {

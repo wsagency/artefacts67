@@ -136,6 +136,35 @@ test("renaming keeps every link that was already handed out", async () => {
   assert.equal((await Effect.runPromise(artifacts.byPath("godisnje-izvjesce")))?.id, created.id);
 });
 
+test("the reserved themes route rejects artifact claims while legacy holders stay id-addressable", async () => {
+  const { db, owner, artifacts } = await services();
+  const candidate = await Effect.runPromise(artifacts.create({
+    ownerId: owner.id, title: "Candidate", html: HTML, slug: "candidate", authorId: owner.id,
+  }));
+  await assert.rejects(
+    () => Effect.runPromise(artifacts.create({ ownerId: owner.id, title: "Taken", html: HTML, slug: "themes", authorId: owner.id })),
+    (error: unknown) => asCodeError(error).code === "slug-taken",
+  );
+  await assert.rejects(
+    () => Effect.runPromise(artifacts.rename(candidate.id, "themes")),
+    (error: unknown) => asCodeError(error).code === "slug-taken",
+  );
+  await assert.rejects(
+    () => Effect.runPromise(artifacts.alias("themes", candidate.id)),
+    (error: unknown) => asCodeError(error).code === "slug-taken",
+  );
+
+  const legacy = await Effect.runPromise(artifacts.create({
+    ownerId: owner.id, title: "Existing holder", html: HTML, slug: "legacy-holder", authorId: owner.id,
+  }));
+  await db.prepare("UPDATE artifacts SET slug = ? WHERE id = ?").bind("themes", legacy.id).run();
+  assert.equal((await Effect.runPromise(artifacts.byPath(legacy.id)))?.id, legacy.id);
+  const renamed = await Effect.runPromise(artifacts.rename(legacy.id, "legacy-themes-holder"));
+  assert.equal(renamed.id, legacy.id);
+  assert.equal((await Effect.runPromise(artifacts.byPath(legacy.id)))?.id, legacy.id);
+  assert.equal(await Effect.runPromise(artifacts.document(renamed)), HTML);
+});
+
 test("a legacy two-segment link resolves through an alias", async () => {
   const { owner, artifacts } = await services();
   const created = await Effect.runPromise(artifacts.create({ ownerId: owner.id, title: "Probni", html: HTML, authorId: owner.id }));

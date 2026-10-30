@@ -1,6 +1,7 @@
 import * as Effect from "effect/Effect";
 import test from "node:test";
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 
 import worker from "../src/index.js";
 import { openD1Shim } from "./db.js";
@@ -11,6 +12,12 @@ import { openAccess } from "../src/access.js";
 import { API_BODY_LIMIT } from "../src/api.js";
 import type { GatePayload } from "../src/artifacts.js";
 import type { ValidationIssue } from "../src/validate.js";
+import { PLATFORM_THEMES } from "../../frontend/src/platform-themes.js";
+import { composePageDocument } from "../../frontend/src/page-composition.js";
+import { worstPageDocumentLength } from "../src/page-size.js";
+
+const PAGE_PNG = Buffer.from(readFileSync(new URL("./fixtures/page-image.png", import.meta.url))).toString("base64");
+const PAGE_JPEG = Buffer.from(readFileSync(new URL("./fixtures/page-photo.jpg", import.meta.url))).toString("base64");
 
 interface ApiOptions { key?: string; method?: string; body?: unknown; headers?: Record<string, string> }
 interface ArtifactDto {
@@ -161,6 +168,51 @@ test("the validator rejects what the platform cannot serve", async () => {
   const notJson = await env.api("/_api/artifacts", { method: "POST", body: HTML });
   assert.equal(notJson.status, 422);                       // a bare string is not a JSON object
 });
+test("page publication rejects invalid inline images and accepts signature-matched fixtures", async () => {
+  const env = await environment();
+  const invalid = await env.publish({
+    folder: "acme", slug: "invalid-page-image", title: "Invalid page", type: "page",
+    html: `<main><h1>Report</h1><img src="data:image/png;base64,${PAGE_JPEG}" alt="Photo" width="96" height="72"></main>`,
+  });
+  assert.equal(invalid.status, 422);
+  assert.equal((await invalid.json<ErrorResponse>()).error.code, "validation");
+  assert.equal((await env.DB.prepare("SELECT COUNT(*) AS count FROM artifacts").first<{ count: number }>())?.count, 0);
+
+  const html = `<main><h1>Report</h1><img src="data:image/jpeg;base64,${PAGE_JPEG}" alt="A mountain lake" width="96" height="72"><img src="data:image/png;base64,${PAGE_PNG}" alt="" width="8" height="8"></main>`;
+  const accepted = await env.publish({
+    folder: "acme", slug: "valid-page", title: "Valid page", type: "page", html,
+    theme: { scope: "platform", slug: "report" }, themeOverrides: { tokens: {} },
+  });
+  assert.equal(accepted.status, 201);
+  const artifact = (await accepted.json<PublishedResponse>()).artifact;
+  const row = await env.DB.prepare(
+    "SELECT type, theme_scope, theme_slug, theme_overrides_sealed FROM artifact_versions WHERE artifact_id = ? AND version = 1",
+  ).bind(artifact.id).first<{ type: string; theme_scope: string | null; theme_slug: string | null; theme_overrides_sealed: string | null }>();
+  assert.equal(row?.type, "page");
+  assert.equal(row?.theme_scope, "platform");
+  assert.equal(row?.theme_slug, "report");
+  assert.ok(row?.theme_overrides_sealed);
+  assert.equal(await env.load("valid-page"), html);
+});
+
+test("page publication accepts a removed platform slug with sealed overrides resolved on Report", async () => {
+  const env = await environment();
+  const html = "<main><h1>Fallback publication</h1></main>";
+  const accepted = await env.publish({
+    folder: "acme", slug: "removed-platform-theme", title: "Fallback page", type: "page", html,
+    theme: { scope: "platform", slug: "removed-platform-theme" },
+    themeOverrides: { tokens: { "--a67-accent": "#8f5e00" } },
+  });
+  assert.equal(accepted.status, 201);
+  const artifact = (await accepted.json<PublishedResponse>()).artifact;
+  const row = await env.DB.prepare(
+    "SELECT theme_scope, theme_slug, theme_overrides_sealed FROM artifact_versions WHERE artifact_id = ? AND version = 1",
+  ).bind(artifact.id).first<{ theme_scope: string | null; theme_slug: string | null; theme_overrides_sealed: string | null }>();
+  assert.equal(row?.theme_scope, "platform");
+  assert.equal(row?.theme_slug, "removed-platform-theme");
+  assert.ok(row?.theme_overrides_sealed);
+  assert.equal(await env.load("removed-platform-theme"), html);
+});
 
 test("an artifact key reaches its one artefact and nothing else", async () => {
   const env = await environment();
@@ -193,6 +245,32 @@ test("an artifact key reaches its one artefact and nothing else", async () => {
   // A write-scoped artifact key still cannot touch the sibling artefact.
   const writer = await (await env.api("/_api/keys", { method: "POST", body: { artifact: "upute", scopes: "read_write" } })).json<KeyResponse>();
   assert.equal((await env.api("/_api/artifacts/rotate", { key: writer.token, method: "POST", body: { artifact: "drugo", password: null } })).status, 403);
+});
+
+test("invalid page theme overrides reject without replacing the readable current version", async () => {
+  const env = await environment();
+  const html = "<main><h1>Readable version</h1></main>";
+  const created = await env.publish({
+    folder: "acme", slug: "invalid-theme-update", title: "Themed", type: "page", html,
+    theme: { scope: "platform", slug: "report" }, themeOverrides: { tokens: {} },
+  });
+  assert.equal(created.status, 201);
+
+  const rejected = await env.publish({
+    folder: "acme", slug: "invalid-theme-update", title: "Broken", type: "page",
+    html: "<main><h1>Must not replace current</h1></main>",
+    theme: { scope: "platform", slug: "report" }, themeOverrides: { tokens: { density: "2" } },
+  });
+  assert.equal(rejected.status, 422);
+  const error = await rejected.json<ErrorResponse>();
+  assert.equal(error.error.code, "validation");
+  assert.ok(error.error.details?.some(issue => issue.field === "themeOverrides"));
+
+  assert.equal(await env.load("invalid-theme-update"), html);
+  const versions = await env.DB.prepare(
+    "SELECT COUNT(*) AS count FROM artifact_versions WHERE artifact_id = (SELECT id FROM artifacts WHERE slug = 'invalid-theme-update')",
+  ).first<{ count: number }>();
+  assert.equal(versions?.count, 1);
 });
 
 test("artifact-key mint accepts an explicit content-read capability and defaults it off", async () => {
@@ -755,4 +833,73 @@ test("HTTP publish with ifVersion does not create a missing artefact or folder",
   assert.equal((await env.DB.prepare("SELECT COUNT(*) AS count FROM folders").first<{ count: number }>())?.count, 0);
   assert.equal((await env.DB.prepare("SELECT COUNT(*) AS count FROM artifacts").first<{ count: number }>())?.count, 0);
   assert.equal(env.bucket.objects.size, 0);
+});
+test("page publication includes expanded brand-locked override CSS in the composed-size cap", async () => {
+  const env = await environment();
+  const origin = "https://example.test";
+  const shellLength = worstPageDocumentLength("", PLATFORM_THEMES, origin, "en");
+  const fragment = `<main>${"x".repeat(1_500_000 - shellLength - 13)}</main>`;
+  const accepted = await env.publish({
+    folder: "acme", slug: "page-without-expanded-theme", title: "Page", type: "page", html: fragment,
+    theme: { scope: "platform", slug: "report" },
+  });
+  assert.equal(accepted.status, 201);
+  const overLimit = await env.publish({
+    folder: "acme", slug: "page-one-over-limit", title: "Page", type: "page", html: fragment.replace("</main>", "x</main>"),
+  });
+  assert.equal(overLimit.status, 422);
+  const overLimitResponse = await overLimit.json<ErrorResponse>();
+  assert.equal(overLimitResponse.error.code, "validation");
+  assert.ok(overLimitResponse.error.details?.some(issue =>
+    issue.code === "composed-too-large" && issue.field === "html" && issue.message.length > 0));
+
+
+  const expandedFont = `"${"A".repeat(158)}"`;
+  const rejected = await env.publish({
+    folder: "acme", slug: "page-with-expanded-theme", title: "Page", type: "page", html: fragment,
+    theme: { scope: "platform", slug: "report" },
+    themeOverrides: { tokens: {
+      "font-heading": expandedFont,
+      "font-body": expandedFont,
+      "font-mono": expandedFont,
+    } },
+  });
+  assert.equal(rejected.status, 422);
+  const response = await rejected.json<ErrorResponse>();
+  assert.equal(response.error.code, "validation");
+  assert.ok(response.error.details?.some(issue =>
+    issue.code === "composed-too-large" && issue.field === "html" && issue.message.length > 0));
+});
+test("publish rejects a page whose runtime bridge exceeds the composed-document cap", async () => {
+  const env = await environment();
+  const origin = "https://example.test";
+  const shellLength = Math.max(...PLATFORM_THEMES.flatMap(theme =>
+    (["light", "dark"] as const).flatMap(mode =>
+      (["s", "m", "l"] as const).map(size =>
+        composePageDocument("", theme, mode, origin, size, "en").length))));
+  const html = `<main>${"x".repeat(1_500_000 - shellLength - 13)}</main>`;
+  const response = await env.publish({
+    folder: "acme", slug: "page-bridge-over-limit", title: "Page", type: "page", html,
+  });
+  assert.equal(response.status, 422);
+  const body = await response.json<ErrorResponse>();
+  assert.equal(body.error.code, "validation");
+  assert.ok(body.error.details?.some(issue => issue.code === "composed-too-large" && issue.field === "html"));
+});
+
+test("page update sizes with the existing language when lang is omitted", async () => {
+  const env = await environment();
+  const existing = await env.publish({
+    folder: "acme", slug: "page-long-language", title: "Page", type: "page", lang: "zh-Hant-TW", html: "<main>Old</main>",
+  });
+  assert.equal(existing.status, 201);
+  const shellLength = worstPageDocumentLength("", PLATFORM_THEMES, "https://example.test", "en");
+  const html = `<main>${"x".repeat(1_500_000 - shellLength - 13)}</main>`;
+  const updated = await env.publish({
+    folder: "acme", slug: "page-long-language", title: "Page", type: "page", html,
+  });
+  assert.equal(updated.status, 422);
+  const body = await updated.json<ErrorResponse>();
+  assert.equal(body.error.code, "validation");
+  assert.ok(body.error.details?.some(issue => issue.code === "composed-too-large" && issue.field === "html"));
 });

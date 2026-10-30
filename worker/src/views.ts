@@ -1,5 +1,7 @@
 // Compatible controller-facing renderers. Only trusted bootstrap data enters the parent;
 // authored HTML is loaded separately by the opaque iframe runtime.
+import { composePageDocument } from "../../frontend/src/page-composition.js";
+import { PLATFORM_THEMES } from "../../frontend/src/platform-themes.js";
 import type { ColleagueGrant, EstateRole } from "./access.js";
 import type { RuntimeSource, ViewerDescriptor, ViewerPermissions } from "./artifact-runtime.js";
 import type { ArtifactVersion } from "./artifacts.js";
@@ -120,7 +122,7 @@ interface RuntimeProjection {
 export const viewerView = (value?: ViewerDescriptor | null) => {
   if (!value) return null;
   return {
-    ...pick(value, ["title", "gated", "protected", "mode", "loadUrl", "gateUrl", "signedIn", "csrf", "actionBase", "artifactRef", "currentVersion", "lang", "data"]),
+    ...pick(value, ["title", "gated", "protected", "mode", "loadUrl", "gateUrl", "signedIn", "csrf", "actionBase", "artifactRef", "currentVersion", "lang", "documentOrigin", "data"]),
     ...(value.runtime.kind !== "console" || value.permissions.manage ? pick(value, ["publicUrl"]) : {}),
     runtime: pick<RuntimeProjection, keyof RuntimeProjection>(value.runtime, ["kind", "path", "token", "artifactId"]),
     permissions: capsView(value.permissions),
@@ -209,3 +211,13 @@ export const adminHomeView = (props: ViewProps = {}) => page("adminHome", "Admin
 export const usersView = (props: ViewProps = {}) => page("users", "Users & invitations", props);
 export const platformSettingsView = (props: ViewProps = {}) => page("platformSettings", "Platform settings", props);
 export const reportsView = (props: ViewProps = {}) => page("reports", "Content reports", props);
+
+const THEME_SAMPLE = `<main class="a67-prose"><article><p>Artefacts67 page themes</p><h1>Common sample page</h1><p>One shared sample lets you compare the checked platform themes.</p><figure><img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jWlcAAAAASUVORK5CYII=" width="96" height="96" alt="Sample photo"><figcaption>A sample image embedded in the page.</figcaption></figure></article></main>`;
+const THEME_GALLERY_STYLE = "body{margin:0;background:#f5f6f8;color:#18202c;font:16px system-ui,sans-serif}.gallery{max-width:1120px;margin:0 auto;padding:32px 20px}.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,320px),1fr));gap:20px}.theme-card{min-width:0;border:1px solid #d9dee7;border-radius:12px;background:white;overflow:hidden}.theme-card h2,.theme-card p{margin:16px 18px}.theme-card iframe{display:block;width:100%;height:480px;border:0;border-top:1px solid #d9dee7;background:white}";
+export function themesPage(origin: string): string {
+  const cards = PLATFORM_THEMES.map(theme => {
+    const sample = composePageDocument(THEME_SAMPLE, theme, "light", origin);
+    return `<section class="theme-card" data-theme-slug="${esc(theme.slug)}"><h2>${esc(theme.name)}</h2><p>${esc(theme.description)}</p><iframe title="${esc(theme.name)} common sample" sandbox="allow-scripts" srcdoc="${esc(sample)}"></iframe></section>`;
+  }).join("");
+  return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data:; font-src data:; connect-src 'none'; frame-src 'self';"><title>Page themes · Artefacts67</title><style>${THEME_GALLERY_STYLE}</style></head><body><main class="gallery"><h1>Page themes</h1><p>Compare the checked platform themes using one shared sample page.</p><div class="cards">${cards}</div></main></body></html>`;
+}

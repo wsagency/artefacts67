@@ -69,3 +69,10 @@ test("unfiled artefacts, empty projects and gated viewers get no indicator", asy
   assert.equal((await f.describe(f.signedIn, { kind: "console", artifactId: f.unfiled.id } as const, f.unfiled)).data, null);
   assert.equal((await f.describe(f.signedIn, f.consoleSource, f.artifact, true)).data, null);
 });
+test("viewer composition uses the deployment origin, not the request host", async (t) => {
+  const f = await fixture();
+  t.after(() => f.db.close());
+  const viewer = await f.describe(new Request("https://alias.test/app"), f.consoleSource);
+  assert.equal(viewer.documentOrigin, f.ctx.publicOrigin);
+  assert.equal(viewer.publicUrl, "/x");
+});

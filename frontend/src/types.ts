@@ -1,3 +1,4 @@
+import type { CompiledTheme } from './theme-compiler';
 import type { JSX } from '@solidjs/web';
 
 export type Role = 'owner' | 'admin' | 'member' | 'manager' | 'editor' | 'viewer';
@@ -117,6 +118,7 @@ export interface ViewerDescriptor {
   artifactRef?: string;
   currentVersion?: number;
   lang?: string;
+  documentOrigin?: string;
   publicUrl?: string;
   runtime?: RuntimeSource;
   permissions?: Capabilities;
@@ -141,9 +143,17 @@ export interface Destination {
   depth?: number;
 }
 
+export interface PagePresentation {
+  type: 'page';
+  theme: { scope: 'platform' | 'project'; slug: string } | null;
+  brandLock: boolean;
+  lang?: string;
+  compiledTheme?: CompiledTheme;
+}
 export interface OpenedArtifact {
   html: string;
   permissions: Readonly<Capabilities>;
+  page?: PagePresentation;
   index?: Array<{ title: string; viewer: ViewerDescriptor }>;
 }
 

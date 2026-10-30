@@ -24,6 +24,7 @@ import { openReports } from "../src/reports.js";
 import { openProjectData } from "../src/project-data.js";
 import { openProjectFiles } from "../src/project-files.js";
 import { openRateLimiter, type RateLimiter } from "../src/ratelimit.js";
+import { validatePageFragment } from "../src/page-validation.js";
 
 const MASTER = "6465762d6d61737465722d6b65792d4e4f542d464f522d70726f642d75736521";
 // The sentinels are what a document says and a gate page never may: asserting on the title
@@ -99,9 +100,9 @@ function mailerDouble() {
 
 interface ShareLoadResponse { html: string; runtime: { grant: string }; observation: RuntimeObservation | null }
 interface ShareIndexResponse {
-  index: Array<{ viewer: { gated: boolean; publicUrl: string; runtime: Extract<RuntimeSource, { kind: "share" }> } }>;
+  index: Array<{ page: { type: "page"; lang: string } | null; viewer: { gated: boolean; publicUrl: string; runtime: Extract<RuntimeSource, { kind: "share" }> } }>;
 }
-interface ShareOpenResponse extends ShareGatePayload { observation: RuntimeObservation | null; runtime: { grant: string } }
+interface ShareOpenResponse extends ShareGatePayload { observation: RuntimeObservation | null; runtime: { grant: string }; page?: { type: "page"; lang: string } }
 
 async function environment({ analytics = null }: { analytics?: Pick<Analytics, "proof"> | null } = {}) {
   const DB = openD1Shim();
@@ -130,6 +131,7 @@ async function environment({ analytics = null }: { analytics?: Pick<Analytics, "
   const sessionRef: { value: RuntimeActiveSession | null } = { value: null };
   const ctx = {
     store, artifacts, folders, shares, access,
+    publicOrigin: "https://artefacts.example",
     analytics: analytics ?? openAnalytics({ db: DB, shares, access, masterKeyHex: MASTER }),
     auth: { sessionCookie: "session", currentSession: () => Effect.sync(() => sessionRef.value) },
     artifactRuntime: openArtifactRuntime({ db: DB, masterKeyHex: MASTER }),
@@ -212,11 +214,15 @@ test("a gated share releases wrapped keys only after the password, and the recip
 test("a gated folder index projects every child through the safe viewer DTO, with the actor context computed once", async (t) => {
   const env = await environment();
   const folder = await Effect.runPromise(env.folders.create({ ownerId: env.owner.id, name: "Client", slug: "client" }));
+  const firstHtml = "<main><h1>Premier</h1></main>";
+  const secondHtml = "<main><h1>English fallback</h1></main>";
   const first = await Effect.runPromise(env.artifacts.create({
-    ownerId: env.owner.id, folderId: folder.id, title: "First", html: HTML, slug: "first", authorId: env.owner.id,
+    ownerId: env.owner.id, folderId: folder.id, title: "First", html: firstHtml, slug: "first",
+    authorId: env.owner.id, type: "page", lang: "fr-CA", validatedPage: validatePageFragment(firstHtml),
   }));
   const second = await Effect.runPromise(env.artifacts.create({
-    ownerId: env.owner.id, folderId: folder.id, title: "Second", html: OTHER_HTML, slug: "second", authorId: env.owner.id,
+    ownerId: env.owner.id, folderId: folder.id, title: "Second", html: secondHtml, slug: "second",
+    authorId: env.owner.id, type: "page", validatedPage: validatePageFragment(secondHtml),
   }));
   const share = await Effect.runPromise(env.shares.create({
     actorId: env.owner.id, kind: "folder", targetId: folder.id, name: "Client",
@@ -250,9 +256,28 @@ test("a gated folder index projects every child through the safe viewer DTO, wit
     }
     assert.deepEqual(payload.index.map((c) => c.viewer.runtime.artifactId).sort(), [first.id, second.id].sort(),
       "each child still names its own document (per-child checks retained)");
+    assert.deepEqual(payload.index.map(child => child.page?.lang).sort(), ["en", "fr-CA"],
+      "each gated folder child carries its own non-English language or English fallback");
     // One request-level actor context: the estate walk happens once per unlock, not per child.
     assert.equal(env.access.calls.foldersFor, signedIn ? 1 : 0);
   }
+});
+
+test("a share password response preserves the published page language", async () => {
+  const env = await environment();
+  const fragment = "<main><h1>Page client</h1></main>";
+  const artifact = await Effect.runPromise(env.artifacts.create({
+    ownerId: env.owner.id, title: "Page client", html: fragment, slug: "page-client", authorId: env.owner.id,
+    type: "page", lang: "fr-CA", validatedPage: validatePageFragment(fragment),
+  }));
+  const share = await Effect.runPromise(env.shares.create({
+    actorId: env.owner.id, kind: "artifact", targetId: artifact.id, name: "Page link",
+    recipient: "client@example.test", password: "share-pass",
+  }));
+
+  const response = await env.unlock(urlPath(share.url), "share-pass");
+  assert.equal(response.status, 200);
+  assert.equal((await response.json() as ShareOpenResponse).page?.lang, "fr-CA");
 });
 
 test("a share password is the share's own: the artefact password never opens it, and vice versa", async () => {
@@ -752,4 +777,37 @@ test("moving a shared folder succeeds when its subtree contains a deleted artefa
 
   const moved = await Effect.runPromise(env.folders.setParent(folder.id, destination.id));
   assert.equal(moved.parentId, destination.id);
+});
+test("password-protected visitor share unlocks expose checked page presentation for artifacts and folder children", async () => {
+  const env = await environment();
+  const fragment = "<main><h1>Shared page</h1></main>";
+  const page = await Effect.runPromise(env.artifacts.create({
+    ownerId: env.owner.id, title: "Shared page", html: fragment, slug: "shared-page", authorId: env.owner.id,
+    type: "page", theme: { scope: "platform", slug: "report" }, themeOverrides: { tokens: { accent: "#8f5e00" } },
+    validatedPage: validatePageFragment(fragment),
+  }));
+  const pageShare = await Effect.runPromise(env.shares.create({
+    actorId: env.owner.id, kind: "artifact", targetId: page.id, name: "Page",
+    recipient: "client@example.test", password: "letmein",
+  }));
+  const unlockedPage = await env.unlock(urlPath(pageShare.url), "letmein");
+  assert.equal(unlockedPage.status, 200);
+  const pagePayload = await unlockedPage.json() as { page?: { type: string; brandLock: boolean; compiledTheme?: { css: string } } };
+  assert.equal(pagePayload.page?.type, "page");
+  assert.equal(pagePayload.page?.brandLock, true);
+  assert.match(pagePayload.page?.compiledTheme?.css ?? "", /--a67-accent:#8f5e00/);
+
+  const folder = await Effect.runPromise(env.folders.create({ ownerId: env.owner.id, name: "Folder", slug: "shared-folder" }));
+  const child = await Effect.runPromise(env.artifacts.create({
+    ownerId: env.owner.id, folderId: folder.id, title: "Folder page", html: fragment, slug: "folder-page", authorId: env.owner.id,
+    type: "page", theme: { scope: "platform", slug: "launch" }, validatedPage: validatePageFragment(fragment),
+  }));
+  const folderShare = await Effect.runPromise(env.shares.create({
+    actorId: env.owner.id, kind: "folder", targetId: folder.id, name: "Folder",
+    recipient: "client@example.test", password: "folder-password",
+  }));
+  const unlockedFolder = await env.unlock(urlPath(folderShare.url), "folder-password");
+  assert.equal(unlockedFolder.status, 200);
+  const folderPayload = await unlockedFolder.json() as { index?: Array<{ page?: { theme?: { slug: string } } }> };
+  assert.equal(folderPayload.index?.find(item => item.page)?.page?.theme?.slug, "launch");
 });

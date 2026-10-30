@@ -2,9 +2,11 @@
 
 [![An open-source project by WS Agency](assets/ws-design-kit/badges/original/open-source-light.svg)](https://ws.agency/)
 
-Publishing **private-by-default, self-contained HTML documents and applications**. Ordinary links
-require authorized sign-in; external readers use deliberately created visitor shares, with an
-optional share password. Applications keep encrypted personal and shared data outside the console session.
+Publishing **private-by-default, self-contained HTML artefacts and applications**. Complete-document
+`site` publishing remains the default and compatible format; optional `page` artefacts are validated
+fragments rendered with checked platform themes. Ordinary links require authorized sign-in;
+external readers use deliberately created visitor shares, with an optional share password.
+Applications keep encrypted personal and shared data outside the console session.
 
 The platform is a **Cloudflare Worker** (D1 for state, R2 for sealed content, one Durable Object for
 strongly-consistent counters). You run your own instance: see [First deploy](#first-deploy).
@@ -61,7 +63,25 @@ strongly-consistent counters). You run your own instance: see [First deploy](#fi
   `allow-same-origin`. Complete documents retain native `DOMContentLoaded`/`load` behavior,
   and their CSS and JavaScript are not extracted into the console. Browser storage is deliberately
   unavailable in this model; `window.artefacts.storage` provides authorized asynchronous persistence.
+
+- **Site and page artefacts.** Existing publishes and requests that omit `type` remain `site`:
+  complete HTML documents with their established source bytes and analytics behavior. Opt into
+  `type: "page"` for a fragment with a constrained HTML/SVG/CSS grammar, a checked platform theme,
+  and a sandboxed composed viewer. The site path is unchanged. Browse the checked themes at
+  `/themes`; the write API accepts `{ "scope": "platform", "slug": "report" | "editorial" | "launch" }`
+  as `theme`, with optional validated `themeOverrides` for page-only customization. Page fragments
+  retain local `#id` navigation. The toolbar's Copy HTML action returns the authored source. For
+  pages with a registered theme, Download HTML composes a standalone document with the trusted
+  inline kit, selected theme, runtime, and CSP; an unregistered theme slug falls back to `report` in
+  the viewer and leaves the downloaded page as the authored fragment. Composed downloads omit the
+  hosted SDK, live persistence, and application data. See the [contract](dev-docs/artefact-contract.md)
+  for the accepted grammar and security boundary. The `/themes` gallery compares all three checked
+  themes on one common sample; it does not publish pages or expose a design editor. The page
+  runtime does not permit external scripts, stylesheets, images or network requests.
   Fragment-only links stay inside the document and preserve its form and JavaScript state.
+  The automated page accessibility gate audits shipped experiences against WCAG 2.2 A/AA rules;
+  axe incomplete findings are reported separately, and this is not a certification of arbitrary
+  authored content.
 - **Fonts are captured when publishing.** Supported Google Fonts stylesheets and font files are
   downloaded, checked and embedded in the encrypted document. Visitors do not contact the font
   provider, and a failed capture rejects publication rather than silently changing typography.
@@ -92,10 +112,14 @@ the Artefacts67 mark (a link home) and the artefact's grouped title menu on the 
 Fullscreen icons on the right, including narrow viewers. Share distinguishes a **private link**
 requiring authorized sign-in from an existing **visitor-share link**. Managers create external
 access through visitor-share management; copying a private link never grants it.
-Download exports the authored **HTML only**, not a ZIP, database, personal/shared application data,
-or the hosted storage SDK. The title menu retains Copy HTML, refresh, reporting and authorized
-version history, rename, resource settings and deletion. Switching to Code preserves the
-running preview; source operations use the same live access checks as downloading.
+Download saves authored complete-document source for a `site`; for a `page` with a registered theme,
+it composes the fragment as a standalone HTML document with the trusted inline kit, selected theme,
+runtime, and CSP. An unregistered theme slug renders with the `report` fallback but downloads as the
+authored fragment. Composed page downloads exclude the hosted SDK, live persistence, and application
+data. The title menu's Copy HTML action always returns the authored source (a fragment for a page);
+it also retains refresh, reporting and authorized version history, rename, resource settings and
+deletion. Switching to Code preserves the running preview; source operations use the same live
+access checks as downloading.
 Share analytics remain private.
 An artefact that declares `<meta name="color-scheme" content="light dark">` also gets a
 light/dark switch in the toolbar: it starts from the reader's system preference, remembers an
@@ -115,11 +139,15 @@ to the clipboard, with an accessible success or failure announcement.
 `/instructions` documents the platform for people and agents. `DESIGN_TEMPLATE_URL` optionally
 names a fallback design template that agents use when the user has not specified a design.
 
-An artefact remains one self-contained HTML document: CSS and JavaScript are inline, media can be
-embedded, and internal screens can use local navigation. Publication accepts no asset uploads,
-asset paths, bundles, separately hosted subpages, or cross-links to other artefact URLs; project
-files are application data in a collection's `file` fields, not page assets.
-Application storage is encrypted JSON key/value data through the hosted SDK, not a SQL database.
+An artefact is either a complete self-contained `site` HTML document or an opt-in `page` fragment.
+Both keep their presentation inline and may use local navigation. Page Copy HTML returns the raw
+fragment. With a registered theme, Download HTML composes a page into a standalone document with
+the trusted kit, selected theme, runtime and CSP; an unregistered theme slug renders with the
+`report` fallback but downloads as the authored fragment. Composed page downloads omit the hosted
+SDK, live persistence and application data. Publication accepts no asset uploads, bundles,
+separately hosted subpages, or cross-links to other artefact URLs; project files are application
+data in collection `file` fields, not page assets. Application storage is encrypted JSON key/value
+data through the hosted SDK, not a SQL database.
 
 The write API publishes **synchronously**: `POST /_api/artifacts` upserts on `(folder, slug)` and
 answers `201`/`200` with the artefact already live. A master key can also mint, rotate and revoke
@@ -132,9 +160,11 @@ and MCP `get_artifact` require the opt-in plus current read authority (and `read
 keys), and audit each outcome without storing source content. Password-gated content does not
 require its password for an authorized key; passwords and visitor shares alone do not grant API/MCP
 read authority. Publish and rotate-with-HTML accept optional `ifVersion`: stale writes conflict and
-concurrent losing content is cleaned up; omission retains unconditional behavior. M1 leaves ordinary
-`site` publication unchanged and does not ship page types, themes, viewer changes or conditional
-console form tokens.
+concurrent losing content is cleaned up; omission retains unconditional behavior. M2 additionally
+supports optional `page` artefacts and checked platform themes; `site` remains the default. The
+`/instructions` and `/llms.txt` publishing guidance continues to recommend complete-document
+`site` output until M4's human assistive-technology sign-off; conditional console form tokens are
+not shipped.
 
 ## Native navigation regression check
 

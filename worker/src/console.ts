@@ -47,6 +47,7 @@ export interface AuthContext {
   operator?: string;
 }
 export interface ConsoleContext extends AuthContext {
+  publicOrigin: string;
   auth: AuthContext["auth"] & Pick<Auth, "meView" | "invite" | "audit" | "counts" |
     "changePassword" | "canManage" | "canSetRole" | "wouldOrphanOwners">;
   store: {

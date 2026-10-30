@@ -42,6 +42,15 @@ async function services(fontFetch: FontFetcher = async () => new Response("unava
   }), ctx, { rest }));
   return { ...ctx, api, master };
 }
+test("existing and omitted-type versions default to site without changing stored content", async () => {
+  const { artifacts, owner, db } = await services();
+  const created = await Effect.runPromise(artifacts.create({ ownerId: owner.id, html: HTML, authorId: owner.id }));
+  const page = await db.prepare(
+    "SELECT type FROM artifact_versions WHERE artifact_id = ? AND version = 1",
+  ).bind(created.id).first<{ type: string }>();
+  assert.equal(page?.type, "site");
+  assert.equal(await Effect.runPromise(artifacts.document(created)), HTML);
+});
 
 test("restore appends retained content without rewinding history or changing the gate/key", async () => {
   const { artifacts, owner } = await services();

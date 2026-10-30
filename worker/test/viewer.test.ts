@@ -15,6 +15,7 @@ import type { GatePayload } from "../src/artifacts.js";
 import { openRateLimiter } from "../src/ratelimit.js";
 import { openAuth } from "../src/auth.js";
 import { openMailer } from "../src/mail.js";
+import { validatePageFragment } from "../src/page-validation.js";
 
 interface WrongPasswordResponse { error: "wrong"; remaining: number }
 interface LockoutResponse { error: "locked"; retryAfter: number }
@@ -208,6 +209,35 @@ test("a gated artefact serves a page with no ciphertext, and the gate opens the 
   // A successful unlock clears the counter.
   assert.equal((await env.fetch("/_gate/tajno", post("pogresna"))).status, 401);
 });
+test("a gated page returns only theme metadata after password verification", async () => {
+  const env = await environment();
+  const fragment = "<main><h1>Locked page</h1></main>";
+  await Effect.runPromise(env.artifacts.create({
+    ownerId: env.owner.id, title: "Locked page", html: fragment, password: "ws", slug: "locked-page",
+    authorId: env.owner.id, type: "page", lang: "hr-BA", theme: { scope: "platform", slug: "launch" }, brandLock: true,
+    themeOverrides: { tokens: { "--a67-accent": "#8f5e00" } },
+    validatedPage: validatePageFragment(fragment),
+  }));
+  const response = await env.fetch("/_gate/locked-page", post("ws"));
+  assert.equal(response.status, 200);
+  const payload = await response.json() as GatePayload & { page: { type: string; theme: { scope: string; slug: string }; brandLock: boolean; lang: string; compiledTheme?: { css: string; tokens: { light: Record<string, string> } } }; runtime: { grant: string } };
+  assert.deepEqual({ type: payload.page.type, theme: payload.page.theme, brandLock: payload.page.brandLock, lang: payload.page.lang },
+    { type: "page", theme: { scope: "platform", slug: "launch" }, brandLock: true, lang: "hr-BA" });
+  assert.equal(payload.page.lang, "hr-BA", "a public password gate must preserve the published page language");
+  assert.equal(payload.page.compiledTheme?.tokens.light.accent, "#8f5e00");
+  assert.match(payload.page.compiledTheme?.css ?? "", /--a67-accent:#8f5e00/);
+  assert.equal(JSON.stringify(payload).includes(fragment), false);
+  assert.ok(payload.runtime.grant);
+  const fallbackFragment = "<main><h1>English fallback</h1></main>";
+  await Effect.runPromise(env.artifacts.create({
+    ownerId: env.owner.id, title: "English fallback", html: fallbackFragment, password: "ws", slug: "english-fallback",
+    authorId: env.owner.id, type: "page", theme: { scope: "platform", slug: "launch" },
+    validatedPage: validatePageFragment(fallbackFragment),
+  }));
+  const fallback = await env.fetch("/_gate/english-fallback", post("ws"));
+  assert.equal(fallback.status, 200);
+  assert.equal((await fallback.json() as { page: { lang: string } }).page.lang, "en");
+});
 
 test("the gate locks the (IP, artefact) pair and audits the lockout", async () => {
   const env = await environment();
@@ -360,6 +390,7 @@ test("gate failures stay closed while reset alone is best-effort", async () => {
         grants += 1;
         return yield* runtime.issue(request, context, input);
       }),
+      presentation: version => runtime.presentation(version),
     },
     limiter, gate: { threshold: 4, lockMs: 3600000 }, store: env.store,
   };
@@ -400,4 +431,22 @@ test("the folder index uses the kit, without the WS Agency credit", () => {
   assert.match(page, /products\/artefacts67\/original\/logo-white\.svg/);
   assert.match(page, /rel="icon" type="image\/svg\+xml" href="\/assets\/ws-design-kit\/products\/artefacts67\/original\/favicon\.svg"/);
   assert.doesNotMatch(page, /Made with love|ws-logo\.svg/);
+});
+test("public themes gallery renders one common sample for exactly three checked themes", async () => {
+  const env = await environment();
+  const response = await env.fetch("/themes");
+  assert.equal(response.status, 200);
+  const page = await response.text();
+  const slugs = [...page.matchAll(/data-theme-slug="([^"]+)"/g)].map(match => match[1]);
+  assert.deepEqual(slugs, ["report", "editorial", "launch"]);
+  assert.equal((page.match(/<iframe\b/g) ?? []).length, 3);
+  for (const slug of ["report", "editorial", "launch"]) {
+    assert.match(page, new RegExp(`<section class="theme-card" data-theme-slug="${slug}"`));
+  }
+  assert.equal((page.match(/&lt;h1&gt;Common sample page&lt;\/h1&gt;/g) ?? []).length, 3);
+  assert.equal((page.match(/Common sample page/g) ?? []).length, 3);
+  const csp = page.match(/<meta http-equiv="Content-Security-Policy" content="([^"]+)"/)?.[1];
+  assert.ok(csp);
+  assert.equal(csp, "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data:; font-src data:; connect-src 'none'; frame-src 'self';");
+  assert.doesNotMatch(page, /X-Artefacts-Grant|wsa_session|PRIVATE_SAMPLE|window\.artefacts\s*=/);
 });

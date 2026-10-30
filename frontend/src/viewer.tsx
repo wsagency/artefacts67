@@ -1,7 +1,8 @@
 import { createEffect, createSignal, onSettled, untrack } from 'solid-js';
 import type { JSX } from '@solidjs/web';
-import { duplicateArtifact, downloadArtifact, mountArtifactFrame, openArtifact, readArtifactSource, reportArtifact, setArtifactFrameTheme, type ArtifactTheme } from './artifact-runtime';
+import { duplicateArtifact, downloadArtifact, mountArtifactFrame, openArtifact, readArtifactSource, reportArtifact, setArtifactFramePageTheme, setArtifactFrameTextSize, setArtifactFrameTheme, type ArtifactTheme } from './artifact-runtime';
 import { usePreference } from './shell';
+import { PLATFORM_THEMES } from './platform-themes';
 import { navigate } from './navigation';
 import { Button, Check, Choice, CopyValue, Dialog, Feedback, Field, Icon, LinkButton, Menu, MenuItem, MenuLink, Panel, PostForm, VersionHistory } from './ui';
 import type { Capabilities, Destination, OpenedArtifact, ViewerDescriptor } from './types';
@@ -122,9 +123,24 @@ export function ArtifactViewer(props: { viewer: ViewerDescriptor | null; title?:
   const [frameElement, setFrameElement] = createSignal<HTMLIFrameElement | undefined>(undefined);
   // One explicit reader choice for every artefact; without one, the system preference.
   const [storedTheme, setStoredTheme] = usePreference<ArtifactTheme | null>('wsa-artefact-theme', null);
+  const [storedPageTheme, setStoredPageTheme] = usePreference<string | null>('wsa-page-theme', null);
+  const [textSize, setTextSize] = usePreference<'s' | 'm' | 'l'>('wsa-page-text-size', 'm');
   const systemScheme = matchMedia('(prefers-color-scheme: dark)');
   const [systemTheme, setSystemTheme] = createSignal<ArtifactTheme>(systemScheme.matches ? 'dark' : 'light');
   const theme = (): ArtifactTheme => { const chosen = storedTheme(); return chosen === 'light' || chosen === 'dark' ? chosen : systemTheme(); };
+  const pageThemeSlug = (): string | null => {
+    const current = opened();
+    if (!current?.page) return null;
+    const assigned = current.page.theme?.scope === 'platform' ? current.page.theme.slug : 'report';
+    const selected = current.page.brandLock ? assigned : storedPageTheme() ?? assigned;
+    return PLATFORM_THEMES.find(item => item.slug === selected)?.slug ?? assigned;
+  };
+  const pageTheme = () => {
+    const current = opened();
+    const selected = pageThemeSlug();
+    if (current?.page?.compiledTheme && selected === (current.page.theme?.scope === 'platform' ? current.page.theme.slug : 'report')) return current.page.compiledTheme;
+    return PLATFORM_THEMES.find(item => item.slug === selected) ?? null;
+  };
   const [themed, setThemed] = createSignal(false);
   const passwords = new Map<string, string>();
   let surface: HTMLElement | undefined;
@@ -236,7 +252,7 @@ export function ArtifactViewer(props: { viewer: ViewerDescriptor | null; title?:
       setThemed(false);
       if (!artifact || artifact.index || !frame || !frame.isConnected) return;
       try {
-        return mountArtifactFrame(frame, artifact, { onError: cause => setError(cause.message), theme: theme(), onThemeSupport: () => setThemed(true) });
+        return mountArtifactFrame(frame, artifact, { onError: cause => setError(cause.message), theme: theme(), pageTheme: pageTheme() ?? undefined, textSize: textSize(), origin: viewer()?.documentOrigin ?? location.origin, onThemeSupport: () => setThemed(true) });
       } catch (cause) {
         setError(cause instanceof Error ? cause.message : 'Unable to mount the artefact.');
       }
@@ -246,6 +262,15 @@ export function ArtifactViewer(props: { viewer: ViewerDescriptor | null; title?:
   createEffect(
     () => ({ frame: frameElement(), scheme: theme() }),
     ({ frame, scheme }) => { if (frame) setArtifactFrameTheme(frame, scheme); },
+  );
+  createEffect(
+    () => ({ frame: frameElement(), artifact: opened(), selected: pageTheme() }),
+    ({ frame, artifact, selected }) => { if (frame && artifact?.page && selected) setArtifactFramePageTheme(frame, selected); },
+  );
+
+  createEffect(
+    () => ({ frame: frameElement(), artifact: opened(), size: textSize() }),
+    ({ frame, artifact, size }) => { if (frame && artifact?.page) setArtifactFrameTextSize(frame, size); },
   );
 
   function select(child: ViewerDescriptor | null): void {
@@ -326,12 +351,17 @@ export function ArtifactViewer(props: { viewer: ViewerDescriptor | null; title?:
       </div>
       <div class="viewer-actions">
         {viewer()?.data && <DataStatus data={viewer()!.data!} />}
+        {opened()?.page && <div class="viewer-page-controls">
+          <Choice label="Theme" options={PLATFORM_THEMES.map(item => [item.slug, item.name])} value={pageTheme()?.slug ?? 'report'}
+            disabled={opened()?.page?.brandLock || busy()} onChange={setStoredPageTheme} />
+          <Choice label="Text size" options={ [['s', 'S'], ['m', 'M'], ['l', 'L']] } value={textSize()} onChange={value => { if (value === 's' || value === 'm' || value === 'l') setTextSize(value); }} />
+        </div>}
         {!isIndex() && <div class="viewer-modes" role="group" aria-label="Artefact view">
           <Button variant="ghost" size="sm" iconOnly aria-label="Preview" title="Preview" aria-pressed={(!codeView()) ? 'true' : 'false'} disabled={!opened() || busy()} onClick={() => setSourceDocument(null)}><Icon name="preview" /></Button>
           <Button variant="ghost" size="sm" iconOnly aria-label="Code" title="Code" aria-pressed={(codeView()) ? 'true' : 'false'} disabled={!opened() || busy()} onClick={showCode}><Icon name="code" /></Button>
         </div>}
         {canShare() && <Button variant="ghost" size="sm" iconOnly class="viewer-icon-button" aria-label="Share" title="Share and copy link" onClick={() => setDialog('share')}><Icon name="share" /></Button>}
-        {!isIndex() && <Button variant="ghost" size="sm" iconOnly class="viewer-icon-button" aria-label="Download HTML" title="Download HTML only — application data is not included" disabled={!opened() || busy()} onClick={() => { const current = opened(); const currentViewer = viewer(); if (current) void action(() => downloadArtifact(currentViewer ?? {}, current, { filename: `${title().replace(/[^a-z0-9 _.-]/gi, '_') || 'artefact'}.html` })); }}><Icon name="download" /></Button>}
+        {!isIndex() && <Button variant="ghost" size="sm" iconOnly class="viewer-icon-button" aria-label="Download HTML" title="Download HTML only — application data is not included" disabled={!opened() || busy()} onClick={() => { const current = opened(); const currentViewer = viewer(); if (current) void action(() => downloadArtifact(currentViewer ?? {}, current, { filename: `${title().replace(/[^a-z0-9 _.-]/gi, '_') || 'artefact'}.html`, pageTheme: pageTheme() ?? undefined, mode: theme(), textSize: textSize() })); }}><Icon name="download" /></Button>}
         {!isIndex() && themed() && !codeView() && <Button variant="ghost" size="sm" iconOnly class="viewer-icon-button" aria-label="Dark appearance" title="Dark appearance" aria-pressed={theme() === 'dark' ? 'true' : 'false'} onClick={() => setStoredTheme(theme() === 'dark' ? 'light' : 'dark')}><Icon name={theme() === 'dark' ? 'sun' : 'moon'} /></Button>}
         <Button variant="ghost" size="sm" iconOnly class="viewer-icon-button" aria-label={fullscreen() ? 'Exit fullscreen' : 'Fullscreen'} title={fullscreen() ? 'Exit fullscreen' : 'Fullscreen'} aria-pressed={fullscreen() ? 'true' : 'false'} onClick={toggleFullscreen}><Icon name={fullscreen() ? 'exitFullscreen' : 'fullscreen'} /></Button>
       </div>

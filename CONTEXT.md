@@ -7,8 +7,11 @@ Publishing private-by-default versioned HTML artefacts into folders. Ordinary pa
 ### Publishing
 
 **Artefact**:
-A versioned HTML document or application published into one folder. It owns its presentation; application data is separate from its published source.
-_Avoid_: document, file, page, asset, deliverable
+A versioned `site` document or `page` fragment published into one folder. A site is a complete HTML document; a page uses the constrained fragment grammar and checked page runtime. It owns its presentation; application data is separate from its published source. Existing and omitted publication `type` values remain `site`.
+_Avoid_: document, file, asset, deliverable
+**Page artefact**:
+An opt-in artefact published as `type: "page"`: validated HTML/SVG/CSS fragment content with optional checked platform `ThemeRef`, composed in the isolated page viewer. Its fragment is not a standalone complete document.
+_Avoid_: site, asset, subpage
 
 **Folder**:
 The container an artefact is published into. A member may use one for a client, a project, or anything else — the platform takes no view on which (ADR 0021).

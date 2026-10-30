@@ -1,6 +1,7 @@
 import test, { type TestContext } from "node:test";
 import assert from "node:assert/strict";
 import * as Effect from "effect/Effect";
+import { parse } from "parse5";
 import { openD1Shim } from "./db.js";
 import { openConsoleContext, memoryBucket, rateLimitBinding } from "./doubles.js";
 import { openArtifactRuntime, duplicateReadable, type RuntimeSource, type RuntimeObservation } from "../src/artifact-runtime.js";
@@ -13,9 +14,10 @@ import { handleConsole } from "../src/console.js";
 import { asCodeError } from "../src/types.js";
 import { clientIp, PART_BYTES } from "../src/http.js";
 import worker from "../src/index.js";
+import { validatePageFragment } from "../src/page-validation.js";
 
 interface ReaderGrant { grant: string; cookie: string }
-interface RuntimeLoadBody { html: string; runtime: { grant: string }; observation: RuntimeObservation | null }
+interface RuntimeLoadBody { html: string; runtime: { grant: string }; observation: RuntimeObservation | null; page?: { type: string; theme: { scope: string; slug: string } | null; brandLock: boolean; lang?: string; compiledTheme?: { slug: string; css: string; tokens: { light: Record<string, string> } } } }
 interface RuntimeStateBody { value?: JsonValue; error?: string; message?: string }
 interface RuntimeDataBody { value?: (ProjectRecord & RecordPage) | null; error?: string; message?: string; issues?: Array<{ field: string; message: string }> }
 interface RuntimeTestCaller {
@@ -582,6 +584,82 @@ test("agent-seeded records are shared by artefacts of one project", async (t) =>
   assert.equal(got.status, 200);
   assert.deepEqual([got.body.value?.version, got.body.value?.data], [2, { title: "Edited" }]);
 });
+test("runtime schema reads expose only definitions to authorized records readers and submitters", async (t) => {
+  const f = await project(t);
+  await f.run(f.projectData.define(f.folder.id, "schema-shape", { kind: "responses", visitors: true, fields: {
+    text: { type: "text", required: true, maxLength: 120 },
+    email: { type: "email" },
+    number: { type: "number", min: 1, max: 10, integer: true },
+    boolean: { type: "boolean" },
+    date: { type: "date" },
+    choice: { type: "choice", options: ["one", "two"], multiple: true },
+    file: { type: "file", multiple: true, maxBytes: 4096, accept: [".pdf", "application/pdf"] },
+  } }));
+  await f.run(f.projectData.define(f.folder.id, "open-records", { kind: "records", visitors: true, fields: {
+    title: { type: "text", required: true },
+  } }));
+  const owner = await f.direct(f.artifact.id);
+  const offers = await data(f, owner, { op: "schema", collection: "offers" });
+  assert.equal(offers.status, 200);
+  assert.deepEqual(offers.body.value, {
+    name: "offers", kind: "records", visitors: false,
+    fields: { title: { type: "text", required: true } },
+  });
+  assert.deepEqual(Object.keys(offers.body.value ?? {}).sort(), ["fields", "kind", "name", "visitors"]);
+
+  const expected = {
+    name: "schema-shape", kind: "responses", visitors: true,
+    fields: {
+      text: { type: "text", required: true, maxLength: 120 },
+      email: { type: "email" },
+      number: { type: "number", min: 1, max: 10, integer: true },
+      boolean: { type: "boolean" },
+      date: { type: "date" },
+      choice: { type: "choice", options: ["one", "two"], multiple: true },
+      file: { type: "file", multiple: true, maxBytes: 4096, accept: [".pdf", "application/pdf"] },
+    },
+  };
+  assert.deepEqual((await data(f, owner, { op: "schema", collection: "schema-shape" })).body.value, expected);
+  const visitor = await f.load();
+  assert.deepEqual((await data(f, visitor, { op: "schema", collection: "schema-shape" })).body.value, expected);
+  assert.deepEqual((await data(f, visitor, { op: "schema", collection: "open-records" })).body.value, {
+    name: "open-records", kind: "records", visitors: true, fields: { title: { type: "text", required: true } },
+  });
+  assert.equal((await data(f, visitor, { op: "schema", collection: "offers" })).status, 403);
+  assert.equal((await data(f, visitor, { op: "schema", collection: "closed" })).status, 403);
+
+  await f.run(f.access.grant({ actorId: "owner", folderId: f.folder.id, userId: "reader", role: "viewer" }));
+  const reader = await f.direct(f.artifact.id, (await f.session("reader")).cookie);
+  assert.deepEqual((await data(f, reader, { op: "schema", collection: "offers" })).body.value, {
+    name: "offers", kind: "records", visitors: false,
+    fields: { title: { type: "text", required: true } },
+  });
+  const responseDefinition = await data(f, reader, { op: "schema", collection: "rsvp" });
+  assert.equal(responseDefinition.status, 200);
+  assert.deepEqual(responseDefinition.body.value, {
+    name: "rsvp", kind: "responses", visitors: true,
+    fields: {
+      name: { type: "text", required: true },
+      attend: { type: "choice", options: ["yes", "no"], required: true },
+      confirm: { type: "boolean", required: true },
+    },
+  });
+  assert.deepEqual((await data(f, reader, { op: "schema", collection: "open-records" })).body.value, {
+    name: "open-records", kind: "records", visitors: true, fields: { title: { type: "text", required: true } },
+  });
+  await Effect.runPromise(f.access.revoke({ actorId: "owner", folderId: f.folder.id, userId: "reader" }));
+  assert.equal((await data(f, reader, { op: "schema", collection: "offers" })).status, 403);
+  await f.run(f.shares.revoke({ actorId: "owner", id: f.visitorShare.id }));
+  assert.equal((await data(f, visitor, { op: "schema", collection: "schema-shape" })).status, 403);
+  assert.equal("records" in (responseDefinition.body.value ?? {}), false);
+  assert.equal("submission" in (responseDefinition.body.value ?? {}), false);
+  assert.equal("submittedBy" in (responseDefinition.body.value ?? {}), false);
+});
+
+test("runtime schema reads fail closed for an unfiled artefact", async (t) => {
+  const f = await project(t);
+  assert.equal((await data(f, await f.direct(f.unfiled.id), { op: "schema", collection: "offers" })).body.error, "no-project");
+});
 
 test("records read and write follow the reader role", async (t) => {
   const f = await project(t);
@@ -875,4 +953,228 @@ test("files: limiter buckets use the pinned keys and windows", async (t) => {
   for (let i = 0; i < 20; i++) await f.run(limiter.hit(`files-start:${actorKey}:${f.folder.id}`, { limit: 20, windowMs: hour }));
   const limited = await startUpload(f, visitor, "cvs", "cv", "b.pdf", 5);
   assert.deepEqual([limited.status, limited.body.error], [429, "rate-limited"]);
+});
+import { compileTheme, type PlatformThemeDefinition } from "../../frontend/src/theme-compiler.js";
+import { composeHostedPageDocument, composePageDownload, composePageDocument, hostedPageDocumentLength } from "../../frontend/src/page-composition.js";
+import { PAGE_FRAME_NONCE_HEX_LENGTH } from "../../frontend/src/page-frame-bridge.js";
+import { buildPageFrameBridge } from "../../frontend/src/page-frame-bridge.js";
+import { PLATFORM_THEMES } from "../../frontend/src/platform-themes.js";
+import { openArtifact, mountArtifactFrame } from "../../frontend/src/artifact-runtime.js";
+
+test("page composition puts the unchanged CSP first and always declares color-scheme", () => {
+  const theme = PLATFORM_THEMES.find(item => item.slug === "editorial")!;
+  const document = composePageDocument('<main><h1>Page body</h1></main>', theme, "dark", ORIGIN, "m", "fr-CA");
+  const match = document.match(/^<!doctype html><html[^>]*><head><meta http-equiv="Content-Security-Policy" content="([^"]+)"/);
+  assert.ok(match);
+  assert.equal(match[1], `default-src 'none'; script-src 'unsafe-inline' 'unsafe-eval' data: blob:; style-src 'unsafe-inline'; img-src data: blob: ${ORIGIN}/assets/favicon.ico ${ORIGIN}/assets/ws-logo.svg; font-src data: blob:; media-src data: blob:; connect-src 'none'; form-action 'none'; base-uri 'none'; object-src 'none'; frame-src 'none'; worker-src 'none'`);
+  assert.match(document, /<html lang="fr-CA"[^>]*>/);
+  assert.match(composePageDocument("<main>English fallback</main>", theme, "light", ORIGIN), /<html lang="en"[^>]*>/);
+  assert.match(document, /<title>Artefacts67 page<\/title>/);
+  assert.match(document, /--a67-font-body/);
+  assert.match(document, /data-theme="dark"/);
+  assert.match(document, /Page body/);
+});
+
+test("page lang is escaped as inert metadata in the document attribute", () => {
+  const theme = PLATFORM_THEMES.find(item => item.slug === "editorial")!;
+  const lang = `fr-CA"'><script>globalThis.compromised=true</script>&<>`;
+  const document = composePageDocument("<main>Page body</main>", theme, "light", ORIGIN, "m", lang);
+  const parsedHtml = parse(document).childNodes.find(node => node.nodeName === "html") as
+    { attrs?: Array<{ name: string; value: string }> } | undefined;
+
+  assert.equal(parsedHtml?.attrs?.find(attribute => attribute.name === "lang")?.value, lang);
+  assert.equal(document.match(/<script(?:\s|>)/g)?.length, 2, "untrusted lang must not add an executable script element");
+});
+
+test("page composition inlines the selected compiled theme and kit without external styles", () => {
+  const theme = PLATFORM_THEMES.find(item => item.slug === "launch")!;
+  const document = composePageDocument("<main>Launch page</main>", theme, "light", ORIGIN);
+  assert.ok(document.includes(theme.css));
+  assert.match(document, /<style[^>]*>[\s\S]*@layer kit, theme, recipes, artefact, object/);
+  assert.doesNotMatch(document, /<link[^>]+stylesheet/);
+  assert.match(document, /<meta name="color-scheme" content="light dark">/);
+});
+test("page download composes a standalone document with the original inline image and no hosted authority", () => {
+  const theme = PLATFORM_THEMES.find(item => item.slug === "editorial")!;
+  const image = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jWlcAAAAASUVORK5CYII=";
+  const fragment = `<main><h1>Common sample page</h1><img alt="Sample photo" src="${image}"></main>`;
+  const document = composePageDownload(fragment, theme, "light", ORIGIN, "m", "fr-CA");
+  const parsed = parse(document);
+  assert.equal(parsed.childNodes[1]?.nodeName, "html");
+  assert.match(document, /^<!doctype html><html/);
+  assert.match(document, /<html lang="fr-CA"[^>]*>/);
+  assert.match(document, /<style id="a67-page-kit">/);
+  assert.match(document, /<script>[\s\S]*PAGE_KIT_RUNTIME|__a67PageKit\.configure/);
+  assert.ok(document.includes(theme.css));
+  assert.ok(document.includes(`src="${image}"`));
+  assert.equal(Buffer.from(image.slice(image.indexOf(",") + 1), "base64").toString("base64"), image.slice(image.indexOf(",") + 1));
+  assert.doesNotMatch(document, /X-Artefacts-Grant|wsa_session|PRIVATE_SAMPLE|window\.artefacts\s*=|<link\b|@import\s+url/i);
+});
+
+test("a rejected theme compiler gate emits no runtime CSS", () => {
+  const invalid = {
+    slug: "rejected",
+    name: "Rejected",
+    description: "",
+    tokens: { light: {}, dark: {} },
+    recipes: { aurora: { colors: ["accent", "c1", "c5"], intensity: 1, angle: 0, positions: ["0% 0%", "50% 50%", "100% 100%"] } },
+  };
+  let servedCss: string | null = null;
+  assert.throws(() => { servedCss = compileTheme(invalid as unknown as PlatformThemeDefinition).css; }, /token|contrast|aurora|invalid/i);
+  assert.equal(servedCss, null);
+});
+test("authorized page loads expose only the selected theme and brand lock metadata", async (t) => {
+  const f = await fixture(t);
+  const page = await Effect.runPromise(f.artifacts.create({
+    ownerId: "owner", title: "Themed page", html: "<main><h1>Themed</h1></main>", slug: "themed-page",
+    authorId: "owner", type: "page", lang: "fr-CA", theme: { scope: "platform", slug: "report" }, brandLock: true,
+    validatedPage: validatePageFragment("<main><h1>Themed</h1></main>"),
+  }));
+  const owner = await f.session("owner");
+  const opened = await f.load({ kind: "console", artifactId: page.id }, owner.cookie);
+  assert.deepEqual(opened.body.page, { type: "page", theme: { scope: "platform", slug: "report" }, brandLock: true, lang: "fr-CA" });
+});
+test("composition scopes compiled selectors and registers child-dependent kits after the fragment", () => {
+  const theme = PLATFORM_THEMES.find(item => item.slug === "editorial")!;
+  const document = composePageDocument('<main><a67-tabs id="tabs"></a67-tabs><a67-checklist id="checklist"></a67-checklist></main>', theme, "light", ORIGIN);
+  assert.match(document, /<html[^>]*data-a67-theme="editorial"/);
+  assert.match(document, /\[data-a67-theme="editorial"\]/);
+  assert.ok(document.indexOf('</main>') < document.indexOf("const SVG_NS = 'http://www.w3.org/2000/svg'"));
+});
+
+test("sealed token overrides produce compiler-checked effective page appearance", async (t) => {
+  const f = await fixture(t);
+  const page = await Effect.runPromise(f.artifacts.create({
+    ownerId: "owner", title: "Overridden page", html: "<main><h1>Themed</h1></main>", slug: "override-page",
+    authorId: "owner", type: "page", theme: { scope: "platform", slug: "report" },
+    themeOverrides: { tokens: { "--a67-accent": "#8f5e00" } },
+    validatedPage: validatePageFragment("<main><h1>Themed</h1></main>"),
+  }));
+  const owner = await f.session("owner");
+  const opened = await f.load({ kind: "console", artifactId: page.id }, owner.cookie);
+  assert.equal(opened.body.page?.brandLock, true);
+  assert.equal(opened.body.page?.compiledTheme?.tokens.light.accent, "#8f5e00");
+  assert.match(opened.body.page?.compiledTheme?.css ?? "", /--a67-accent:#8f5e00/);
+});
+
+test("sealed overrides on a page without an explicit theme apply to the checked Report fallback", async (t) => {
+  const f = await fixture(t);
+  const page = await Effect.runPromise(f.artifacts.create({
+    ownerId: "owner", title: "Override-only page", html: "<main><h1>Themed</h1></main>", slug: "override-only-page",
+    authorId: "owner", type: "page", themeOverrides: { tokens: { "--a67-accent": "#8f5e00" } },
+    validatedPage: validatePageFragment("<main><h1>Themed</h1></main>"),
+  }));
+  const owner = await f.session("owner");
+  const opened = await f.load({ kind: "console", artifactId: page.id }, owner.cookie);
+  assert.equal(opened.body.page?.theme, null, "The page's authored theme metadata remains absent.");
+  assert.equal(opened.body.page?.brandLock, true);
+  assert.equal(opened.body.page?.compiledTheme?.slug, "report");
+  assert.equal(opened.body.page?.compiledTheme?.tokens.light.accent, "#8f5e00");
+  assert.match(opened.body.page?.compiledTheme?.css ?? "", /--a67-accent:#8f5e00/);
+});
+
+test("stored overrides survive an unavailable platform theme resolving to Report", async (t) => {
+  const f = await fixture(t);
+  const html = "<main><h1>Fallback override</h1></main>";
+  const page = await Effect.runPromise(f.artifacts.create({
+    ownerId: "owner", title: "Fallback override", html, slug: "removed-theme-override",
+    authorId: "owner", type: "page", theme: { scope: "platform", slug: "removed-platform-theme" },
+    themeOverrides: { tokens: { "--a67-accent": "#8f5e00" } },
+    validatedPage: validatePageFragment(html),
+  }));
+  const owner = await f.session("owner");
+  const opened = await f.load({ kind: "console", artifactId: page.id }, owner.cookie);
+  assert.equal(opened.body.page?.theme?.scope, "platform");
+  assert.equal(opened.body.page?.theme?.slug, "removed-platform-theme");
+  assert.equal(opened.body.page?.brandLock, true);
+  assert.equal(opened.body.page?.compiledTheme?.slug, "report");
+  assert.equal(opened.body.page?.compiledTheme?.tokens.light.accent, "#8f5e00");
+});
+test("page composition accepts exactly the composed-document limit", () => {
+  const theme = PLATFORM_THEMES.find(item => item.slug === "report")!;
+  const shell = composePageDocument("", theme, "light", ORIGIN);
+  const fragment = "x".repeat(1_500_000 - shell.length);
+  const document = composePageDocument(fragment, theme, "light", ORIGIN);
+  assert.equal(document.length, 1_500_000);
+});
+test("hosted composition includes the exact bridge while downloads remain bridge-free", () => {
+  const theme = PLATFORM_THEMES.find(item => item.slug === "report")!;
+  const nonce = "a".repeat(PAGE_FRAME_NONCE_HEX_LENGTH);
+  const shell = composeHostedPageDocument("", theme, "light", ORIGIN, "m", "en", nonce, false);
+  const fragment = "x".repeat(1_500_000 - shell.length);
+  const document = composeHostedPageDocument(fragment, theme, "light", ORIGIN, "m", "en", nonce, false);
+  assert.equal(document.length, 1_500_000);
+  assert.equal(hostedPageDocumentLength(fragment, theme, "light", ORIGIN, "m", "en", nonce, false), document.length);
+  const bridge = buildPageFrameBridge(nonce, "light", false);
+  assert.ok(document.includes(bridge));
+  const download = composePageDownload(fragment, theme, "light", ORIGIN, "m", "en");
+  assert.equal(download.includes("data-nonce="), false);
+  assert.equal(download.length, document.length - bridge.length);
+  assert.throws(() => composeHostedPageDocument(`${fragment}x`, theme, "light", ORIGIN, "m", "en", nonce, false),
+    error => error instanceof Error && "code" in error && error.code === "composed-too-large");
+});
+
+test("page composition rejects one character over the composed-document limit", () => {
+  const theme = PLATFORM_THEMES.find(item => item.slug === "report")!;
+  const shell = composePageDocument("", theme, "light", ORIGIN);
+  const fragment = "x".repeat(1_500_001 - shell.length);
+  const tooLarge = (error: unknown) => error instanceof Error && "code" in error && error.code === "composed-too-large";
+  assert.throws(() => composePageDocument(fragment, theme, "light", ORIGIN), tooLarge);
+  assert.throws(() => composePageDownload(fragment, theme, "light", ORIGIN), tooLarge);
+});
+test("failed hosted composition installs no delayed connection error or window listener", async () => {
+  const theme = PLATFORM_THEMES.find(item => item.slug === "report")!;
+  const publishedOrigin = "https://example.test";
+  const requestOrigin = "https://alias.test";
+  const shell = composePageDocument("", theme, "light", publishedOrigin);
+  const html = "x".repeat(1_500_000 - shell.length);
+  const viewer = {
+    gated: false, loadUrl: "/_runtime/load", runtime: { kind: "public", path: "/page" },
+    permissions: { read: true, write: false, manage: false, own: false }, documentOrigin: publishedOrigin,
+  };
+  const oldFetch = globalThis.fetch;
+  const oldLocation = Object.getOwnPropertyDescriptor(globalThis, "location");
+  const oldWindow = Object.getOwnPropertyDescriptor(globalThis, "window");
+  const oldSetTimeout = globalThis.setTimeout;
+  const oldClearTimeout = globalThis.clearTimeout;
+  let scheduled = 0;
+  let listeners = 0;
+  const fakeWindow = {
+    addEventListener: () => { listeners++; },
+    removeEventListener: () => { listeners--; },
+  };
+  Object.defineProperty(globalThis, "location", { configurable: true, value: { origin: requestOrigin } });
+  Object.defineProperty(globalThis, "window", { configurable: true, value: fakeWindow });
+  globalThis.setTimeout = ((..._args: Parameters<typeof setTimeout>) => { scheduled++; return 1 as unknown as ReturnType<typeof setTimeout>; }) as typeof setTimeout;
+  globalThis.clearTimeout = ((_timer?: ReturnType<typeof setTimeout>) => {}) as typeof clearTimeout;
+  globalThis.fetch = async () => new Response(JSON.stringify({
+    html,
+    runtime: { grant: "grant" },
+    page: { type: "page", theme: { scope: "platform", slug: "report" }, brandLock: false },
+  }), { headers: { "Content-Type": "application/json" } });
+  try {
+    const opened = await openArtifact(viewer as never);
+    const iframe = {
+      tagName: "IFRAME",
+      setAttribute: () => {},
+      removeAttribute: () => {},
+      style: { removeProperty: () => {} },
+      closest: () => null,
+    } as unknown as HTMLIFrameElement;
+    let cleanup: (() => void) | undefined;
+    let failure: unknown;
+    try { cleanup = mountArtifactFrame(iframe, opened, { origin: viewer.documentOrigin }); } catch (error) { failure = error; }
+    cleanup?.();
+    assert.ok(failure instanceof Error && "code" in failure && failure.code === "composed-too-large");
+    assert.equal(scheduled, 0);
+    assert.equal(listeners, 0);
+  } finally {
+    globalThis.fetch = oldFetch;
+    globalThis.setTimeout = oldSetTimeout;
+    globalThis.clearTimeout = oldClearTimeout;
+    if (oldLocation) Object.defineProperty(globalThis, "location", oldLocation);
+    else Reflect.deleteProperty(globalThis, "location");
+    if (oldWindow) Object.defineProperty(globalThis, "window", oldWindow);
+    else Reflect.deleteProperty(globalThis, "window");
+  }
 });

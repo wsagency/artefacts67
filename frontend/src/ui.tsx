@@ -118,7 +118,13 @@ export function Dialog(props: { title: string; open: boolean; onOpenChange: (ope
     else if (!open && element.open) element.close();
   });
   onSettled(() => () => { if (element.open) element.close(); });
-  return <dialog ref={element} aria-labelledby={id} class="dialog-content grid gap-4 border p-6 shadow-lg sm:rounded-lg" onCancel={event => { event.preventDefault(); props.onOpenChange(false); }} onClose={() => { props.onOpenChange(false); if (returnFocus?.isConnected) returnFocus.focus(); }} onClick={event => { if (event.target !== element) return; const rect = element.getBoundingClientRect(); if (event.clientX < rect.left || event.clientX > rect.right || event.clientY < rect.top || event.clientY > rect.bottom) props.onOpenChange(false); }}><header class="dialog-header"><h2 id={id} class="text-lg font-semibold leading-none tracking-tight">{props.title}</h2><Button variant="ghost" aria-label="Close dialog" onClick={() => props.onOpenChange(false)}>×</Button></header>{props.children}</dialog>;
+  const handleClose = (event: Event) => {
+    // Native close is queued; ignore it if this dialog has already been reopened.
+    if ((event.currentTarget as HTMLDialogElement).open) return;
+    props.onOpenChange(false);
+    if (returnFocus?.isConnected) returnFocus.focus();
+  };
+  return <dialog ref={element} aria-labelledby={id} class="dialog-content grid gap-4 border p-6 shadow-lg sm:rounded-lg" onCancel={event => { event.preventDefault(); props.onOpenChange(false); }} onClose={handleClose} onClick={event => { if (event.target !== element) return; const rect = element.getBoundingClientRect(); if (event.clientX < rect.left || event.clientX > rect.right || event.clientY < rect.top || event.clientY > rect.bottom) props.onOpenChange(false); }}><header class="dialog-header"><h2 id={id} class="text-lg font-semibold leading-none tracking-tight">{props.title}</h2><Button variant="ghost" aria-label="Close dialog" onClick={() => props.onOpenChange(false)}>×</Button></header>{props.children}</dialog>;
 }
 export function Menu(props: { label: string; trigger: JSX.Element; children: JSX.Element; class?: string; align?: 'start' | 'end' }) {
   const id = `menu-${++nextId}`;

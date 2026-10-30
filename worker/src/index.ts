@@ -28,7 +28,7 @@ import { contract } from "./contract.js";
 import { instructionsPage, agentInstructions } from "./instructions.js";
 import { openMailer, type Mailer } from "./mail.js";
 import { handleAuth, handleConsole, legacyAuthRedirect, legacyAdminRedirect } from "./console.js";
-import { homeView, setWebAnalyticsToken } from "./views.js";
+import { homeView, setWebAnalyticsToken, themesPage } from "./views.js";
 import { openArtifactRuntime, type ArtifactRuntime } from "./artifact-runtime.js";
 import { openRuntimeState, type RuntimeState } from "./runtime-state.js";
 import { openProjectData, type ProjectData } from "./project-data.js";
@@ -189,6 +189,8 @@ const responseProgram = (request: Request, env: WorkerEnv, match: RouteMatch): E
         return html(instructionsPage(originOf(env, request), env));
       case "agentInstructions":
         return text(agentInstructions(originOf(env, request), env), 200, { "Cache-Control": "no-store" });
+      case "themes":
+        return html(themesPage(originOf(env, request)));
       default:
         return json({ error: "not_found", handler: match.handler, params: match.params }, 404);
     }

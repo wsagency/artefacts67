@@ -8,6 +8,59 @@ import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
+import { register } from '../../worker/node_modules/tsx/dist/esm/api/index.mjs';
+register({ tsconfig: new URL('../../worker/tsconfig.json', import.meta.url).pathname });
+const { PLATFORM_THEMES } = await import('../src/platform-themes.ts');
+const { PAGE_KIT_CSS: kitCss, PAGE_KIT_RUNTIME: kitRuntime, themeConfigurationScript } = await import('../src/page-kit.ts');
+
+const axeTags = ['wcag2a', 'wcag2aa', 'wcag21a', 'wcag21aa', 'wcag22aa'];
+const axeRows = [];
+const axeIncomplete = [];
+let axeSource;
+const axeWorlds = new Map();
+const axeTargets = new Set();
+const runAxeRow = async (page, send, evaluate, theme, scheme, width, viewportSend = send) => {
+  if (!axeSource) axeSource = await readFile(new URL('../node_modules/axe-core/axe.min.js', import.meta.url), 'utf8');
+  let contextId = axeWorlds.get(send);
+  if (!contextId) {
+    const { frameTree } = await send('Page.getFrameTree');
+    ({ executionContextId: contextId } = await send('Page.createIsolatedWorld', { frameId: frameTree.frame.id, worldName: 'axe-accessibility-check' }));
+    axeWorlds.set(send, contextId);
+  }
+  const axeEvaluate = async expression => {
+    const result = await send('Runtime.evaluate', { expression, contextId, awaitPromise: true, returnByValue: true });
+    if (result.exceptionDetails) throw new Error(result.exceptionDetails.exception?.description ?? result.exceptionDetails.text);
+    return result.result.value;
+  };
+  if (!axeTargets.has(send)) {
+    const injected = await send('Runtime.evaluate', { expression: axeSource, contextId, awaitPromise: true, returnByValue: true });
+    if (injected.exceptionDetails) throw new Error(`axe-core injection failed: ${injected.exceptionDetails.text}`);
+    axeTargets.add(send);
+  }
+  await viewportSend('Emulation.setDeviceMetricsOverride', { width, height: 900, deviceScaleFactor: 1, mobile: width < 500 });
+  const cssViewport = await evaluate('window.innerWidth');
+  assert.equal(cssViewport, width, `Axe row ${page}/${theme.slug}/${scheme} requested ${width}px but rendered at ${cssViewport}px CSS width.`);
+  await evaluate(`(() => {
+    document.documentElement.dataset.a67Theme=${JSON.stringify(theme.slug)};
+    document.documentElement.dataset.theme=${JSON.stringify(scheme)};
+    let style=document.getElementById('__pageAxeTheme');
+    if(!style){style=document.createElement('style');style.id='__pageAxeTheme';document.head.append(style);}
+    style.textContent=${JSON.stringify(theme.css)};
+  })()`);
+  const active = await axeEvaluate(`axe.getRules().flatMap(rule=>rule.tags)`);
+  for (const tag of axeTags) assert(active.includes(tag), `axe-core WCAG tag ${tag} must be active.`);
+  const result = await axeEvaluate(`axe.run(document,{runOnly:{type:'tag',values:${JSON.stringify(axeTags)}}})`);
+  const row = { page, theme: theme.slug, scheme, width, violations: result.violations, incomplete: result.incomplete };
+  axeRows.push(row);
+  assert.equal(row.violations.length, 0, `axe violations in ${page}/${theme.slug}/${scheme}/${width}: ${JSON.stringify(row.violations.map(item=>({id:item.id,help:item.help,nodes:item.nodes.map(node=>node.target)})))}`);
+  axeIncomplete.push(...row.incomplete.map(item=>({page,theme:theme.slug,scheme,width,id:item.id,help:item.help,nodes:item.nodes.map(node=>node.target)})));
+};
+const runAxeThemeMatrix = async (page, send, evaluate, viewportSend = send) => {
+  for (const theme of PLATFORM_THEMES) for (const scheme of ['light','dark']) for (const width of [390,1440]) {
+    await runAxeRow(page, send, evaluate, theme, scheme, width, viewportSend);
+  }
+};
+
 
 const viewer = new URL(process.env.WS_SMOKE_VIEWER ?? '');
 assert(['localhost', '127.0.0.1'].includes(viewer.hostname), 'This mutating check is local-only.');
@@ -30,39 +83,677 @@ try {
   let sequence = 0;
   const requests = new Map();
   let subfolderPosts = 0;
-  socket.addEventListener('message', event => { const message = JSON.parse(event.data); if (message.method === 'Network.requestWillBeSent' && message.params.request.method === 'POST' && new URL(message.params.request.url).pathname.endsWith('/subfolder')) subfolderPosts++; const request = requests.get(message.id); if (request) { requests.delete(message.id); if (message.error) request.reject(new Error(message.error.message)); else request.resolve(message.result); } });
-  const call = (method, params = {}, sessionId) => new Promise((resolve, reject) => { const id = ++sequence; requests.set(id, { resolve, reject }); socket.send(JSON.stringify({ id, method, params, ...(sessionId ? { sessionId } : {}) })); });
+  const runtimeFileResponses = [];
+  let kitSessionId;
+  const kitRequests = [], kitConsoleErrors = [], kitExceptions = [], kitCspViolations = [];
+  const diagnosticsBySession = new Map();
+  const autoAttachHandlers = new Map();
+  const call = (method, params = {}, sessionId) => new Promise((resolve, reject) => { const id = ++sequence; requests.set(id, { resolve, reject, method, contextId: params.contextId, expression: typeof params.expression === 'string' ? params.expression.slice(0, 140) : '' }); socket.send(JSON.stringify({ id, method, params, ...(sessionId ? { sessionId } : {}) })); });
+  const diagnosticsFor = sessionId => {
+    let diagnostics = diagnosticsBySession.get(sessionId);
+    if (!diagnostics) {
+      diagnostics = { requests: [], networkFailures: [], consoleErrors: [], exceptions: [], cspViolations: [], domains: [], captureReady: false };
+      diagnosticsBySession.set(sessionId, diagnostics);
+    }
+    return diagnostics;
+  };
+  const enableDiagnostics = async (sessionId, domains) => {
+    const diagnostics = diagnosticsFor(sessionId);
+    for (const domain of domains) {
+      await call(`${domain}.enable`, {}, sessionId);
+      diagnostics.domains.push(domain);
+    }
+    diagnostics.captureReady = true;
+    return diagnostics;
+  };
+  const externalRequestUrls = urls => urls.filter(url => {
+    const resource = new URL(url);
+    return (resource.protocol === 'http:' || resource.protocol === 'https:') && resource.origin !== viewer.origin;
+  });
+  const autoAttachFrames = async (targetId, retainedSessionIds) => {
+    const sessions = new Map(), setups = new Map(), targetInfos = new Map(), setupErrors = [];
+    autoAttachHandlers.set(undefined, message => {
+      const { sessionId, targetInfo, waitingForDebugger } = message.params;
+      targetInfos.set(targetInfo.targetId, targetInfo);
+      if (targetInfo.type === 'iframe') retainedSessionIds?.add(sessionId);
+      sessions.set(targetInfo.targetId, sessionId);
+      const setup = (async () => {
+        const diagnostics = targetInfo.type === 'iframe' ? await enableDiagnostics(sessionId, ['Page', 'Network', 'Runtime', 'Log']) : null;
+        if (diagnostics) {
+          diagnostics.targetInfo = targetInfo;
+          diagnostics.waitingForDebugger = waitingForDebugger === true;
+        }
+        if (waitingForDebugger) await call('Runtime.runIfWaitingForDebugger', {}, sessionId);
+      })().catch(error => { setupErrors.push(`${targetInfo.targetId}: ${error.message}`); });
+      setups.set(targetInfo.targetId, setup);
+    });
+    await call('Target.autoAttachRelated', { targetId, waitForDebuggerOnStart: true, filter: [{ type: 'page' }, { type: 'iframe' }] });
+    return { sessions, setups, targetInfos, setupErrors };
+  };
+  socket.addEventListener('message', event => {
+    const message = JSON.parse(event.data);
+    const diagnostic = diagnosticsBySession.get(message.sessionId);
+    if (diagnostic) {
+      if (message.method === 'Network.requestWillBeSent') diagnostic.requests.push(message.params.request.url);
+      if (message.method === 'Network.loadingFailed') diagnostic.networkFailures.push({ error: message.params.errorText, blockedReason: message.params.blockedReason ?? null });
+      if (message.method === 'Runtime.consoleAPICalled' && message.params.type === 'error') diagnostic.consoleErrors.push(message.params.args.map(arg => arg.value ?? arg.description).join(' '));
+      if (message.method === 'Runtime.exceptionThrown') diagnostic.exceptions.push(message.params.exceptionDetails.exception?.description ?? message.params.exceptionDetails.text);
+      if (message.method === 'Log.entryAdded' && (message.params.entry.source === 'security' || /content security policy/i.test(message.params.entry.text))) diagnostic.cspViolations.push(message.params.entry.text);
+    }
+    const autoAttachHandler = autoAttachHandlers.get(message.sessionId);
+    if (message.method === 'Target.attachedToTarget' && autoAttachHandler) autoAttachHandler(message);
+    if (message.sessionId === kitSessionId) {
+      if (message.method === 'Network.requestWillBeSent') kitRequests.push(message.params.request.url);
+      if (message.method === 'Runtime.consoleAPICalled' && message.params.type === 'error') kitConsoleErrors.push(message.params.args.map(arg => arg.value ?? arg.description).join(' '));
+      if (message.method === 'Runtime.exceptionThrown') kitExceptions.push(message.params.exceptionDetails.exception?.description ?? message.params.exceptionDetails.text);
+      if (message.method === 'Log.entryAdded' && (message.params.entry.source === 'security' || /content security policy/i.test(message.params.entry.text))) kitCspViolations.push(message.params.entry.text);
+    }
+    if (message.method === 'Network.requestWillBeSent' && message.params.request.method === 'POST' && new URL(message.params.request.url).pathname.endsWith('/subfolder')) subfolderPosts++;
+    if (message.method === 'Network.responseReceived' && new URL(message.params.response.url).pathname.startsWith('/_runtime/files/')) {
+      const headers = message.params.response.headers;
+      const disposition = Object.entries(headers).find(([name]) => name.toLowerCase() === 'content-disposition')?.[1];
+      runtimeFileResponses.push({ url: message.params.response.url, status: message.params.response.status, disposition });
+    }
+    const request = requests.get(message.id);
+    if (request) {
+      requests.delete(message.id);
+      if (message.error) request.reject(new Error(`${request.method}${request.contextId ? ` (context ${request.contextId})` : ''}${request.expression ? ` [${request.expression}]` : ''}: ${message.error.message}`));
+      else request.resolve(message.result);
+    }
+  });
   const { targetId } = await call('Target.createTarget', { url: 'about:blank' });
   const { sessionId } = await call('Target.attachToTarget', { targetId, flatten: true });
   const command = (method, params) => call(method, params, sessionId);
   await command('Network.enable');
   await command('Network.setCookie', { name: 'wsa_session', value: process.env.WS_SMOKE_SESSION, url: viewer.origin, httpOnly: true, sameSite: 'Lax' });
   await command('Page.enable');
+  await command('Page.addScriptToEvaluateOnNewDocument', { source: `(() => {
+    const NativeChannel = MessageChannel;
+    Object.defineProperty(window, '__pageSmokeChannels', { value: [] });
+    window.MessageChannel = class extends NativeChannel {
+      constructor() { super(); window.__pageSmokeChannels.push(this.port1); }
+    };
+    let pendingReady;
+    window.addEventListener('message', event => {
+      if (window.top === window && sessionStorage.getItem('__holdPageReaderReady') === 'true' && !pendingReady && event.data?.type === 'artefacts:ready') {
+        event.stopImmediatePropagation();
+        pendingReady = event;
+        window.__pagePendingReady = () => {
+          pendingReady = undefined;
+          sessionStorage.removeItem('__holdPageReaderReady');
+          window.__pagePendingReadyData = event.data;
+        };
+      }
+    }, true);
+  })();` });
   await command('Page.navigate', { url: viewer.href });
   const evaluate = async (expression, contextId, send = command) => { const result = await send('Runtime.evaluate', { expression, awaitPromise: true, returnByValue: true, ...(contextId ? { contextId } : {}) }); if (result.exceptionDetails) throw new Error(result.exceptionDetails.exception?.description ?? result.exceptionDetails.text); return result.result.value; };
   const until = async (expression, contextId, send = command, timeout = 15000) => { const deadline = Date.now() + timeout; do { if (await evaluate(expression, contextId, send)) return; await delay(50); } while (Date.now() < deadline); throw new Error(`Reader condition failed: ${expression}`); };
+  let cspProbeTarget, cspProbeAutoAttach, cspProbeSession, cspProbeDiagnostics, probeCommand;
+  try {
+    cspProbeTarget = await call('Target.createTarget', { url: 'about:blank' });
+    cspProbeAutoAttach = await autoAttachFrames(cspProbeTarget.targetId);
+    const attachDeadline = Date.now() + 5000;
+    while (!cspProbeAutoAttach.sessions.has(cspProbeTarget.targetId) && Date.now() < attachDeadline) await delay(25);
+    assert(cspProbeAutoAttach.sessions.has(cspProbeTarget.targetId), 'The CSP probe page must attach before it is navigated.');
+    cspProbeSession = cspProbeAutoAttach.sessions.get(cspProbeTarget.targetId);
+    await cspProbeAutoAttach.setups.get(cspProbeTarget.targetId);
+    await call('Page.enable', {}, cspProbeSession);
+    cspProbeDiagnostics = await enableDiagnostics(cspProbeSession, ['Network', 'Runtime', 'Log']);
+    cspProbeDiagnostics.targetInfo = cspProbeAutoAttach.targetInfos.get(cspProbeTarget.targetId);
+    cspProbeDiagnostics.domains.unshift('Page');
+    probeCommand = (method, params) => call(method, params, cspProbeSession);
+    const blockedChild = `<!doctype html><script>window.__pageSmokeCspEvents=[];window.addEventListener('securitypolicyviolation',event=>window.__pageSmokeCspEvents.push({blockedURI:event.blockedURI,violatedDirective:event.violatedDirective}))</script><meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'none'"><script>window.__cspProbeExecuted=true</script>`;
+    const escapedChild = blockedChild.replaceAll('&', '&amp;').replaceAll('"', '&quot;').replaceAll('<', '&lt;');
+    const probeHtml = `<!doctype html><iframe sandbox="allow-scripts" srcdoc="${escapedChild}"></iframe>`;
+    await probeCommand('Page.navigate', { url: `data:text/html;charset=utf-8,${encodeURIComponent(probeHtml)}` });
+    await until('!!document.querySelector("iframe")', undefined, probeCommand);
+    const rootFrameId = (await probeCommand('Page.getFrameTree')).frameTree.frame.id;
+    const deadline = Date.now() + 5000;
+    let probeDiagnostics = [], probeFrames = [];
+    do {
+      await Promise.all(cspProbeAutoAttach.setups.values());
+      probeFrames = [...cspProbeAutoAttach.targetInfos.entries()].filter(([, targetInfo]) => targetInfo.type === 'iframe' && targetInfo.parentFrameId === rootFrameId);
+      probeDiagnostics = [cspProbeDiagnostics, ...probeFrames.map(([targetId]) => diagnosticsBySession.get(cspProbeAutoAttach.sessions.get(targetId))).filter(Boolean)];
+      if (probeDiagnostics.some(diagnostics => diagnostics.cspViolations.length > 0)) break;
+      await delay(50);
+    } while (Date.now() < deadline);
+    assert.deepEqual(cspProbeDiagnostics.domains, ['Page', 'Network', 'Runtime', 'Log'], 'Parent diagnostics must be armed before probe navigation.');
+    assert(probeDiagnostics.some(diagnostics => diagnostics.cspViolations.some(text => /Content Security Policy|content security policy/i.test(text))), 'The startup CSP canary must be captured before an opaque srcdoc resumes.');
+    const attachedProbeFrames = probeFrames.map(([targetId]) => diagnosticsBySession.get(cspProbeAutoAttach.sessions.get(targetId))).filter(Boolean);
+    assert(attachedProbeFrames.length > 0, 'The opaque CSP canary must attach a child target.');
+    assert(attachedProbeFrames.every(diagnostics => diagnostics.captureReady), 'Child Network, Runtime, and Log domains must be enabled and retained.');
+    const probeFrameSession = cspProbeAutoAttach.sessions.get(probeFrames[0][0]);
+    const probeFrameCommand = (method, params) => call(method, params, probeFrameSession);
+    const probeFrameCspEvents = await evaluate('window.__pageSmokeCspEvents', undefined, probeFrameCommand);
+    assert(probeFrameCspEvents.some(event => /script-src/.test(event.violatedDirective)), 'The startup CSP violation must be recorded by a listener in the child before its policy is parsed.');
+    assert.equal(await evaluate('window.__cspProbeExecuted === true', undefined, probeFrameCommand), false, 'The canary CSP must continue blocking inline script.');
+    assert.deepEqual(externalRequestUrls(await evaluate('performance.getEntriesByType("resource").map(entry => entry.name)', undefined, probeFrameCommand)), [], 'The canary child must have no external resource requests.');
+    assert.deepEqual(externalRequestUrls(probeDiagnostics.flatMap(diagnostics => diagnostics.requests)), [], 'The startup CSP canary must not make external requests.');
+    console.log('CDP startup smoke: opaque srcdoc CSP event captured before load and child resources accounted');
+  } finally {
+    autoAttachHandlers.delete(undefined);
+    if (cspProbeTarget) await call('Target.closeTarget', { targetId: cspProbeTarget.targetId });
+    for (const attachedSessionId of new Set(cspProbeAutoAttach?.sessions.values() ?? [])) {
+      await call('Target.detachFromTarget', { sessionId: attachedSessionId }).catch(() => {});
+    }
+  }
+  // Exercise the platform CSS with an isolated static document, rather than an authored site.
+  const bindingSdk = String.raw`<script>
+window.__a67PageKit = { canWriteRecords: true };
+globalThis.bindingCalls = [];
+globalThis.salesRecord = { id: "sale-1", collection: "sales", version: 1, data: { title: "January", amount: 7 } };
+const salesSchema = { name: "sales", kind: "records", visitors: true, fields: { title: { type: "text", required: true }, amount: { type: "number" } } };
+window.artefacts = {
+  storage: {
+    get: async (key, options) => { bindingCalls.push({ op: "storage.get", key, scope: options.scope }); return ["chapter-1"]; },
+    set: async (key, value, options) => { bindingCalls.push({ op: "storage.set", key, value, scope: options.scope }); },
+  },
+  data: {
+    schema: async collection => {
+      if (collection === "private") throw Object.assign(new Error("Denied"), { code: "forbidden" });
+      if (collection === "pending") return new Promise(resolve => { globalThis.resolvePendingSchema = () => resolve(salesSchema); });
+      if (collection === "rsvp") return { name: "rsvp", kind: "responses", visitors: true, fields: { email: { type: "email", required: true } } };
+      return salesSchema;
+    },
+    list: async collection => {
+      if (collection === "broken") throw new Error("Records unavailable.");
+      if (collection === "empty") return { records: [], cursor: null };
+      return { records: [salesRecord], cursor: null };
+    },
+    get: async () => salesRecord,
+    update: async (_collection, _id, data, options) => {
+      bindingCalls.push({ op: "data.update", data, version: options.ifVersion });
+      salesRecord = { ...salesRecord, version: salesRecord.version + 1, data: { ...data, amount: Number(data.amount) } };
+      return salesRecord;
+    },
+    submit: async (collection, form) => {
+      bindingCalls.push({ op: "data.submit", collection, data: Object.fromEntries(new FormData(form)) });
+      return { id: "smoke-response" };
+    },
+  },
+};
+</script>`;
+  const photo = (await readFile(new URL('../../worker/test/fixtures/page-photo.jpg', import.meta.url))).toString('base64');
+  const staticTarget = await call('Target.createTarget', { url: 'about:blank' });
+  const staticAttached = await call('Target.attachToTarget', { targetId: staticTarget.targetId, flatten: true });
+  const staticCommand = (method, params) => call(method, params, staticAttached.sessionId);
+  kitSessionId = staticAttached.sessionId;
+  await staticCommand('Page.enable');
+  await staticCommand('Runtime.enable');
+  await staticCommand('Network.enable');
+  await staticCommand('Log.enable');
+  const { frameTree: staticTree } = await staticCommand('Page.getFrameTree');
+  const staticHtml = `<!doctype html><html lang="en" data-theme="light"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="color-scheme" content="light dark"><style>${kitCss}</style></head><body><main><header data-variant="hero"><div><h1>Static report</h1><p data-tone="muted">Responsive page-kit smoke content.</p></div><figure><img id="photo" alt="Smoke fixture photo" width="640" height="480" src="data:image/jpeg;base64,${photo}"><figcaption>JPEG photo</figcaption></figure></header><section data-variant="grid"><article data-tone="info"><h2>Information</h2><p>Readable content remains visible.</p></article><article data-tone="ok"><h2>Healthy</h2><p>Status text remains visible.</p></article></section><details><summary>More information</summary><p id="details-content">Print-visible details.</p></details><button type="button">Screen action</button></main></body></html>`;
+  await staticCommand('Page.setDocumentContent', { frameId: staticTree.frame.id, html: staticHtml });
+  const staticEvaluate = async expression => evaluate(expression, undefined, staticCommand);
+  for (const width of [320, 390, 1440]) {
+    await staticCommand('Emulation.setDeviceMetricsOverride', { width, height: 900, deviceScaleFactor: 1, mobile: width < 500 });
+    await until(`document.readyState === "complete" && !!document.querySelector("#photo")`, undefined, staticCommand);
+    const layout = await staticEvaluate(`(() => { const image=document.querySelector("#photo"); return { viewport:innerWidth, page:document.documentElement.scrollWidth, image:image.getBoundingClientRect().width, container:image.parentElement.getBoundingClientRect().width, loaded:image.complete && image.naturalWidth>0, columns:getComputedStyle(document.querySelector('[data-variant="grid"]')).gridTemplateColumns }; })()`);
+    assert.equal(layout.viewport, width);
+    assert(layout.page <= width, `Page-kit content overflows at ${width}px: ${layout.page}px.`);
+    assert(layout.image <= layout.container, `JPEG overflows its figure at ${width}px: ${layout.image}px > ${layout.container}px.`);
+    assert(layout.loaded, 'Inline JPEG fixture must render.');
+    if (width < 500) assert.equal(layout.columns.split(' ').length, 1, `Grid must reflow at ${width}px.`);
+  }
+  const inversePalette = await staticEvaluate('(() => { const main=document.querySelector("main"), accentReference=document.createElement("span"), foregroundReference=document.createElement("span"); accentReference.style.backgroundColor="var(--a67-accent)"; foregroundReference.style.color="var(--a67-on-accent)"; main.append(accentReference,foregroundReference); const entries=[["plain",null],["band","band"],["full-bleed","full-bleed"]].map(([name,variant])=>{ const container=document.createElement("section"); container.dataset.tone="inverse"; if(variant)container.dataset.variant=variant; container.innerHTML="<h2>Inverse heading</h2><p>Inverse body text</p><a href=\\"#\\">Inverse link</a>"; main.append(container); return {name,container}; }); const luminance=color=>{ const [red,green,blue]=color.match(/[\\d.]+/g).map(Number).map(channel=>channel/255).map(channel=>channel<=0.04045?channel/12.92:((channel+0.055)/1.055)**2.4); return 0.2126*red+0.7152*green+0.0722*blue; }; const contrast=(background,foreground)=>{ const values=[luminance(background),luminance(foreground)].sort((a,b)=>b-a); return (values[0]+0.05)/(values[1]+0.05); }; const colors=[]; for(const theme of ["light","dark"]){ document.documentElement.dataset.theme=theme; const expectedBackground=getComputedStyle(accentReference).backgroundColor, expectedForeground=getComputedStyle(foregroundReference).color; for(const {name,container} of entries){ const background=getComputedStyle(container).backgroundColor, foreground=getComputedStyle(container).color, body=getComputedStyle(container.querySelector("p")).color; colors.push({theme,name,expectedBackground,expectedForeground,background,foreground,body,heading:getComputedStyle(container.querySelector("h2")).color,link:getComputedStyle(container.querySelector("a")).color,contrast:contrast(background,body)}); } } return colors; })()');
+  for (const palette of inversePalette) {
+    assert.equal(palette.background, palette.expectedBackground, `${palette.theme} ${palette.name} inverse container accent background`);
+    assert.equal(palette.foreground, palette.expectedForeground, `${palette.theme} ${palette.name} inverse container on-accent foreground`);
+    assert.equal(palette.body, palette.expectedForeground, `${palette.theme} ${palette.name} inverse body foreground`);
+    assert.equal(palette.heading, palette.expectedForeground, `${palette.theme} ${palette.name} inverse heading foreground`);
+    assert.equal(palette.link, palette.expectedForeground, `${palette.theme} ${palette.name} inverse link foreground`);
+    assert(palette.contrast >= 4.5, `${palette.theme} ${palette.name} inverse body contrast must be at least 4.5:1; got ${palette.contrast}`);
+  }
+  console.log('page kit inverse palette static smoke: plain/band/full-bleed light/dark container and body colors, heading/link foregrounds and contrast passed');
+  await staticEvaluate('document.documentElement.dataset.theme="light"');
+  await staticCommand('Emulation.setEmulatedMedia', { features: [{ name: 'prefers-reduced-motion', value: 'reduce' }] });
+  assert(await staticEvaluate('matchMedia("(prefers-reduced-motion: reduce)").matches'));
+  assert(await staticEvaluate('getComputedStyle(document.querySelector("main")).transitionDuration === "0s"'));
+  await staticCommand('Emulation.setEmulatedMedia', { media: 'print' });
+  const printState = await staticEvaluate('(() => { const details=document.querySelector("details"), content=document.querySelector("#details-content"); return { closed:!details.open, display:getComputedStyle(content).display, container:getComputedStyle(details,"::details-content").contentVisibility, height:content.getBoundingClientRect().height, main:getComputedStyle(document.querySelector("main")).visibility, action:getComputedStyle(document.querySelector("button")).display, color:getComputedStyle(document.body).color, background:getComputedStyle(document.body).backgroundColor }; })()');
+  assert(printState.closed, 'The print disclosure fixture must be closed.');
+  assert.notEqual(printState.display, 'none');
+  assert.equal(printState.container, 'visible', 'Closed details content container must be visible in print.');
+  assert(printState.height > 0, 'Meaningful disclosure content must participate in print layout.');
+  assert.equal(printState.main, 'visible');
+  assert.equal(printState.action, 'none', 'Screen-only actions are hidden in print.');
+  assert.equal(printState.color, 'rgb(0, 0, 0)');
+  assert.equal(printState.background, 'rgb(255, 255, 255)');
+  await staticCommand('Emulation.setEmulatedMedia', { media: '' });
+  console.log('page kit static smoke: JPEG at 320/390/1440, print and reduced motion passed');
+  for (const theme of PLATFORM_THEMES) for (const scheme of ['light', 'dark']) {
+    const compiledHtml = `<!doctype html><html lang="en" data-a67-theme="${theme.slug}" data-theme="${scheme}"><head><meta name="color-scheme" content="light dark"><meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data:; font-src data:; connect-src 'none'; form-action 'none'; base-uri 'none'; object-src 'none'; frame-src 'none'; worker-src 'none'"><style>${kitCss}${theme.css}</style></head><body><main><section data-tone="inverse"><header data-variant="hero" data-style="aurora"><div><h1>Theme smoke</h1><p>Readable page content.</p></div><figure><span>Direct figure label</span><h2>Figure heading</h2><h2 data-tone="inverse">Inverse figure heading</h2><svg viewBox="0 0 8 8"><rect width="8" height="8" fill="#000000"/><text x="1" y="4" fill="#ffffff">Vector text</text></svg><p>Figure note <a href="#">Figure link</a></p><div><section data-variant="band" data-tone="inverse"><h2>Nested inverse heading</h2><a href="#">Nested inverse link</a></section></div><figcaption>Decorative caption</figcaption><figcaption data-tone="inverse"><a href="#">Inverse caption link</a></figcaption></figure></header><a67-kpi data-style="glow" label="Metric" value="42"></a67-kpi></section><header data-variant="hero" data-style="aurora" data-tone="inverse"><div><h1>Inverse header</h1></div><figure><span>Header inverse figure label</span><p>Header inverse note <a href="#">Header inverse link</a></p></figure></header><button type="button">Action</button></main><script>${kitRuntime}</script><script>${themeConfigurationScript(theme)}</script></body></html>`;
+    const semanticSurfaces = '<section id="inverse-surfaces" data-tone="inverse"><h2 id="inverse-heading">Inverse heading</h2><pre id="inverse-pre"><code id="inverse-code">code sample</code></pre><table><thead><tr><th id="inverse-head">Header</th></tr></thead><tbody><tr><td>First row</td></tr><tr id="inverse-stripe"><td>Striped row<h2 id="inverse-stripe-heading">Stripe heading</h2></td></tr></tbody></table><section data-variant="grid" id="density-grid"><div>One</div><div>Two</div></section></section>';
+    const responsiveCompiledHtml = compiledHtml.replace('<section data-tone="inverse"><header', '<section><header').replace('<head>', '<head><meta name="viewport" content="width=device-width, initial-scale=1">').replace('<main>', '<main>' + semanticSurfaces);
+    await staticCommand('Page.setDocumentContent', { frameId: staticTree.frame.id, html: responsiveCompiledHtml });
+    await until('document.readyState === "complete" && !!document.querySelector("header[data-style=aurora] > figure") && !!document.querySelector("a67-kpi > [role=group] > [data-a67-kpi-value]")', undefined, staticCommand);
+    const themeState = await staticEvaluate(`(() => {
+      const styles = document.querySelector("style").sheet;
+      const root = getComputedStyle(document.documentElement);
+      const caption = getComputedStyle(document.querySelector("figcaption"));
+      const auroraFigure = document.querySelector("header[data-variant=hero][data-style=aurora] > figure");
+      const figure = getComputedStyle(auroraFigure, "::before");
+      const figureStyle = getComputedStyle(auroraFigure);
+      const directFigureText = getComputedStyle(document.querySelector("figure > span"));
+      const figureParagraph = getComputedStyle(document.querySelector("figure > p"));
+      const figureSvg = getComputedStyle(document.querySelector("figure > svg"));
+      const figureSvgText = getComputedStyle(document.querySelector("figure svg text"));
+      const figureHeading = getComputedStyle(document.querySelector("figure > h2:not([data-tone])"));
+      const inverseFigureHeading = getComputedStyle(document.querySelector("figure > h2[data-tone=inverse]"));
+      const inverseFigureCaption = getComputedStyle(document.querySelector("figure > figcaption[data-tone=inverse]"));
+      const inverseFigureCaptionLink = getComputedStyle(document.querySelector("figure > figcaption[data-tone=inverse] a"));
+      const figureLink = getComputedStyle(document.querySelector("figure > p a"));
+      const nestedInverse = document.querySelector("figure > div > [data-tone=inverse]");
+      const nestedInverseStyle = getComputedStyle(nestedInverse);
+      const nestedInverseHeading = getComputedStyle(nestedInverse.querySelector("h2"));
+      const nestedInverseLink = getComputedStyle(nestedInverse.querySelector("a"));
+      const headerInverseFigure = document.querySelector("header[data-tone=inverse] > figure");
+      const headerInverseFigureStyle = getComputedStyle(headerInverseFigure);
+      const headerInverseLink = getComputedStyle(headerInverseFigure.querySelector("a"));
+      const kpi = document.querySelector("a67-kpi[data-style=glow]");
+      const kpiBlock = kpi.querySelector(':scope > [role="group"]');
+      const kpiStyle = getComputedStyle(kpiBlock);
+      const kpiValue = getComputedStyle(kpiBlock.querySelector("[data-a67-kpi-value]"));
+      const button = getComputedStyle(document.querySelector("main > button"));
+      const channels = color => {
+        const modern = /^color\\(srgb\\s+([\\d.]+)\\s+([\\d.]+)\\s+([\\d.]+)(?:\\s*\\/\\s*[\\d.]+)?\\)$/.exec(color);
+        if (modern) return modern.slice(1, 4).map(Number);
+        const legacy = /^rgba?\\(\\s*([\\d.]+)[,\\s]+([\\d.]+)[,\\s]+([\\d.]+)/.exec(color);
+        if (legacy) return legacy.slice(1, 4).map(value => Number(value) / 255);
+        throw new Error('Unsupported computed color syntax: ' + color);
+      };
+      const luminance = color => { const rgb = channels(color).map(value => value <= .04045 ? value / 12.92 : ((value + .055) / 1.055) ** 2.4); return rgb[0] * .2126 + rgb[1] * .7152 + rgb[2] * .0722; };
+      const contrast = (first, second) => { const a=luminance(first), b=luminance(second); return (Math.max(a,b)+.05)/(Math.min(a,b)+.05); };
+      if (Math.abs(contrast('color(srgb 1 1 1)', 'color(srgb 0 0 0)') - 21) > .01) throw new Error('Modern computed-color contrast parsing failed.');
+      const inverseSection = getComputedStyle(document.querySelector("#inverse-surfaces"));
+      const inverseHeading = getComputedStyle(document.querySelector("#inverse-heading"));
+      const inverseCode = getComputedStyle(document.querySelector("#inverse-code"));
+      const inversePre = getComputedStyle(document.querySelector("#inverse-pre"));
+      const inverseHead = getComputedStyle(document.querySelector("#inverse-head"));
+      const inverseThead = getComputedStyle(document.querySelector("#inverse-head").parentElement.parentElement);
+      const inverseStripe = getComputedStyle(document.querySelector("#inverse-stripe"));
+      const stripeCell = getComputedStyle(document.querySelector("#inverse-stripe td"));
+      const inverseStripeHeading = getComputedStyle(document.querySelector("#inverse-stripe-heading"));
+      const grid = document.querySelector("#density-grid");
+      document.documentElement.style.setProperty("--a67-density","0.75");
+      const compactGap = parseFloat(getComputedStyle(grid).columnGap);
+      document.documentElement.style.setProperty("--a67-density","1.25");
+      const expandedGap = parseFloat(getComputedStyle(grid).columnGap);
+      document.documentElement.style.removeProperty("--a67-density");
+      return {
+        bg: root.getPropertyValue("--a67-bg").trim(),
+        ink: root.getPropertyValue("--a67-ink").trim(),
+        figureBackground: figureStyle.backgroundColor,
+        figureColor: figureStyle.color,
+        directFigureTextBackground: directFigureText.backgroundColor,
+        directFigureTextColor: directFigureText.color,
+        figureHeadingColor: figureHeading.color,
+        figureLinkColor: figureLink.color,
+        figureLinkContrast: contrast(figureLink.color, figureStyle.backgroundColor),
+        figureSvgTextFill: figureSvgText.fill,
+        captionBackground: caption.backgroundColor,
+        inverseFigureHeadingBackground: inverseFigureHeading.backgroundColor,
+        inverseFigureHeadingColor: inverseFigureHeading.color,
+        inverseFigureHeadingContrast: contrast(inverseFigureHeading.color, inverseFigureHeading.backgroundColor),
+        inverseFigureCaptionBackground: inverseFigureCaption.backgroundColor,
+        inverseFigureCaptionColor: inverseFigureCaption.color,
+        inverseFigureCaptionLinkColor: inverseFigureCaptionLink.color,
+        inverseFigureCaptionContrast: contrast(inverseFigureCaptionLink.color, inverseFigureCaption.backgroundColor),
+        captionColor: caption.color,
+        figureParagraphBackground: figureParagraph.backgroundColor,
+        figureParagraphColor: figureParagraph.color,
+        figureSvgBackground: figureSvg.backgroundColor,
+        nestedInverseBackground: nestedInverseStyle.backgroundColor,
+        nestedInverseHeadingColor: nestedInverseHeading.color,
+        nestedInverseLinkColor: nestedInverseLink.color,
+        nestedInverseHeadingContrast: contrast(nestedInverseHeading.color, nestedInverseStyle.backgroundColor),
+        nestedInverseLinkContrast: contrast(nestedInverseLink.color, nestedInverseStyle.backgroundColor),
+        headerInverseFigureBackground: headerInverseFigureStyle.backgroundColor,
+        headerInverseFigureColor: headerInverseFigureStyle.color,
+        headerInverseLinkColor: headerInverseLink.color,
+        gradient: figure.backgroundImage,
+        glow: kpiStyle.boxShadow,
+        kpiDisplay: kpiStyle.display,
+        kpiBackground: kpiStyle.backgroundColor,
+        kpiColor: kpiValue.color,
+        buttonColor: button.color,
+        buttonBackground: button.backgroundColor,
+        captionContrast: contrast(caption.color, caption.backgroundColor),
+        figureParagraphContrast: contrast(figureParagraph.color, figureParagraph.backgroundColor),
+        kpiContrast: contrast(kpiValue.color, kpiStyle.backgroundColor),
+        buttonContrast: contrast(button.color, button.backgroundColor),
+        rules: styles.cssRules.length,
+        inverseHeadingColor: inverseHeading.color,
+        inverseHeadingContrast: contrast(inverseHeading.color, inverseSection.backgroundColor),
+        inversePreBackground: inversePre.backgroundColor,
+        inversePreColor: inversePre.color,
+        inversePreContrast: contrast(inversePre.color, inversePre.backgroundColor),
+        inverseCodeColor: inverseCode.color,
+        inverseCodeContrast: contrast(inverseCode.color, inversePre.backgroundColor),
+        inverseHeadBackground: inverseThead.backgroundColor,
+        inverseHeadColor: inverseHead.color,
+        inverseHeadContrast: contrast(inverseHead.color, inverseThead.backgroundColor),
+        inverseStripeBackground: inverseStripe.backgroundColor,
+        inverseStripeColor: stripeCell.color,
+        inverseStripeContrast: contrast(stripeCell.color, inverseStripe.backgroundColor),
+        inverseStripeHeadingColor: inverseStripeHeading.color,
+        inverseStripeHeadingContrast: contrast(inverseStripeHeading.color, inverseStripe.backgroundColor),
+        densityGapRatio: expandedGap / compactGap,
+      };
+    })()`);
+    const expected = theme.tokens[scheme];
+    const rgb = value => `rgb(${parseInt(value.slice(1, 3), 16)}, ${parseInt(value.slice(3, 5), 16)}, ${parseInt(value.slice(5, 7), 16)})`;
+    const expectedSurface = rgb(expected.surface);
+    const expectedInk = rgb(expected.ink);
+    const expectedAccent = rgb(expected.accent);
+    const expectedAccentInk = rgb(expected["accent-ink"]);
+    const expectedOnAccent = rgb(expected["on-accent"]);
+    assert.equal(themeState.bg, expected.bg, `${theme.slug} ${scheme} canvas token`);
+    assert.equal(themeState.ink, expected.ink, `${theme.slug} ${scheme} ink token`);
+    assert(themeState.glow.includes('inset'), `${theme.slug} ${scheme} glow effect must parse`);
+    assert.equal(themeState.kpiDisplay, 'block', `${theme.slug} ${scheme} glow applies to the generated KPI group block`);
+    assert.equal(themeState.kpiBackground, expectedSurface, `${theme.slug} ${scheme} glow surface is opaque`);
+    assert.equal(themeState.kpiColor, expectedInk, `${theme.slug} ${scheme} inverse KPI text uses its checked ink/surface pair`);
+    assert(themeState.kpiContrast >= 4.5, `${theme.slug} ${scheme} rendered KPI contrast`);
+    assert.equal(themeState.figureBackground, expectedSurface, `${theme.slug} ${scheme} aurora figure has an opaque base behind direct text and gradient`);
+    assert.equal(themeState.figureColor, expectedInk, `${theme.slug} ${scheme} inverse direct figure text uses its checked ink/surface pair`);
+    assert.equal(themeState.figureParagraphBackground, expectedSurface, `${theme.slug} ${scheme} figure paragraph opaque surface`);
+    assert.equal(themeState.figureParagraphColor, expectedInk, `${theme.slug} ${scheme} inverse figure paragraph text uses its checked ink/surface pair`);
+    assert.equal(themeState.figureHeadingColor, expectedInk, `${theme.slug} ${scheme} inverse figure heading text uses its checked ink/surface pair`);
+    assert.equal(themeState.inverseFigureHeadingBackground, expectedAccent, `${theme.slug} ${scheme} direct inverse aurora heading retains accent background`);
+    assert.equal(themeState.inverseFigureHeadingColor, expectedOnAccent, `${theme.slug} ${scheme} direct inverse aurora heading retains on-accent foreground`);
+    assert(themeState.inverseFigureHeadingContrast >= 4.5, `${theme.slug} ${scheme} direct inverse aurora heading contrast`);
+    assert.equal(themeState.inverseFigureCaptionBackground, expectedAccent, `${theme.slug} ${scheme} inverse aurora caption retains accent background`);
+    assert.equal(themeState.inverseFigureCaptionColor, expectedOnAccent, `${theme.slug} ${scheme} inverse aurora caption retains on-accent foreground`);
+    assert.equal(themeState.inverseFigureCaptionLinkColor, expectedOnAccent, `${theme.slug} ${scheme} inverse aurora caption link retains on-accent foreground`);
+    assert(themeState.inverseFigureCaptionContrast >= 4.5, `${theme.slug} ${scheme} inverse aurora caption link contrast`);
+    assert.equal(themeState.figureLinkColor, expectedAccentInk, `${theme.slug} ${scheme} unwrapped figure link uses the kit accent-ink token`);
+    assert(themeState.figureLinkContrast >= 4.5, `${theme.slug} ${scheme} rendered figure-link contrast against its opaque surface`);
+    assert.equal(themeState.directFigureTextBackground, expectedSurface, `${theme.slug} ${scheme} wrapped direct figure text has an opaque surface`);
+    assert.equal(themeState.directFigureTextColor, expectedInk, `${theme.slug} ${scheme} wrapped direct figure text uses checked ink`);
+    assert.equal(themeState.nestedInverseBackground, expectedAccent, `${theme.slug} ${scheme} nested inverse region retains accent surface`);
+    assert.equal(themeState.nestedInverseHeadingColor, expectedOnAccent, `${theme.slug} ${scheme} nested inverse heading retains on-accent foreground`);
+    assert.equal(themeState.nestedInverseLinkColor, expectedOnAccent, `${theme.slug} ${scheme} nested inverse link retains on-accent foreground`);
+    assert(themeState.nestedInverseHeadingContrast >= 4.5, `${theme.slug} ${scheme} nested inverse heading contrast`);
+    assert(themeState.nestedInverseLinkContrast >= 4.5, `${theme.slug} ${scheme} nested inverse link contrast`);
+    assert.equal(themeState.headerInverseFigureBackground, expectedSurface, `${theme.slug} ${scheme} inverse hero header's figure remains on an opaque surface`);
+    assert.equal(themeState.headerInverseFigureColor, expectedInk, `${theme.slug} ${scheme} inverse hero header figure uses checked ink`);
+    assert.equal(themeState.headerInverseLinkColor, expectedInk, `${theme.slug} ${scheme} inverse hero header figure link uses checked ink`);
+    assert.equal(themeState.figureSvgBackground, expectedSurface, `${theme.slug} ${scheme} SVG figure opaque surface`);
+    assert.equal(themeState.figureSvgTextFill, 'rgb(255, 255, 255)', `${theme.slug} ${scheme} explicit SVG text paint remains intact`);
+    assert(themeState.figureParagraphContrast >= 4.5, `${theme.slug} ${scheme} rendered figure paragraph contrast`);
+    assert(themeState.rules > 5, `${theme.slug} ${scheme} generated CSS rules must parse`);
+    assert(themeState.captionContrast >= 4.5, `${theme.slug} ${scheme} rendered caption contrast`);
+    assert(themeState.buttonContrast >= 4.5, `${theme.slug} ${scheme} rendered control contrast`);
+    assert.equal(themeState.inverseHeadingColor, expectedOnAccent, `${theme.slug} ${scheme} inverse-section heading uses on-accent`);
+    assert(themeState.inverseHeadingContrast >= 4.5, `${theme.slug} ${scheme} rendered inverse-section heading contrast`);
+    assert.equal(themeState.inverseCodeColor, expectedInk, `${theme.slug} ${scheme} code inside inverse pre uses surface ink`);
+    assert(themeState.inverseCodeContrast >= 4.5, `${theme.slug} ${scheme} rendered inverse code contrast`);
+    assert.equal(themeState.inversePreBackground, expectedSurface, `${theme.slug} ${scheme} inverse pre uses an opaque surface`);
+    assert.equal(themeState.inversePreColor, expectedInk, `${theme.slug} ${scheme} inverse pre restores its ink foreground`);
+    assert(themeState.inversePreContrast >= 4.5, `${theme.slug} ${scheme} rendered inverse pre contrast`);
+    assert.equal(themeState.inverseHeadBackground, expectedSurface, `${theme.slug} ${scheme} inverse table header uses an opaque surface`);
+    assert.equal(themeState.inverseHeadColor, expectedInk, `${theme.slug} ${scheme} inverse table header restores its ink foreground`);
+    assert(themeState.inverseHeadContrast >= 4.5, `${theme.slug} ${scheme} rendered inverse table-header contrast`);
+    assert.notEqual(themeState.inverseStripeBackground, expectedAccent, `${theme.slug} ${scheme} inverse striped row does not retain accent`);
+    assert.equal(themeState.inverseStripeColor, expectedInk, `${theme.slug} ${scheme} inverse striped row restores its ink foreground`);
+    assert(themeState.inverseStripeContrast >= 4.5, `${theme.slug} ${scheme} rendered inverse striped-row contrast`);
+    assert.equal(themeState.inverseStripeHeadingColor, expectedInk, `${theme.slug} ${scheme} heading on striped opaque surface uses surface ink`);
+    assert(themeState.inverseStripeHeadingContrast >= 4.5, `${theme.slug} ${scheme} rendered inverse striped-row heading contrast`);
+    assert(Math.abs(themeState.densityGapRatio - 1.25 / 0.75) < 0.02, `${theme.slug} ${scheme} density changes rendered layout gap; got ${themeState.densityGapRatio}`);
+  }
+  await staticEvaluate('document.title="Page theme static and data-bound smoke"');
+  await runAxeThemeMatrix('static-and-data-bound', staticCommand, staticEvaluate);
+  assert.deepEqual(kitRequests.filter(url => !/^(?:data:|blob:|about:)/i.test(url)), [], 'Theme runtime smoke must make no external or network requests.');
+  assert.deepEqual(kitConsoleErrors, [], 'Theme runtime smoke must not log console errors.');
+  assert.deepEqual(kitExceptions, [], 'Theme runtime smoke must not throw exceptions.');
+  assert.deepEqual(kitCspViolations, [], 'Theme runtime smoke must have no CSP violations.');
+  console.log('page theme smoke: report/editorial/launch in light/dark, runtime KPI/aurora opaque text foregrounds and explicit SVG fill preservation under CSP passed (SVG contrast not automated)');
+  const kitTarget = await call('Target.createTarget', { url: 'about:blank' });
+  const kitAttached = await call('Target.attachToTarget', { targetId: kitTarget.targetId, flatten: true });
+  const kitCommand = (method, params) => call(method, params, kitAttached.sessionId);
+  kitSessionId = kitAttached.sessionId;
+  await kitCommand('Network.enable');
+  await kitCommand('Runtime.enable');
+  await kitCommand('Log.enable');
+  await kitCommand('Page.enable');
+  const { frameTree: kitTree } = await kitCommand('Page.getFrameTree');
+  const inlineLogo = (await readFile(new URL('../../worker/test/fixtures/page-image.png', import.meta.url))).toString('base64');
+  const interactiveHtml = `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="color-scheme" content="light dark"><style>${kitCss}</style></head><body>
+    ${bindingSdk}
+    <main><h1>Interactive report</h1><a67-toc label="Contents">
+    </a67-toc><h2>Summary</h2><h3>Revenue</h3><h2>Details</h2>
+    <a67-tabs><div role="tablist" aria-label="Report sections"><button id="tab-one" type="button" role="tab" aria-controls="panel-one" aria-selected="true" tabindex="0">One</button><button id="tab-two" type="button" role="tab" aria-controls="panel-two" aria-selected="false" tabindex="-1" disabled="">Two</button><button id="tab-three" type="button" role="tab" aria-controls="panel-three" aria-selected="false" tabindex="-1">Three</button></div><section id="panel-one" role="tabpanel" aria-labelledby="tab-one">First panel</section><section id="panel-two" role="tabpanel" aria-labelledby="tab-two" hidden="">Second panel</section><section id="panel-three" role="tabpanel" aria-labelledby="tab-three">Third panel<a67-tabs id="nested-tabs"><div role="tablist"><button id="inner-tab-one" type="button" role="tab" aria-controls="inner-panel-one" aria-selected="true" tabindex="0">Inner one</button><button id="inner-tab-two" type="button" role="tab" aria-controls="inner-panel-two" aria-selected="false" tabindex="-1">Inner two</button></div><section id="inner-panel-one" role="tabpanel" aria-labelledby="inner-tab-one">Nested first</section><section id="inner-panel-two" role="tabpanel" aria-labelledby="inner-tab-two" hidden="">Nested second</section></a67-tabs></section></a67-tabs>
+    <a67-kpi label="Visitors" value="1,240" delta="+12%" trend="up"></a67-kpi>
+    <table id="chart-source"><caption>Monthly visits</caption><thead><tr><th scope="col">Month</th><th scope="col">Visitors</th></tr></thead><tbody><tr><th scope="row">January</th><td>10</td></tr><tr><th scope="row">February</th><td>20</td></tr></tbody></table>
+    <a67-chart id="visitors-chart" for="chart-source" type="bar" title="Visitors by month" label-column="Month" value-column="Visitors"></a67-chart>
+    <a67-chart id="visitors-line" for="chart-source" type="line" title="Visitors trend" label-column="Month" value-column="Visitors"></a67-chart>
+    <a67-chart id="visitors-donut" for="chart-source" type="donut" title="Visitors share" label-column="Month" value-column="Visitors"></a67-chart>
+    <a67-form id="bound-form" collection="rsvp"></a67-form>
+    <a67-form id="forbidden-form" collection="private"></a67-form>
+    <a67-checklist id="bound-checklist" storage-key="reading" storage-scope="shared"><span data-item="chapter-1">Read chapter one</span></a67-checklist>
+    <a67-records id="read-only" collection="sales" fields="title,amount"></a67-records>
+    <a67-records id="editable" collection="sales" fields="title,amount" editable=""></a67-records>
+    <a67-records id="empty-records" collection="empty"></a67-records>
+    <a67-records id="broken-records" collection="broken"></a67-records>
+    <a67-records id="denied-records" collection="private"></a67-records>
+    <a67-kpi id="bound-kpi" label="Sales" collection="sales" field="amount" aggregate="sum"></a67-kpi>
+    <a67-kpi id="empty-kpi" label="Empty" collection="empty" field="amount" aggregate="sum"></a67-kpi>
+    <a67-kpi id="broken-kpi" label="Broken" collection="broken" field="amount" aggregate="sum"></a67-kpi>
+    <a67-kpi id="denied-kpi" label="Denied" collection="private" field="amount" aggregate="sum"></a67-kpi>
+    <a67-kpi id="pending-kpi" label="Pending" collection="pending" field="amount" aggregate="sum"></a67-kpi>
+    <a67-logo id="resolved-logo" label="Example logo"></a67-logo><a67-logo id="fallback-logo" label="Fallback logo"></a67-logo><a67-logo id="decorative-logo" label=""></a67-logo></main>
+    <script>${kitRuntime}</script></body></html>`;
+  const kitDocument = interactiveHtml.replace('<head>', '<head><meta name="viewport" content="width=device-width, initial-scale=1"><meta http-equiv="Content-Security-Policy" content="default-src \'none\'; script-src \'unsafe-inline\' \'unsafe-eval\' data: blob:; style-src \'unsafe-inline\'; img-src data:; font-src data: blob:; media-src data: blob:; connect-src \'none\'; form-action \'none\'; base-uri \'none\'; object-src \'none\'; frame-src \'none\'; worker-src \'none\'">');
+  await kitCommand('Page.setDocumentContent', { frameId: kitTree.frame.id, html: kitDocument });
+  const kitEvaluate = async expression => evaluate(expression, undefined, kitCommand);
+  await until('document.readyState === "complete" && !!document.querySelector("a67-toc nav") && !!document.querySelector("a67-chart svg")', undefined, kitCommand);
+  await until('document.querySelector("#bound-form [data-a67-state]")?.dataset.state==="ready" && document.querySelector("#forbidden-form [data-a67-state]")?.dataset.state==="forbidden" && document.querySelector("#bound-checklist [data-a67-state]")?.dataset.state==="ready" && document.querySelector("#read-only tbody tr") && document.querySelector("#editable tbody tr") && document.querySelector("#empty-records [data-a67-state]")?.dataset.state==="empty" && document.querySelector("#broken-records [data-a67-state]")?.dataset.state==="error" && document.querySelector("#denied-records [data-a67-state]")?.dataset.state==="forbidden" && document.querySelector("#bound-kpi [data-a67-state]")?.dataset.state==="ready" && document.querySelector("#empty-kpi [data-a67-state]")?.dataset.state==="empty" && document.querySelector("#broken-kpi [data-a67-state]")?.dataset.state==="error" && document.querySelector("#denied-kpi [data-a67-state]")?.dataset.state==="forbidden"', undefined, kitCommand);
+  const bindingStates = await kitEvaluate(`(() => {
+    const state = id => document.querySelector("#" + id + " [data-a67-state]")?.dataset.state;
+    return {
+      form: state("bound-form"), formDenied: state("forbidden-form"),
+      checklist: state("bound-checklist"), restored: document.querySelector("#bound-checklist input")?.checked,
+      readOnly: state("read-only"), readOnlyActions: document.querySelectorAll("#read-only tbody button").length,
+      editable: state("editable"), recordsEmpty: state("empty-records"), recordsError: state("broken-records"), recordsDenied: state("denied-records"),
+      kpi: state("bound-kpi"), kpiValue: document.querySelector("#bound-kpi [data-a67-kpi-value]")?.textContent,
+      kpiEmpty: state("empty-kpi"), kpiError: state("broken-kpi"), kpiDenied: state("denied-kpi"),
+      loading: state("pending-kpi"), storage: bindingCalls.find(call => call.op === "storage.get"),
+    };
+  })()`);
+  assert.deepEqual(bindingStates, {
+    form: "ready", formDenied: "forbidden", checklist: "ready", restored: true,
+    readOnly: "ready", readOnlyActions: 0, editable: "ready", recordsEmpty: "empty", recordsError: "error", recordsDenied: "forbidden",
+    kpi: "ready", kpiValue: "7", kpiEmpty: "empty", kpiError: "error", kpiDenied: "forbidden", loading: "loading",
+    storage: { op: "storage.get", key: "reading", scope: "shared" },
+  }, 'Bound components expose live data, scoped persistence, editable authority path, and distinct accessible states.');
+  const formPayload = await kitEvaluate('(() => { const form=document.querySelector("#bound-form form"), input=document.querySelector("#bound-form input[name=email]"); input.value="ana@example.test"; return { name:input.name, entries:[...new FormData(form)] }; })()');
+  assert.deepEqual(formPayload, { name: "email", entries: [["email", "ana@example.test"]] }, 'Generated controls serialize through native FormData.');
+  await kitEvaluate('document.querySelector("#bound-form form").requestSubmit()');
+  await until('document.querySelector("#bound-form [data-a67-state]")?.textContent==="Response submitted."', undefined, kitCommand);
+  assert.deepEqual(await kitEvaluate('bindingCalls.find(call => call.op === "data.submit")'), {
+    op: "data.submit", collection: "rsvp", data: { email: "ana@example.test" },
+  }, 'The generated form submits the schema-named value through the SDK.');
+  await kitEvaluate('document.querySelector("#bound-checklist").save("chapter-1", false)');
+  assert.deepEqual(await kitEvaluate('bindingCalls.find(call => call.op === "storage.set")'), {
+    op: "storage.set", key: "reading", value: [], scope: "shared",
+  }, 'Checklist changes preserve their declared storage key and scope.');
+  await kitEvaluate('document.querySelector("#editable tbody button").click()');
+  await until('!!document.querySelector("#editable form input[name=title]")', undefined, kitCommand);
+  await kitEvaluate('(() => { const form=document.querySelector("#editable form"); form.elements.title.value="January revised"; form.requestSubmit(); })()');
+  await until('document.querySelector("#editable tbody tr td")?.textContent==="January revised"', undefined, kitCommand);
+  assert.deepEqual(await kitEvaluate('bindingCalls.find(call => call.op === "data.update")'), {
+    op: "data.update", data: { title: "January revised", amount: "7" }, version: 1,
+  }, 'Authorized record edits use get/update and the live record version.');
+  await kitEvaluate('resolvePendingSchema()');
+  await until('document.querySelector("#pending-kpi [data-a67-state]")?.dataset.state!=="loading"', undefined, kitCommand);
+  const pendingState = await kitEvaluate('({ state:document.querySelector("#pending-kpi [data-a67-state]")?.dataset.state, message:document.querySelector("#pending-kpi [data-a67-state]")?.textContent })');
+  assert.equal(pendingState.state, "ready", `The pending KPI should settle after schema resolution: ${JSON.stringify(pendingState)}`);
+  await kitEvaluate('delete window.artefacts.data; delete window.artefacts.storage');
+  await kitEvaluate('Promise.all([document.querySelector("#bound-form").load(), document.querySelector("#read-only").load(), document.querySelector("#bound-kpi").loadAggregate()])');
+  await kitEvaluate('document.querySelector("#bound-checklist").save("chapter-1", false)');
+  const standaloneBindings = await kitEvaluate(`(() => ({
+    form: document.querySelector("#bound-form [data-a67-state]")?.dataset.state,
+    fakeForm: !!document.querySelector("#bound-form form"),
+    records: document.querySelector("#read-only [data-a67-state]")?.dataset.state,
+    kpi: document.querySelector("#bound-kpi [data-a67-state]")?.dataset.state,
+    checklist: document.querySelector("#bound-checklist [data-a67-state]")?.textContent,
+  }))()`);
+  assert.deepEqual(standaloneBindings, {
+    form: "error", fakeForm: false, records: "error", kpi: "error",
+    checklist: "Session-only checklist; changes are not saved.",
+  }, 'Standalone output labels hosted-only bindings and session-only checklist state instead of faking data.');
+  const toc = await kitEvaluate('(() => { const nav=document.querySelector("a67-toc nav"); const headings=[...document.querySelectorAll("h2,h3")]; const links=[...nav.querySelectorAll("a")]; links[0].click(); return { label:nav.getAttribute("aria-label"),count:links.length,href:links[0].getAttribute("href"),headingId:headings[0].id,hash:location.hash,depth:nav.querySelector("[data-depth]")?.textContent.trim() }; })()');
+  assert.equal(toc.label, 'Contents');
+  assert.equal(toc.count, 3, 'TOC discovers h2 and h3 headings.');
+  assert.equal(toc.href, `#${toc.headingId}`, 'Generated TOC fragment links point at the discovered heading.');
+  assert.equal(toc.hash, toc.href, 'Clicking a TOC link uses normal fragment navigation.');
+  assert.equal(toc.depth, 'Revenue', 'Nested h3 headings remain visible and identified.');
+  assert(await kitEvaluate('(() => { const group=document.querySelector("a67-kpi [role=group]"); return group.getAttribute("aria-label")==="Visitors" && group.querySelector("[data-a67-kpi-value]").textContent==="1,240" && group.querySelector("[data-a67-kpi-delta]").textContent==="Increase: +12%" && !document.querySelector("a67-kpi").hasAttribute("collection"); })()'), 'Literal KPI value and non-color trend must render without a binding.');
+  const tabsFocus = async id => kitEvaluate(`document.getElementById(${JSON.stringify(id)}).focus()`);
+  const pressTabKey = async (key, code, virtualKey) => {
+    await kitCommand('Input.dispatchKeyEvent', { type: 'keyDown', key, code, windowsVirtualKeyCode: virtualKey, nativeVirtualKeyCode: virtualKey });
+    await kitCommand('Input.dispatchKeyEvent', { type: 'keyUp', key, code, windowsVirtualKeyCode: virtualKey, nativeVirtualKeyCode: virtualKey });
+  };
+  await tabsFocus('tab-one');
+  await pressTabKey('ArrowRight', 'ArrowRight', 39);
+  await until('document.activeElement.id === "tab-three" && document.getElementById("tab-three").getAttribute("aria-selected")==="true"', undefined, kitCommand);
+  assert(await kitEvaluate('!document.getElementById("panel-three").hidden && document.getElementById("panel-one").hidden && document.getElementById("tab-two").disabled && document.getElementById("tab-two").tabIndex===-1'), 'ArrowRight skips the disabled tab while preserving selection, roving tabindex, and panel visibility.');
+  await pressTabKey('End', 'End', 35);
+  assert(await kitEvaluate('document.activeElement.id==="tab-three" && document.getElementById("tab-three").getAttribute("aria-selected")==="true" && !document.getElementById("panel-three").hidden'), 'End focuses and selects the last enabled tab and reveals its panel.');
+  await pressTabKey('Home', 'Home', 36);
+  assert(await kitEvaluate('document.activeElement.id==="tab-one" && document.getElementById("tab-one").getAttribute("aria-selected")==="true" && !document.getElementById("panel-one").hidden'), 'Home focuses and selects the first enabled tab and reveals its panel.');
+  await pressTabKey('ArrowLeft', 'ArrowLeft', 37);
+  assert(await kitEvaluate('document.activeElement.id==="tab-three" && document.getElementById("tab-three").getAttribute("aria-selected")==="true"'), 'ArrowLeft wraps to the last enabled tab.');
+  await kitEvaluate('document.getElementById("inner-tab-two").click()');
+  assert(await kitEvaluate('document.getElementById("tab-three").getAttribute("aria-selected")==="true" && !document.getElementById("panel-three").hidden && document.getElementById("inner-tab-two").getAttribute("aria-selected")==="true" && !document.getElementById("inner-panel-two").hidden'), 'Nested tab clicks change only the nested tab component.');
+  await kitCommand('Emulation.setDeviceMetricsOverride', { width: 390, height: 900, deviceScaleFactor: 1, mobile: false });
+  const resizeViewport = await kitEvaluate('innerWidth');
+  await kitEvaluate('document.documentElement.style.fontSize="200%"');
+  const textResize = await kitEvaluate('(() => { const heading=document.querySelector("h1"), tab=document.getElementById("tab-one"), rect=heading.getBoundingClientRect(), main=document.querySelector("main"), client=document.documentElement.clientWidth, overflow=[...document.querySelectorAll("body *")].filter(el=>el.getBoundingClientRect().right>client+1).slice(0,8).map(el=>[el.tagName,el.id,Math.round(el.getBoundingClientRect().right),el.scrollWidth,el.clientWidth]); return { viewport:innerWidth, client, fontSize:parseFloat(getComputedStyle(document.documentElement).fontSize), page:document.documentElement.scrollWidth, heading:heading.textContent, headingVisible:rect.width>0&&rect.left>=0&&rect.right<=innerWidth, content:main.textContent.includes("January")&&main.textContent.includes("Monthly visits"), tabVisible:tab.getBoundingClientRect().width>0, tabEnabled:!tab.disabled, overflow }; })()');
+  assert.equal(resizeViewport, 390, 'The text-resize check must start with a 390 CSS-pixel viewport.');
+  assert.equal(textResize.viewport, 390, 'The 200% text-resize check must keep the 390 CSS-pixel viewport.');
+  assert.equal(textResize.fontSize, 32, '200% text resizing must double the 16px root text size.');
+  assert(textResize.page <= textResize.client, `Interactive content overflows horizontally at 200% text size: ${textResize.page}px > ${textResize.client}px; ${JSON.stringify(textResize.overflow)}.`);
+  assert.equal(textResize.heading, "Interactive report");
+  assert(textResize.headingVisible && textResize.content && textResize.tabVisible && textResize.tabEnabled, 'Text, content and keyboard controls remain visible and operable at 200% size.');
+  await tabsFocus('tab-one');
+  await pressTabKey('ArrowRight', 'ArrowRight', 39);
+  assert(await kitEvaluate('document.activeElement.id==="tab-three" && !document.getElementById("panel-three").hidden'), 'Keyboard tab operation remains available at 200% size.');
+  await kitEvaluate('document.documentElement.style.removeProperty("font-size")');
+  await kitCommand('Emulation.clearDeviceMetricsOverride');
+  await kitCommand('Emulation.setEmulatedMedia', { media: 'print' });
+  const tabPrint = await kitEvaluate('({hidden:document.getElementById("panel-one").hidden,display:getComputedStyle(document.getElementById("panel-one")).display,selected:document.getElementById("tab-three").getAttribute("aria-selected"),nestedDisplay:getComputedStyle(document.getElementById("inner-panel-one")).display})');
+  assert.equal(tabPrint.hidden, true);
+  assert.notEqual(tabPrint.display, 'none', 'Inactive panels must be visible in print.');
+  assert.equal(tabPrint.selected, 'true', 'Printing does not change the screen tab selection state.');
+  assert.notEqual(tabPrint.nestedDisplay, 'none', 'Inactive nested panels must be visible in print.');
+  await kitCommand('Emulation.setEmulatedMedia', { media: '' });
+  assert(await kitEvaluate('document.getElementById("panel-one").hidden && document.getElementById("tab-three").getAttribute("aria-selected")==="true"'), 'Leaving print preserves screen selection and panel state.');
+  const chart = await kitEvaluate('(() => { const host=document.querySelector("a67-chart"); const svg=host.querySelector("svg"); const title=document.getElementById(svg.querySelector("title").id); const description=svg.querySelector("desc").textContent; const widths=[...svg.querySelectorAll("rect")].map(rect=>Number(rect.getAttribute("width"))); return { role:svg.getAttribute("role"),title:title.textContent,description,widths,tableVisible:getComputedStyle(document.getElementById("chart-source")).display!=="none",summary:host.querySelector("figcaption").textContent }; })()');
+  assert.equal(chart.role, 'img');
+  assert.equal(chart.title, 'Visitors by month');
+  assert.match(chart.description, /January, 10; February, 20/);
+  assert(chart.widths[1] > chart.widths[0], 'Chart bar lengths derive from the visible table values.');
+  assert(chart.tableVisible, 'The source table remains visible as the chart alternative.');
+  assert.match(chart.summary, /January — 10; February — 20/);
+  const chartVariants = await kitEvaluate('(() => { const line=document.querySelector("#visitors-line"), donut=document.querySelector("#visitors-donut"), lineSvg=line.querySelector("svg"), donutSvg=donut.querySelector("svg"); return { lineRole:lineSvg.getAttribute("role"),lineTitle:lineSvg.querySelector("title").textContent,lineDescription:lineSvg.querySelector("desc").textContent,lineMarkers:lineSvg.querySelectorAll("circle").length,donutRole:donutSvg.getAttribute("role"),donutDescription:donutSvg.querySelector("desc").textContent,donutArcs:donutSvg.querySelectorAll("circle").length,donutHeight:Number(donutSvg.getAttribute("viewBox").split(" ")[3]),donutBottom:88+58+15,donutSummary:donut.querySelector("figcaption").textContent }; })()');
+  assert.equal(chartVariants.lineRole, 'img');
+  assert.equal(chartVariants.lineTitle, 'Visitors trend');
+  assert.match(chartVariants.lineDescription, /January, 10; February, 20/);
+  assert.equal(chartVariants.lineMarkers, 2);
+  assert.equal(chartVariants.donutRole, 'img');
+  assert.match(chartVariants.donutDescription, /January, 10; February, 20/);
+  assert.equal(chartVariants.donutArcs, 2);
+  assert(chartVariants.donutHeight >= chartVariants.donutBottom + 8, 'Donut SVG reserves room for the complete stroked circle.');
+  assert.match(chartVariants.donutSummary, /January — 10; February — 20/);
+  await kitEvaluate('document.querySelector("#chart-source tbody tr td").textContent="30"');
+  await until('document.querySelector("a67-chart figcaption")?.textContent.includes("January — 30")', undefined, kitCommand);
+  assert.match(await kitEvaluate('document.querySelector("a67-chart svg desc").textContent'), /January, 30/);
+  const nestedChart = await kitEvaluate(`(async () => {
+    document.documentElement.setAttribute("lang","hr-HR");
+    const table=document.createElement("table"); table.id="self-observed-source";
+    const caption=document.createElement("caption"); caption.textContent="Self-observed chart";
+    const head=document.createElement("thead"), header=document.createElement("tr");
+    const monthHeader=document.createElement("th"), valueHeader=document.createElement("th");
+    monthHeader.textContent="Month"; valueHeader.textContent="Value"; header.append(monthHeader,valueHeader); head.append(header);
+    const body=document.createElement("tbody"), row=document.createElement("tr");
+    const month=document.createElement("th"), value=document.createElement("td");
+    month.textContent="April"; value.textContent="1.234,5"; row.append(month,value); body.append(row);
+    table.append(caption,head,body); document.body.append(table);
+    let observed=0, frames=0, ticking=true;
+    const observer=new MutationObserver(records=>observed+=records.length);
+    observer.observe(table,{subtree:true,childList:true,characterData:true});
+    const chart=document.createElement("a67-chart");
+    chart.id="self-observed-chart"; chart.setAttribute("for",table.id); chart.setAttribute("type","bar");
+    chart.setAttribute("title","Self-observed chart"); chart.setAttribute("label-column","Month"); chart.setAttribute("value-column","Value");
+    requestAnimationFrame(function tick(){frames++;if(ticking)requestAnimationFrame(tick);});
+    caption.append(chart);
+    await new Promise(resolve=>setTimeout(resolve,120));
+    const firstCount=observed, firstFrames=frames;
+    await new Promise(resolve=>setTimeout(resolve,120));
+    ticking=false; observer.disconnect();
+    return {stable:observed===firstCount, responsive:frames>firstFrames, mutations:observed, figure:!!chart.querySelector("figure"), summary:chart.querySelector("figcaption")?.textContent};
+  })()`);
+  assert.equal(nestedChart.stable, true, `Chart must not observe its own generated content indefinitely: ${nestedChart.mutations} mutations.`);
+  assert.equal(nestedChart.responsive, true, 'The frame must continue servicing animation frames during chart initialization.');
+  assert.equal(nestedChart.figure, true, 'The chart frame remains present after observer processing.');
+  assert.match(nestedChart.summary, /April — 1234\.5/);
+  console.log('page kit browser regression: table-caption chart observer settles, preserves its SVG, parses decimal-comma values, and keeps animation frames responsive');
+  await kitEvaluate(`window.__a67PageKit.configure({ logo: "data:image/png;base64,${inlineLogo}" })`);
+  const resolvedLogo = await kitEvaluate('(() => { const svg=document.querySelector("#resolved-logo svg"); return { role:svg.getAttribute("role"),label:svg.getAttribute("aria-label"),href:svg.querySelector("image")?.getAttribute("href"),fallback:svg.querySelectorAll("path").length }; })()');
+  assert.equal(resolvedLogo.role, 'img');
+  assert.equal(resolvedLogo.label, 'Example logo');
+  assert.equal(resolvedLogo.href, `data:image/png;base64,${inlineLogo}`);
+  assert.equal(resolvedLogo.fallback, 0, 'Resolved theme logo renders as an inline SVG image.');
+  await kitEvaluate('window.__a67PageKit.configure({ logo: null })');
+  const logoFallback = await kitEvaluate('(() => { const svg=document.querySelector("#fallback-logo svg"), decorative=document.querySelector("#decorative-logo svg"); return { role:svg.getAttribute("role"),label:svg.getAttribute("aria-label"),paths:svg.querySelectorAll("path").length,mark:svg.querySelector("path")?.getAttribute("d").startsWith("M297.8"),decorative:decorative.getAttribute("aria-hidden"),decorativeRole:decorative.getAttribute("role") }; })()');
+  assert.deepEqual(logoFallback, { role: 'img', label: 'Fallback logo', paths: 2, mark: true, decorative: 'true', decorativeRole: null }, 'Missing logo uses the actual platform mark; an empty label is decorative.');
+  await new Promise(resolve => setTimeout(resolve, 25));
+  await kitEvaluate('document.title="Page theme interactive and data-bound smoke"');
+  await runAxeThemeMatrix('interactive-and-data-bound', kitCommand, kitEvaluate);
+  assert.deepEqual(kitRequests.filter(url => !/^(?:data:|blob:|about:)/i.test(url)), [], 'Page-kit behavior must not issue external or network requests.');
+  assert.deepEqual(kitConsoleErrors, [], 'Page-kit behavior must not log console errors.');
+  assert.deepEqual(kitExceptions, [], 'Page-kit behavior must not throw uncaught exceptions.');
+  assert.deepEqual(kitCspViolations, [], 'Page-kit behavior must not trigger Content Security Policy violations.');
+  await call('Target.closeTarget', { targetId: kitTarget.targetId });
+  console.log('page kit interaction smoke: TOC links, keyboard tabs, literal KPI, table-synchronized chart, resolved logo and platform-mark fallback; no requests, console errors, exceptions or CSP violations');
   await until('!!document.querySelector("iframe.artifact-frame")');
+  await command('Page.bringToFront');
   await command('Browser.grantPermissions', { origin: viewer.origin, permissions: ['clipboardReadWrite', 'clipboardSanitizedWrite'] });
   const promptCopy = await evaluate('new Promise(async (resolve, reject) => { const button = [...document.querySelectorAll("button")].find(button => button.textContent.trim() === "Copy AI prompt"); if (!button) return reject(new Error("Copy AI prompt button is missing.")); button.click(); const until = async () => { const status = document.querySelector("[aria-live=polite]"); if (status?.textContent.trim() === "AI prompt copied") return resolve({ status: status.textContent.trim(), text: await navigator.clipboard.readText() }); if (status?.textContent.includes("Unable to copy")) return reject(new Error(status.textContent)); setTimeout(until, 50); }; until(); })');
   assert(promptCopy.text.startsWith('# Artefacts67: instructions for AI agents'), 'Copy AI prompt must copy /llms.txt.');
   assert.equal(promptCopy.status, 'AI prompt copied', 'Copy AI prompt must announce success.');
   assert(await evaluate('document.querySelector(".viewer-title-button").textContent.includes("Solid 2 smoke")'), 'Use a dedicated Solid 2 smoke fixture, not an ordinary artefact.');
+  const viewerArtifact = /^\/app\/a\/([^/]+)\/view\/?$/.exec(viewer.pathname);
+  assert(viewerArtifact, 'Use the prescribed local /app/a/<smoke-slug>/view URL.');
+  const artifactRef = decodeURIComponent(viewerArtifact[1]);
+  const artifactListResponse = await fetch(new URL('/_api/artifacts', viewer.origin), {
+    headers: { Authorization: `Bearer ${process.env.WS_SMOKE_API_KEY}` },
+  });
+  assert.equal(artifactListResponse.status, 200, 'The local master key must list the smoke fixture.');
+  const fixture = (await artifactListResponse.json()).artifacts.find(artifact =>
+    artifact.id === artifactRef || artifact.slug === artifactRef);
+  assert(fixture, 'The reader URL must identify the dedicated Solid 2 smoke artefact.');
   await evaluate('globalThis.readerFrame=document.querySelector("iframe.artifact-frame"); globalThis.readerDocument=document; globalThis.readerSidebar=document.querySelector("aside.sidebar");');
   await evaluate('new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)))');
   const openFrame = async (send = command) => {
     const { frameTree } = await send('Page.getFrameTree');
-    let frame = frameTree.childFrames?.find(child => child.frame.parentId === frameTree.frame.id)?.frame;
-    let frameCommand = send;
+    let frame = frameTree.childFrames?.find(child => child.frame.parentId === frameTree.frame.id && child.frame.url === 'about:srcdoc')?.frame;
+    let frameCommand = send, frameSessionId;
     // Chrome isolates the opaque sandbox in its own target on current releases.
     if (!frame) {
       const deadline = Date.now() + 15000;
       do {
-        const target = (await call('Target.getTargets')).targetInfos.find(target => target.type === 'iframe' && target.parentFrameId === frameTree.frame.id);
+        const target = (await call('Target.getTargets')).targetInfos.find(target => target.type === 'iframe' && target.parentFrameId === frameTree.frame.id && target.url === 'about:srcdoc');
         if (target) {
           const attached = await call('Target.attachToTarget', { targetId: target.targetId, flatten: true });
+          frameSessionId = attached.sessionId;
           frameCommand = (method, params) => call(method, params, attached.sessionId);
-          frame = { id: target.targetId };
-          break;
+          const attachedTree = await frameCommand('Page.getFrameTree');
+          frame = attachedTree.frameTree.frame;
         }
         await delay(50);
       } while (Date.now() < deadline);
@@ -70,9 +761,10 @@ try {
     assert(frame, 'The authored document must be running.');
     const { executionContextId } = await frameCommand('Page.createIsolatedWorld', { frameId: frame.id, worldName: 'reader-check' });
     await until('document.readyState === "complete"', executionContextId, frameCommand);
-    return { executionContextId, frameCommand };
+    return { executionContextId, frameCommand, frameSessionId };
   };
   const { executionContextId, frameCommand } = await openFrame();
+  assert.equal(await evaluate('document.documentElement.lang', executionContextId, frameCommand), fixture.lang, 'Hosted page documents must use the published BCP-47 language.');
   // Model user-entered state inside the authored document, not in its parent.
   const bootId = globalThis.crypto.randomUUID();
   await evaluate(`document.documentElement.dataset.readerSmokeState = ${JSON.stringify(bootId)}`, executionContextId, frameCommand);
@@ -103,8 +795,11 @@ try {
   await until('!!document.querySelector("[popover]:popover-open")');
   await evaluate('Array.from(document.querySelectorAll("[popover]:popover-open [role=menuitem]")).find(item=>item.textContent.trim()==="Rename").click()');
   await until('!!document.querySelector("dialog[open] input[name=title]")');
+  // The queued close from Share must not dismiss a newly opened rename dialog.
+  await delay(100);
+  assert.equal(await evaluate('!!document.querySelector("dialog[open] input[name=title]")'), true, "A stale dialog close must not dismiss the new rename dialog.");
   const renamedTitle = await evaluate('document.querySelector(".viewer-title-button").textContent.trim()==="Solid 2 smoke renamed"') ? 'Solid 2 smoke updated' : 'Solid 2 smoke renamed';
-  await evaluate(`const input=document.querySelector("dialog[open] input[name=title]"); input.value=${JSON.stringify(renamedTitle)}; input.dispatchEvent(new Event("input",{bubbles:true})); input.form.requestSubmit();`);
+  await evaluate(`(() => { const input=document.querySelector("dialog[open] input[name=title]"); if (!input) throw new Error("Rename dialog title input disappeared before submission."); input.value=${JSON.stringify(renamedTitle)}; input.dispatchEvent(new Event("input",{bubbles:true})); input.form.requestSubmit(); })()`);
   await until(`!document.querySelector("dialog[open]") && document.querySelector(".viewer-title-button").textContent.trim()===${JSON.stringify(renamedTitle)}`);
   assert(await evaluate('document===readerDocument && document.querySelector("iframe.artifact-frame")===readerFrame && document.querySelector("aside.sidebar")===readerSidebar'), 'Saving metadata must preserve the console, sidebar and frame.');
   assert.equal(await frameRead(), bootId, 'Saving metadata must preserve authored state.');
@@ -231,16 +926,6 @@ try {
   const contentKey = await evaluate('document.querySelector("main input[readonly]")?.value');
   settingsMasterKey = contentKey;
   assert(contentKey?.startsWith("wak_"), 'The one-time token notice remains intact after minting the opted-in master key.');
-  const viewerArtifact = /^\/app\/a\/([^/]+)\/view\/?$/.exec(viewer.pathname);
-  assert(viewerArtifact, 'Use the prescribed local /app/a/<smoke-slug>/view URL.');
-  const artifactRef = decodeURIComponent(viewerArtifact[1]);
-  const artifactListResponse = await fetch(new URL('/_api/artifacts', viewer.origin), {
-    headers: { Authorization: `Bearer ${process.env.WS_SMOKE_API_KEY}` },
-  });
-  assert.equal(artifactListResponse.status, 200, 'The local master key must list the smoke fixture.');
-  const fixture = (await artifactListResponse.json()).artifacts.find(artifact =>
-    artifact.id === artifactRef || artifact.slug === artifactRef);
-  assert(fixture, 'The reader URL must identify the dedicated Solid 2 smoke artefact.');
   const contentPath = `/_api/artifacts/${encodeURIComponent(artifactRef)}/content?version=${fixture.version}`;
   const contentResponse = await fetch(new URL(contentPath, viewer.origin), {
     headers: { Authorization: `Bearer ${process.env.WS_SMOKE_API_KEY}` },
@@ -249,7 +934,7 @@ try {
   const content = await contentResponse.json();
   assert.equal(content.version, fixture.version);
   assert.equal(content.artifact.version, fixture.version);
-  assert.equal(content.title, fixture.title, 'The returned title must match current fixture metadata.');
+  assert.equal(content.title, renamedTitle, 'The returned title must match the metadata saved by the smoke.');
   assert.match(content.html, /Solid 2 smoke/, 'The authorized read must return the fixture HTML.');
   console.log(`content read (HTTP): ${artifactRef} version=${content.version} capability=allowed`);
   const uiContentResponse = await fetch(new URL(contentPath, viewer.origin), {
@@ -261,34 +946,50 @@ try {
     headers: { Authorization: `Bearer ${process.env.WS_SMOKE_NOREAD_API_KEY}` },
   });
   assert.equal(deniedContent.status, 403, 'A local wak_ key without can_read_content must be refused.');
-  const stalePublish = await fetch(new URL('/_api/artifacts', viewer.origin), {
+  const staleSiteSlug = `smoke-stale-site-${Date.now().toString(36)}`;
+  const staleSiteHtml = `<!-- prefix that defeats HTML sniffing -->
+<!doctype html><html lang="en"><head><title>Stale site fixture</title></head><body><p>Version one</p></body></html>`;
+  const publishSite = body => fetch(new URL('/_api/artifacts', viewer.origin), {
     method: 'POST',
-    headers: {
-      Authorization: `Bearer ${process.env.WS_SMOKE_API_KEY}`,
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify({
-      folder: fixture.folder.slug,
-      slug: fixture.slug,
-      title: content.title,
-      lang: content.language,
-      html: content.html,
-      ifVersion: fixture.version + 1,
-    }),
+    headers: { Authorization: `Bearer ${process.env.WS_SMOKE_API_KEY}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
   });
-  assert.equal(stalePublish.status, 409, 'A stale conditional publish must conflict.');
-  const stalePublishBody = await stalePublish.json();
-  assert.equal(stalePublishBody.error?.code, 'conflict', 'A stale conditional publish must return a conflict envelope.');
-  assert.equal(stalePublishBody.error?.details?.currentVersion, fixture.version,
-    'The conflict must report the fixture’s current version.');
-  const unchangedContentResponse = await fetch(new URL(`/_api/artifacts/${encodeURIComponent(artifactRef)}/content`, viewer.origin), {
+  const staleSiteCreated = await publishSite({
+    type: 'site', folder: fixture.folder.slug ?? fixture.folder.id, slug: staleSiteSlug, title: 'Stale site type regression', lang: 'en', html: staleSiteHtml,
+  });
+  assert.equal(staleSiteCreated.status, 201, 'The typed stale-site regression fixture must be created.');
+  const createdSite = await staleSiteCreated.json();
+  assert.equal(createdSite.artifact.version, 1);
+  const staleSiteHtmlV2 = staleSiteHtml.replace('Version one', 'Version two');
+  const staleSiteUpdated = await publishSite({
+    type: 'site', folder: fixture.folder.slug ?? fixture.folder.id, slug: staleSiteSlug, title: 'Stale site type regression',
+    lang: 'en', html: staleSiteHtmlV2, ifVersion: createdSite.artifact.version,
+  });
+  assert.equal(staleSiteUpdated.status, 200, 'The typed stale-site fixture must advance to version two.');
+  const currentSiteResponse = await fetch(new URL(`/_api/artifacts/${encodeURIComponent(staleSiteSlug)}/content`, viewer.origin), {
     headers: { Authorization: `Bearer ${process.env.WS_SMOKE_API_KEY}` },
   });
-  assert.equal(unchangedContentResponse.status, 200, 'The fixture must remain content-readable after a stale publish.');
-  const unchangedContent = await unchangedContentResponse.json();
-  assert.equal(unchangedContent.version, fixture.version, 'The stale publish must not change the fixture version.');
-  assert.equal(unchangedContent.html, content.html, 'The stale publish must not change the fixture HTML.');
-  console.log(`ifVersion (HTTP): stale publish rejected (409), currentVersion=${fixture.version}, fixture unchanged`);
+  assert.equal(currentSiteResponse.status, 200);
+  const currentSite = await currentSiteResponse.json();
+  assert.equal(currentSite.version, 2);
+  assert.match(currentSite.html, /^<!-- prefix that defeats HTML sniffing -->\s*<!doctype html>/i);
+  const staleSite = { type: 'site', folder: fixture.folder, slug: staleSiteSlug, title: 'Stale site type regression', lang: 'en', version: createdSite.artifact.version };
+  const staleSitePublish = await publishSite({
+    type: staleSite.type, folder: staleSite.folder.slug ?? staleSite.folder.id, slug: staleSite.slug, title: staleSite.title,
+    lang: staleSite.lang, html: currentSite.html, ifVersion: staleSite.version,
+  });
+  assert.equal(staleSitePublish.status, 409, 'A stale site publish must conflict even when its HTML comment precedes the doctype.');
+  const staleSiteBody = await staleSitePublish.json();
+  assert.equal(staleSiteBody.error?.code, 'conflict');
+  assert.equal(staleSiteBody.error?.details?.currentVersion, currentSite.version);
+  const unchangedSiteResponse = await fetch(new URL(`/_api/artifacts/${encodeURIComponent(staleSiteSlug)}/content`, viewer.origin), {
+    headers: { Authorization: `Bearer ${process.env.WS_SMOKE_API_KEY}` },
+  });
+  assert.equal(unchangedSiteResponse.status, 200);
+  const unchangedSite = await unchangedSiteResponse.json();
+  assert.equal(unchangedSite.version, currentSite.version);
+  assert.equal(unchangedSite.html, currentSite.html);
+  console.log(`ifVersion (HTTP): comment-prefixed site stale publish rejected (409), currentVersion=${currentSite.version}, fixture unchanged`);
   console.log('content read (HTTP): capability=denied (403)');
   // Native forms inside the sandbox reach project responses through the SDK (ADR 0032).
   let mcpId = 0;
@@ -313,7 +1014,7 @@ try {
 <button type="submit">Send</button><button type="button" id="via-request">Send via requestSubmit</button>
 <button type="submit" id="cancel-click" onclick="event.preventDefault()">Send (cancelled by its click handler)</button>
 </form>
-<p id="status"></p>
+<p id="status"></p><p id="schema-state"></p>
 <form name="lone" id="lone"><input name="q"></form>
 <p id="lone-status"></p>
 <form name="offer" id="offer"><input type="hidden" name="note">
@@ -323,6 +1024,9 @@ try {
 <p id="offer-status"></p>
 <script>
 const form = document.getElementById('rsvp');
+window.artefacts.data.schema('rsvp').then(definition => {
+  document.getElementById('schema-state').textContent = JSON.stringify(definition);
+}).catch(error => { document.getElementById('schema-state').textContent = 'error:' + error.code; });
 document.getElementById('via-request').addEventListener('click', () => form.requestSubmit());
 form.addEventListener('submit', async (event) => {
   event.preventDefault();
@@ -359,7 +1063,15 @@ document.getElementById('offer').addEventListener('submit', async (event) => {
     await evaluate('new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)))');
     let rsvp = await openFrame();
     const inRsvp = expression => evaluate(expression, rsvp.executionContextId, rsvp.frameCommand);
-    await until('!!document.forms.rsvp && !!document.forms.lone && !!document.forms.offer', rsvp.executionContextId, rsvp.frameCommand);
+    await until('!!document.forms.rsvp && !!document.forms.lone && !!document.forms.offer && document.getElementById("schema-state").textContent.startsWith("{")', rsvp.executionContextId, rsvp.frameCommand);
+    const schema = await inRsvp('JSON.parse(document.getElementById("schema-state").textContent)');
+    assert.deepEqual(schema, {
+      name: 'rsvp', kind: 'responses', visitors: false,
+      fields: {
+        name: { type: 'text', required: true }, attend: { type: 'choice', options: ['yes', 'no'], required: true },
+        menu: { type: 'choice', options: ['fish', 'veg'], required: true }, confirm: { type: 'boolean', required: true },
+      },
+    }, 'The injected data schema method returns the authorized public definition without submissions.');
     const pressEnter = async () => {
       await rsvp.frameCommand('Input.dispatchKeyEvent', { type: 'keyDown', key: 'Enter', code: 'Enter', text: '\r', unmodifiedText: '\r', windowsVirtualKeyCode: 13, nativeVirtualKeyCode: 13 });
       await rsvp.frameCommand('Input.dispatchKeyEvent', { type: 'keyUp', key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13, nativeVirtualKeyCode: 13 });
@@ -489,6 +1201,74 @@ document.getElementById('offer').addEventListener('submit', async (event) => {
       await tool('define_collection', { ...project, name, ...definition });
       created.collections.push(name);
     }
+    const photo = await readFile(new URL('../../worker/test/fixtures/page-photo.jpg', import.meta.url));
+    const pngImage = await readFile(new URL('../../worker/test/fixtures/page-image.png', import.meta.url));
+    const photoSrc = `data:image/jpeg;base64,${photo.toString('base64')}`;
+    const pngSrc = `data:image/png;base64,${pngImage.toString('base64')}`;
+    const pageSlug = `smoke-page-images-${run}`;
+    const pageHtml = `<main><h1>Image publishing smoke</h1><figure><img src="${photoSrc}" alt="A landscape beside a lake" width="96" height="72"><figcaption>Lake landscape</figcaption></figure><img src="${pngSrc}" alt="" width="8" height="8"></main>`;
+    const siteSlug = `smoke-site-compat-${run}`;
+    const siteHtml = '<!doctype html><html lang="en"><head><meta charset="utf-8"><title>Legacy site</title></head><body><main><h1>Legacy site bytes</h1></main></body></html>';
+    const publishHeaders = { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json' };
+    const pageInvalid = await fetch(new URL('/_api/artifacts', viewer.origin), {
+      method: 'POST', headers: publishHeaders,
+      body: JSON.stringify({ ...project, slug: `smoke-page-invalid-${run}`, title: 'Invalid page image', type: 'page',
+        html: `<main><img src="data:image/png;base64,${photo.toString('base64')}" alt="Photo" width="96" height="72"></main>` }),
+    });
+    assert.equal(pageInvalid.status, 422, 'An image MIME/signature mismatch must be rejected before publication.');
+    const pagePublish = await fetch(new URL('/_api/artifacts', viewer.origin), {
+      method: 'POST', headers: publishHeaders,
+      body: JSON.stringify({ ...project, slug: pageSlug, title: 'Page image smoke', type: 'page', html: pageHtml }),
+    });
+    assert.equal(pagePublish.status, 201, 'Valid inline JPEG and PNG page images must publish.');
+    created.artifacts.push(pageSlug);
+    const pageArtifact = (await pagePublish.json()).artifact;
+    const pageContentResponse = await fetch(new URL(`/_api/artifacts/${encodeURIComponent(pageArtifact.id)}/content?version=${pageArtifact.version}`, viewer.origin), {
+      headers: { Authorization: `Bearer ${key}` },
+    });
+    assert.equal(pageContentResponse.status, 200);
+    const pageContent = await pageContentResponse.json();
+    assert.equal(pageContent.html, pageHtml, 'Published page content must preserve both complete data-image sources byte-for-byte.');
+    const controlPageSlug = `smoke-controls-${run}`;
+    const controlPageHtml = '<main><h1>Reader controls smoke</h1><a67-tabs id="reader-tabs"><div role="tablist"><button id="reader-tab-one" type="button" role="tab" aria-controls="reader-panel-one" aria-selected="true" tabindex="0">One</button><button id="reader-tab-two" type="button" role="tab" aria-controls="reader-panel-two" aria-selected="false" tabindex="-1">Two</button></div><section id="reader-panel-one" role="tabpanel" aria-labelledby="reader-tab-one">First panel</section><section id="reader-panel-two" role="tabpanel" aria-labelledby="reader-tab-two" hidden="">Second panel</section></a67-tabs><a67-checklist id="reader-checklist" storage-key="reader-smoke" storage-scope="personal"><span data-item="chapter-one">Read chapter one</span></a67-checklist><input id="reader-state" type="text" value="initial" aria-label="Retained reader state"></main>';
+    const controlPage = await fetch(new URL('/_api/artifacts', viewer.origin), {
+      method: 'POST', headers: publishHeaders,
+      body: JSON.stringify({ ...project, slug: controlPageSlug, title: 'Reader controls smoke', type: 'page', theme: { scope: 'platform', slug: 'report' }, html: controlPageHtml }),
+    });
+    assert.equal(controlPage.status, 201, `A themed page must publish for the controls smoke: ${await controlPage.text()}`);
+    created.artifacts.push(controlPageSlug);
+    const pendingControlPageSlug = `smoke-controls-pending-${run}`;
+    const pendingControlPageHtml = controlPageHtml.replace(/<a67-checklist id="reader-checklist"[\s\S]*?<\/a67-checklist>/, '<div id="reader-checklist-mount"></div>');
+    const pendingControlPage = await fetch(new URL('/_api/artifacts', viewer.origin), {
+      method: 'POST', headers: publishHeaders,
+      body: JSON.stringify({ ...project, slug: pendingControlPageSlug, title: 'Pending reader controls smoke', type: 'page', theme: { scope: 'platform', slug: 'report' }, html: pendingControlPageHtml }),
+    });
+    assert.equal(pendingControlPage.status, 201, `A themed page must publish for pending connection coverage: ${await pendingControlPage.text()}`);
+    created.artifacts.push(pendingControlPageSlug);
+    const lockedPageSlug = `smoke-controls-locked-${run}`;
+    const lockedPage = await fetch(new URL('/_api/artifacts', viewer.origin), {
+      method: 'POST', headers: publishHeaders,
+      body: JSON.stringify({ ...project, slug: lockedPageSlug, title: 'Locked controls smoke', type: 'page', theme: { scope: 'platform', slug: 'launch' }, themeOverrides: { tokens: { '--a67-accent': '#8f5e00' } }, html: '<main><h1>Locked reader controls</h1></main>' }),
+    });
+    assert.equal(lockedPage.status, 201, 'A brand-locked page must publish for the controls smoke.');
+    created.artifacts.push(lockedPageSlug);
+    assert(pageContent.html.includes(photoSrc) && pageContent.html.includes(pngSrc), 'Both inline image sources must remain intact.');
+    const sitePublish = await fetch(new URL('/_api/artifacts', viewer.origin), {
+      method: 'POST', headers: publishHeaders,
+      body: JSON.stringify({ ...project, slug: siteSlug, title: 'Legacy site compatibility', html: siteHtml }),
+    });
+    assert.equal(sitePublish.status, 201, 'Omitted type must preserve complete-document site publishing.');
+    created.artifacts.push(siteSlug);
+    const siteArtifact = (await sitePublish.json()).artifact;
+    const siteContentResponse = await fetch(new URL(`/_api/artifacts/${encodeURIComponent(siteArtifact.id)}/content?version=${siteArtifact.version}`, viewer.origin), {
+      headers: { Authorization: `Bearer ${key}` },
+    });
+    assert.equal(siteContentResponse.status, 200);
+    const siteHtmlWithAnalytics = (await siteContentResponse.json()).html;
+    const siteSourceBytes = siteHtmlWithAnalytics.replace(/<script data-wsa-analytics>[\s\S]*?<\/script>/, '');
+    assert.equal(siteSourceBytes, siteHtml, 'Complete-document site source bytes must remain unchanged by page publishing.');
+    assert.equal((siteHtmlWithAnalytics.match(/<script data-wsa-analytics>/g) ?? []).length, 1, 'Legacy site analytics instrumentation must remain exactly once.');
+    console.log(`page image publishing: JPEG (${photo.length} bytes) + PNG (${pngImage.length} bytes) preserved; invalid MIME/signature rejected (422); complete-document site bytes unchanged with existing analytics script`);
     // The agent path: MCP controls the session, the bytes go to the API part path. A hostile
     // non-ASCII name pins the name handling: file() keeps it exactly, a saved download sanitizes it.
     const assetName = 'Angebot – März "1" 📎.png';
@@ -564,14 +1344,26 @@ $('abort-probe').addEventListener('click', () => {
     await until('!!document.querySelector("iframe.artifact-frame")');
     await evaluate('new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)))');
     let frame = await openFrame();
+    await frame.frameCommand('Network.enable');
     const inFrame = expression => evaluate(expression, frame.executionContextId, frame.frameCommand);
     const untilFrame = (expression, timeout) => until(expression, frame.executionContextId, frame.frameCommand, timeout);
     await untilFrame('document.getElementById("asset-status").textContent !== ""');
     const shown = await inFrame('document.getElementById("asset-status").textContent');
     assert.equal(shown, `image:1x1:image/png:${assetName}`, 'file() must keep the stored name exactly.');
+    const encodedAssetName = encodeURIComponent(assetName).replace(/['()*]/g, character => `%${character.charCodeAt(0).toString(16).toUpperCase()}`);
+    const fileResponse = await waitFor(() => runtimeFileResponses.findLast(response => response.url.includes(assetFile.id)), 'the runtime file response');
+    assert.equal(fileResponse.status, 200);
+    assert(fileResponse.disposition?.includes(`filename*=UTF-8''${encodedAssetName}`), `Content-Disposition must carry the encoded stored filename: ${JSON.stringify(fileResponse.disposition)}`);
     console.log(`file(): ${shown}`);
     await inFrame('document.getElementById("download").click(); true');
     const [guid, download] = await waitFor(() => [...downloads].find(([, entry]) => entry.done), 'a completed download');
+    const downloadResponse = await waitFor(() => {
+      const responses = runtimeFileResponses.filter(response => response.url.includes(assetFile.id));
+      return responses.length >= 2 ? responses.at(-1) : null;
+    }, 'the runtime download response');
+    assert.equal(downloadResponse.status, 200);
+    assert.equal(downloadResponse.disposition, fileResponse.disposition);
+    console.log(`download trace: response=${JSON.stringify(downloadResponse.disposition)} file.name=${JSON.stringify(assetName)} CDP.suggestedFilename=${JSON.stringify(download.name)} expected=${JSON.stringify(savedName)}`);
     assert.equal(download.name, savedName, 'A saved download carries the sanitized name.');
     assert.equal(sha(await readFile(join(work, guid))), sha(png));
     await untilFrame('document.getElementById("download-status").textContent === "downloaded"');
@@ -581,23 +1373,30 @@ $('abort-probe').addEventListener('click', () => {
       await setFiles(frame, '#uploads input[name=files]', [bigPath, smallPath]);
       await inFrame('document.forms.uploads.elements.confirm.checked = true; document.querySelector("#uploads button[type=submit]").click(); true');
     };
-    let paused;
-    const stopPaused = onEvent('Fetch.requestPaused', params => { paused = params; });
+    let paused, pausedSession;
+    const stopPausedRoot = onEvent('Fetch.requestPaused', params => { paused = params; pausedSession = sessionId; }, sessionId);
+    const stopPausedFrame = frame.frameSessionId ? onEvent('Fetch.requestPaused', params => { paused = params; pausedSession = frame.frameSessionId; }, frame.frameSessionId) : () => {};
+    const uploadPartPattern = [{ urlPattern: '*/_runtime/files/uploads/*/parts/2', requestStage: 'Request' }];
     let bigId;
+    let frameFetchEnabled = false;
     try {
-      await command('Fetch.enable', { patterns: [{ urlPattern: '*/_runtime/files/uploads/*/parts/2', requestStage: 'Request' }] });
+      await command('Fetch.enable', { patterns: uploadPartPattern });
+      if (frame.frameSessionId) { await frame.frameCommand('Fetch.enable', { patterns: uploadPartPattern }); frameFetchEnabled = true; }
       await submitUploads();   // big first, so only big part 1 can complete before the reload
       await waitFor(() => paused, 'the paused part 2');
       bigId = paused.request.url.match(/\/_runtime\/files\/uploads\/([a-f0-9]{32})\/parts\/2$/)?.[1];
       assert(bigId, `Unexpected paused URL ${paused.request.url}`);
       await untilFrame(`document.getElementById("upload-progress").textContent === "files:8388608/${total}"`);
-      await command('Fetch.failRequest', { requestId: paused.requestId, errorReason: 'Aborted' });
+      await call('Fetch.failRequest', { requestId: paused.requestId, errorReason: 'Aborted' }, pausedSession);
+      if (frameFetchEnabled) { await frame.frameCommand('Fetch.disable'); frameFetchEnabled = false; }
       await evaluate('globalThis.beforeFileReload = true');
       await command('Page.reload');   // before the viewer's 1 s part retry
       await until('!globalThis.beforeFileReload && !!document.querySelector("iframe.artifact-frame")');
     } finally {
       await command('Fetch.disable');
-      stopPaused();
+      if (frameFetchEnabled) await frame.frameCommand('Fetch.disable');
+      stopPausedRoot();
+      stopPausedFrame();
     }
     console.log(`interrupted: ${bigId} part 1 acknowledged, reloaded before part 2`);
     await evaluate('new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)))');
@@ -723,6 +1522,312 @@ $('probe-upload').addEventListener('click', () => {
     assert.equal(visitorFile.recordId, visitorId);
     assert.equal(sha((await apiBytes(visitorFile.downloadPath)).bytes), sha(small));
     console.log(`visitor file round-trip: small.txt sha256 ok submittedBy.type=${visitorRecord.submission.submittedBy.type}`);
+  await command('Emulation.setEmulatedMedia', { features: [{ name: 'prefers-color-scheme', value: 'light' }] });
+  const startupControlsUrl = new URL(`/app/a/${controlPageSlug}/view`, viewer.origin);
+  await command('Page.navigate', { url: startupControlsUrl.href });
+  await until('document.querySelectorAll(".viewer-page-controls select").length===2');
+  await until('document.querySelector("iframe.artifact-frame")?.srcdoc.length > 0');
+  const startupFrame = await openFrame();
+  const inStartupFrame = expression => evaluate(expression, startupFrame.executionContextId, startupFrame.frameCommand);
+  await until('document.querySelector("#reader-checklist [data-a67-state]")?.dataset.state==="ready" && document.querySelectorAll("#reader-checklist input[type=\\"checkbox\\"]").length===1 && document.querySelector("#reader-checklist label")?.textContent.trim()==="Read chapter one"', startupFrame.executionContextId, startupFrame.frameCommand);
+  assert.equal(await inStartupFrame('document.querySelector("#reader-checklist")?.isConnected'), true, 'The checklist must remain parser-authored in the published document.');
+  assert.equal(await inStartupFrame('document.querySelector("#reader-checklist input")?.type'), 'checkbox', 'Parser-created checklist must render a real checkbox after bridge startup.');
+  console.log('page reader startup smoke: parser-authored checklist initialized through the live bridge');
+  const controlsUrl = new URL(`/app/a/${pendingControlPageSlug}/view`, viewer.origin);
+  await evaluate("sessionStorage.setItem('__holdPageReaderReady', 'true')");
+  await command('Page.navigate', { url: controlsUrl.href });
+  await until('document.querySelectorAll(".viewer-page-controls select").length===2');
+  await evaluate('globalThis.pageReaderDocument = document; globalThis.readerFrame = document.querySelector("iframe.artifact-frame")');
+  await until('document.querySelector("iframe.artifact-frame")?.srcdoc.length > 0');
+  const controlFrame = await openFrame();
+  const inControlFrame = expression => evaluate(expression, controlFrame.executionContextId, controlFrame.frameCommand);
+  await until('!!document.querySelector("#reader-state")', controlFrame.executionContextId, controlFrame.frameCommand);
+  const inControlPage = expression => evaluate(expression, undefined, controlFrame.frameCommand);
+  const composition = await evaluate(`(() => {
+    const iframe = document.querySelector('iframe.artifact-frame');
+    const srcdoc = iframe.srcdoc;
+    const match = srcdoc.match(/^<!doctype html><html[^>]*><head><meta http-equiv="Content-Security-Policy" content="([^"]+)"/);
+    return { sandbox: iframe.getAttribute('sandbox'), csp: match?.[1], srcdoc };
+  })()`);
+  assert.equal(composition.sandbox, 'allow-scripts', 'The page frame must keep its exact opaque sandbox.');
+  assert.equal(composition.csp, `default-src 'none'; script-src 'unsafe-inline' 'unsafe-eval' data: blob:; style-src 'unsafe-inline'; img-src data: blob: ${new URL('/assets/favicon.ico', viewer.origin).href} ${new URL('/assets/ws-logo.svg', viewer.origin).href}; font-src data: blob:; media-src data: blob:; connect-src 'none'; form-action 'none'; base-uri 'none'; object-src 'none'; frame-src 'none'; worker-src 'none'`);
+  assert(composition.srcdoc.includes('<meta name="color-scheme" content="light dark">'), 'Page composition always declares both color schemes.');
+  assert(composition.srcdoc.includes('<style id="a67-page-kit">') && composition.srcdoc.includes('<style id="a67-page-theme"'), 'Kit and selected theme CSS must be inline.');
+  assert(!/<link[^>]+stylesheet/i.test(composition.srcdoc), 'Page composition must not issue external stylesheet requests.');
+  await inControlFrame('globalThis.controlRoot = document.documentElement; globalThis.controlThemeStyle = document.getElementById("a67-page-theme"); document.getElementById("reader-state").value = "retained"; document.documentElement.dataset.readerSmokeState = "retained"; true');
+  const changeControl = async (label, value) => evaluate(`(() => {
+    const select = [...document.querySelectorAll('.viewer-page-controls select')].find(item => item.labels[0]?.textContent.trim() === ${JSON.stringify(label)});
+    if (!select || select.disabled && ${JSON.stringify(label)} === 'Theme') throw new Error('Missing enabled ' + ${JSON.stringify(label)} + ' control.');
+    select.value = ${JSON.stringify(value)};
+    select.dispatchEvent(new Event('change', { bubbles: true }));
+    return select.value;
+  })()`);
+  await until('typeof window.__pagePendingReady==="function"');
+  await changeControl('Theme', 'editorial');
+  await changeControl('Text size', 's');
+  const pendingReady = await evaluate('window.__pagePendingReady(); window.__pagePendingReadyData');
+  await evaluate(`parent.postMessage(${JSON.stringify(pendingReady)}, '*'); true`, controlFrame.executionContextId, controlFrame.frameCommand);
+  await until('window.__pageSmokeChannels.length > 0');
+  await until('document.documentElement.dataset.a67Theme==="editorial" && document.documentElement.style.fontSize==="87.5%"', controlFrame.executionContextId, controlFrame.frameCommand);
+  await until('!!document.querySelector("#reader-tabs [aria-selected=\\"true\\"]")', controlFrame.executionContextId, controlFrame.frameCommand);
+  await inControlPage(`(() => { const checklist=document.createElement('a67-checklist'); checklist.id='reader-checklist'; checklist.setAttribute('storage-key','reader-smoke'); checklist.setAttribute('storage-scope','personal'); checklist.innerHTML='<span data-item="chapter-one">Read chapter one</span>'; document.querySelector('#reader-checklist-mount').replaceWith(checklist); return true; })()`);
+  await until('document.querySelector("#reader-checklist [data-a67-state]")?.dataset.state==="ready" && document.querySelectorAll("#reader-checklist input[type=\\"checkbox\\"]").length===1 && document.querySelector("#reader-checklist label")?.textContent.trim()==="Read chapter one"', controlFrame.executionContextId, controlFrame.frameCommand);
+  await inControlFrame('document.querySelector("#reader-tab-two").click(); true');
+  await until('document.querySelector("#reader-tab-two").getAttribute("aria-selected")==="true" && !document.querySelector("#reader-panel-two").hidden', controlFrame.executionContextId, controlFrame.frameCommand);
+  await inControlFrame('document.querySelector("#reader-tab-one").click(); true');
+  await until('document.querySelector("#reader-tab-one").getAttribute("aria-selected")==="true"', controlFrame.executionContextId, controlFrame.frameCommand);
+  for (const slug of ['report', 'editorial', 'launch']) {
+    await changeControl('Theme', slug);
+    await until(`document.getElementById("a67-page-theme")?.dataset.themeSlug===${JSON.stringify(slug)}`, controlFrame.executionContextId, controlFrame.frameCommand);
+    const retained = await inControlFrame('({ value: document.getElementById("reader-state").value, state: document.documentElement.dataset.readerSmokeState, sameRoot: document.documentElement === globalThis.controlRoot, sameStyle: document.getElementById("a67-page-theme") === globalThis.controlThemeStyle, scope: document.documentElement.dataset.a67Theme, accent: getComputedStyle(document.documentElement).getPropertyValue("--a67-accent").trim() })');
+    assert.equal(retained.scope, slug, `Changing to ${slug} must update the actual theme selector scope.`);
+    assert.equal(retained.accent, PLATFORM_THEMES.find(theme => theme.slug === slug).tokens.light.accent, `${slug} must apply its checked computed accent token.`);
+    assert.equal(await evaluate('document.querySelector("iframe.artifact-frame")===globalThis.readerFrame'), true, 'Theme changes must not replace or reload the frame.');
+  }
+  const nonce = composition.srcdoc.match(/data-nonce="([a-f0-9]+)"/)?.[1];
+  assert(nonce, 'The page runtime must carry a nonce.');
+  const beforeSpoof = await inControlFrame('({ slug: document.getElementById("a67-page-theme").dataset.themeSlug, css: document.getElementById("a67-page-theme").textContent })');
+  await evaluate(`(() => {
+    const port = window.__pageSmokeChannels.at(-1);
+    if (!port) throw new Error('The runtime channel was not captured.');
+    port.postMessage({ type: 'page-theme', source: 'attacker', nonce: ${JSON.stringify(nonce)}, version: 99, theme: { scope: 'platform', slug: 'report' }, css: 'html { color: red }' });
+    port.postMessage({ type: 'page-theme', source: 'parent', nonce: 'stale', version: 100, theme: { scope: 'platform', slug: 'report' }, css: 'html { color: red }' });
+    port.postMessage({ type: 'page-theme', source: 'parent', nonce: ${JSON.stringify(nonce)}, version: 1, theme: { scope: 'platform', slug: 'report' }, css: 'html { color: red }' });
+    return true;
+  })()`);
+  await delay(100);
+  assert.deepEqual(await inControlFrame('({ slug: document.getElementById("a67-page-theme").dataset.themeSlug, css: document.getElementById("a67-page-theme").textContent })'), beforeSpoof, 'Wrong-source, wrong-nonce and stale theme messages must be ignored.');
+  const modeButton = await evaluate('!!document.querySelector(\'button[aria-label="Dark appearance"]\')');
+  assert(modeButton, 'The page reader must expose the light/dark switch.');
+  await evaluate('document.querySelector(\'button[aria-label="Dark appearance"]\').click()');
+  await until('document.querySelector(\'button[aria-label="Dark appearance"]\').getAttribute("aria-pressed")==="true"');
+  await until('document.documentElement.dataset.theme==="dark"', controlFrame.executionContextId, controlFrame.frameCommand);
+  await evaluate('document.querySelector(\'button[aria-label="Dark appearance"]\').click()');
+  await until('document.documentElement.dataset.theme==="light"', controlFrame.executionContextId, controlFrame.frameCommand);
+  for (const [size, cssSize] of [['s', '87.5%'], ['m', '100%'], ['l', '120%']]) {
+    await changeControl('Text size', size);
+    await until(`document.documentElement.style.fontSize===${JSON.stringify(cssSize)}`, controlFrame.executionContextId, controlFrame.frameCommand);
+  }
+  const externalRequests = await inControlFrame(`performance.getEntriesByType('resource').map(entry => entry.name).filter(url => !url.startsWith('data:') && new URL(url).origin !== ${JSON.stringify(viewer.origin)})`);
+  assert.deepEqual(externalRequests, [], 'The composed page must not request external resources.');
+  assert.equal(await evaluate('document===globalThis.pageReaderDocument && document.querySelector("iframe.artifact-frame")===globalThis.readerFrame'), true, 'Theme/mode/size changes must not navigate the reader.');
+  await command('Page.navigate', { url: controlsUrl.href });
+  await until('document.querySelectorAll(".viewer-page-controls select").length===2');
+  assert.equal(await evaluate(`[...document.querySelectorAll('.viewer-page-controls select')].find(item => item.labels[0]?.textContent.trim() === 'Theme').value`), 'launch', 'Theme preference persists globally per browser.');
+  assert.equal(await evaluate(`[...document.querySelectorAll('.viewer-page-controls select')].find(item => item.labels[0]?.textContent.trim() === 'Text size').value`), 'l', 'Text-size preference persists globally per browser.');
+  await command('Page.navigate', { url: new URL(`/app/a/${lockedPageSlug}/view`, viewer.origin).href });
+  await until('document.querySelectorAll(".viewer-page-controls select").length===2');
+  const lockedControl = await evaluate(`(() => { const select = [...document.querySelectorAll('.viewer-page-controls select')].find(item => item.labels[0]?.textContent.trim() === 'Theme'); return { disabled: select.disabled, value: select.value }; })()`);
+  assert.deepEqual(lockedControl, { disabled: true, value: 'launch' }, 'Brand lock disables theme selection but displays the effective theme.');
+  await until('document.querySelector("iframe.artifact-frame")?.srcdoc.length > 0');
+  const lockedFrame = await openFrame();
+  assert.equal(await evaluate('getComputedStyle(document.documentElement).getPropertyValue("--a67-accent").trim()', lockedFrame.executionContextId, lockedFrame.frameCommand), '#8f5e00', 'A brand-locked token override must affect the rendered page.');
+  const galleryTarget = await call('Target.createTarget', { url: 'about:blank' });
+  const galleryAttached = await call('Target.attachToTarget', { targetId: galleryTarget.targetId, flatten: true });
+  const gallerySession = galleryAttached.sessionId;
+  const galleryCommand = (method, params) => call(method, params, gallerySession);
+  kitSessionId = gallerySession;
+  const galleryParentDiagnostics = diagnosticsFor(gallerySession);
+  await galleryCommand('Page.enable');
+  galleryParentDiagnostics.domains.push('Page');
+  await galleryCommand('Network.enable');
+  galleryParentDiagnostics.domains.push('Network');
+  await galleryCommand('Runtime.enable');
+  galleryParentDiagnostics.domains.push('Runtime');
+  await galleryCommand('Log.enable');
+  galleryParentDiagnostics.domains.push('Log');
+  galleryParentDiagnostics.captureReady = true;
+  const gallerySessionIds = new Set([gallerySession]);
+  const galleryAutoAttach = await autoAttachFrames(galleryTarget.targetId, gallerySessionIds);
+  const galleryEvaluate = async expression => evaluate(expression, undefined, galleryCommand);
+  const galleryUntil = async expression => until(expression, undefined, galleryCommand);
+  try {
+    galleryParentDiagnostics.armedBeforeNavigation = true;
+    await galleryCommand('Page.navigate', { url: new URL('/themes', viewer.origin).href });
+    await galleryUntil('document.querySelectorAll(".theme-card iframe").length===3');
+    const gallery = await galleryEvaluate(`(() => {
+      const cards=[...document.querySelectorAll('.theme-card')];
+      const samples=cards.map(card=>new DOMParser().parseFromString(card.querySelector('iframe').getAttribute('srcdoc'),'text/html'));
+      return {
+        slugs:cards.map(card=>card.dataset.themeSlug),
+        themes:samples.map(sample=>sample.documentElement.dataset.a67Theme),
+        content:samples.map(sample=>sample.querySelector('main').innerHTML),
+        images:samples.map(sample=>sample.querySelector('img')?.getAttribute('src')),
+        srcdocs:cards.map(card=>card.querySelector('iframe').getAttribute('srcdoc')),
+      };
+    })()`);
+    assert.deepEqual(gallery.slugs, ['report', 'editorial', 'launch']);
+    assert.deepEqual(gallery.themes, gallery.slugs);
+    assert.equal(new Set(gallery.content).size, 1, 'Every gallery preview must use exactly the same sample content.');
+    assert(gallery.content[0].includes('Common sample page'));
+    assert.equal(new Set(gallery.images).size, 1, 'Every gallery preview must use the same inline sample image.');
+    const { frameTree: galleryTree } = await galleryCommand('Page.getFrameTree');
+    const galleryFrameDeadline = Date.now() + 15000;
+    let targets = [];
+    do {
+      targets = (await call('Target.getTargets')).targetInfos.filter(target =>
+        target.type === 'iframe' && target.parentFrameId === galleryTree.frame.id && target.url === 'about:srcdoc');
+      if (targets.length === 3 && targets.every(target => galleryAutoAttach.sessions.has(target.targetId))) break;
+      await delay(50);
+    } while (Date.now() < galleryFrameDeadline);
+    assert.equal(targets.length, 3, 'The three isolated preview frames must be running.');
+    assert(targets.every(target => galleryAutoAttach.sessions.has(target.targetId)), 'Every preview target must be registered for diagnostics.');
+    await Promise.all(targets.map(target => galleryAutoAttach.setups.get(target.targetId)));
+    assert.deepEqual(galleryAutoAttach.setupErrors, [], 'Preview diagnostic domains must be enabled and retained.');
+    assert.equal(gallerySessionIds.size, 4, 'Retain diagnostics for the gallery parent and all three preview sessions.');
+    const liveGalleryFrames = [];
+    for (const target of targets) {
+      const sessionId = galleryAutoAttach.sessions.get(target.targetId);
+      const diagnostics = diagnosticsBySession.get(sessionId);
+      assert(diagnostics?.captureReady && gallerySessionIds.has(sessionId), 'Each isolated preview must retain its diagnostic session.');
+      const frameCommand = (method, params) => call(method, params, sessionId);
+      const { frameTree } = await frameCommand('Page.getFrameTree');
+      liveGalleryFrames.push({ frameId: frameTree.frame.id, frameCommand, sessionId });
+    }
+    const livePreviews = [];
+    for (const preview of liveGalleryFrames) {
+      await until('document.readyState === "complete"', undefined, preview.frameCommand);
+      const live = await evaluate(`(() => {
+        const image=document.querySelector('img');
+        const accent=getComputedStyle(document.documentElement).getPropertyValue('--a67-accent').trim();
+        return {
+          theme:document.documentElement.dataset.a67Theme,
+          heading:document.querySelector('h1')?.textContent.trim(),
+          kit:typeof window.__a67PageKit?.configure==='function',
+          configured:Object.prototype.hasOwnProperty.call(window.__a67PageKit||{},'logo')&&window.__a67PageKit.logo===null,
+          imageLoaded:!!image&&image.complete&&image.naturalWidth===1,
+          accent,
+          resources:performance.getEntriesByType('resource').map(resource=>resource.name),
+        };
+      })()`, undefined, preview.frameCommand);
+      livePreviews.push(live);
+    }
+    const galleryRecords = [...gallerySessionIds].map(sessionId => diagnosticsBySession.get(sessionId)).filter(Boolean);
+    assert.equal(galleryRecords.length, gallerySessionIds.size, 'Every retained parent and preview session must have diagnostic evidence.');
+    const galleryDiagnostics = {
+      requests: galleryRecords.flatMap(diagnostics => diagnostics.requests),
+      networkFailures: galleryRecords.flatMap(diagnostics => diagnostics.networkFailures),
+      consoleErrors: galleryRecords.flatMap(diagnostics => diagnostics.consoleErrors),
+      exceptions: galleryRecords.flatMap(diagnostics => diagnostics.exceptions),
+      cspViolations: galleryRecords.flatMap(diagnostics => diagnostics.cspViolations),
+    };
+    assert.deepEqual(livePreviews.map(preview => preview.theme).sort(), ['editorial', 'launch', 'report']);
+    for (const preview of livePreviews) {
+      assert.equal(preview.heading, 'Common sample page');
+      assert.equal(preview.kit, true, `${preview.theme} inline page-kit runtime must execute.`);
+      assert.equal(preview.configured, true, `${preview.theme} inline theme configuration must execute.`);
+      assert.equal(preview.imageLoaded, true, `${preview.theme} data-image sample must render.`);
+      assert.notEqual(preview.accent, '', `${preview.theme} compiled theme CSS must apply.`);
+    }
+    // Audit the exact gallery srcdocs as independent top-level documents so Chromium can apply
+    // each requested viewport to the document itself instead of the narrower gallery card.
+    for (const [index, theme] of gallery.slugs.entries()) {
+      const auditTarget = await call('Target.createTarget', { url: 'about:blank' });
+      try {
+        const auditAttached = await call('Target.attachToTarget', { targetId: auditTarget.targetId, flatten: true });
+        const auditCommand = (method, params) => call(method, params, auditAttached.sessionId);
+        await auditCommand('Page.enable');
+        await auditCommand('Runtime.enable');
+        const { frameTree } = await auditCommand('Page.getFrameTree');
+        await auditCommand('Page.setDocumentContent', { frameId: frameTree.frame.id, html: gallery.srcdocs[index] });
+        const auditEvaluate = expression => evaluate(expression, undefined, auditCommand);
+        await until('document.readyState==="complete"', undefined, auditCommand);
+        await runAxeThemeMatrix(`gallery-preview-${theme}`, auditCommand, auditEvaluate);
+      } finally {
+        await call('Target.closeTarget', { targetId: auditTarget.targetId });
+      }
+    }
+    assert(galleryParentDiagnostics.captureReady && galleryParentDiagnostics.armedBeforeNavigation, 'Gallery parent diagnostics must be registered before navigation.');
+    assert.deepEqual(externalRequestUrls([...galleryDiagnostics.requests, ...livePreviews.flatMap(preview => preview.resources)]), [], 'The gallery and live previews must not make external requests.');
+    assert.deepEqual(galleryDiagnostics.networkFailures.filter(failure => failure.blockedReason === 'csp' || /content security policy/i.test(failure.error)), [], 'Gallery startup must not block resources under CSP.');
+    assert.deepEqual(galleryDiagnostics.consoleErrors, [], 'Live theme previews must not log console errors.');
+    assert.deepEqual(galleryDiagnostics.exceptions, [], 'Live theme previews must not throw runtime exceptions.');
+    assert.deepEqual(galleryDiagnostics.cspViolations, [], 'Live theme previews must not trigger CSP failures.');
+    console.log('Task 7 smoke: live public gallery frames rendered all checked themes without CSP failures');
+    console.log('Task 7 smoke: public gallery verified');
+    await runAxeThemeMatrix('gallery', galleryCommand, galleryEvaluate);
+    await galleryCommand('Target.setAutoAttach', { autoAttach: false, waitForDebuggerOnStart: false, flatten: true });
+    autoAttachHandlers.delete(undefined);
+    assert.equal(autoAttachHandlers.has(undefined), false, 'Gallery auto-attachment diagnostics must stop before the download viewer navigation.');
+
+    await galleryCommand('Page.navigate', { url: new URL(`/app/a/${pageSlug}/view`, viewer.origin).href });
+    await galleryUntil('!!document.querySelector("button[aria-label=\\"Download HTML\\"]:not(:disabled)") && !!document.querySelector("iframe.artifact-frame")?.srcdoc');
+    const themeControl = await galleryEvaluate(`(() => { const select=[...document.querySelectorAll('.viewer-page-controls select')].find(item=>item.labels[0]?.textContent.trim()==='Theme'); return { disabled:select.disabled,value:select.value }; })()`);
+    if (!themeControl.disabled) await galleryEvaluate(`(() => { const select=[...document.querySelectorAll('.viewer-page-controls select')].find(item=>item.labels[0]?.textContent.trim()==='Theme'); select.value='editorial'; select.dispatchEvent(new Event('change',{bubbles:true})); return true; })()`);
+    const downloadTheme = await galleryEvaluate(`[...document.querySelectorAll('.viewer-page-controls select')].find(item=>item.labels[0]?.textContent.trim()==='Theme').value`);
+    if (!themeControl.disabled) assert.equal(downloadTheme, 'editorial');
+    const photoFrame = await openFrame(galleryCommand);
+    await until(`document.documentElement.dataset.a67Theme===${JSON.stringify(downloadTheme)}`, photoFrame.executionContextId, photoFrame.frameCommand);
+    await galleryEvaluate(`(() => {
+      const create=URL.createObjectURL.bind(URL);
+      URL.createObjectURL=blob=>{ window.__downloadCapture=blob.text(); return create(blob); };
+      HTMLAnchorElement.prototype.click=function(){ window.__downloadName=this.download; };
+      document.querySelector('button[aria-label="Download HTML"]').click();
+      return true;
+    })()`);
+    await galleryUntil('window.__downloadName === "Page image smoke.html" && !!window.__downloadCapture');
+    const downloadedPage = await galleryEvaluate('window.__downloadCapture');
+    assert.equal(await galleryEvaluate('window.__downloadName'), 'Page image smoke.html');
+    console.log('Task 7 smoke: reader download blob captured');
+    const standalone = await galleryEvaluate(`(() => {
+      const source=${JSON.stringify(downloadedPage)};
+      const doc=new DOMParser().parseFromString(source,'text/html');
+      const images=[...doc.images];
+      const external=[...doc.querySelectorAll('[src],[href]')].map(element=>element.getAttribute('src')||element.getAttribute('href')).filter(value=>value&&!value.startsWith('data:'));
+      return {
+        doctype:source.startsWith('<!doctype html>'),
+        slug:doc.documentElement.dataset.a67Theme,
+        kit:!!doc.getElementById('a67-page-kit'),
+        theme:!!doc.getElementById('a67-page-theme'),
+        photo:images.some(image=>image.getAttribute('src')===${JSON.stringify(photoSrc)}),
+        png:images.some(image=>image.getAttribute('src')===${JSON.stringify(pngSrc)}),
+        noAuthority:!/window\.artefacts\s*=/.test(source),
+        noGrant:!source.includes('X-Artefacts-Grant')&&!source.includes('wsa_session')&&!source.includes(${JSON.stringify(process.env.WS_SMOKE_SESSION)}),
+        noPrivateData:!source.includes(${JSON.stringify(process.env.WS_SMOKE_API_KEY)}),
+        external,
+      };
+    })()`);
+    assert(standalone.doctype, 'Downloaded page must parse as a complete standalone HTML document.');
+    assert.equal(standalone.slug, downloadTheme);
+    assert(standalone.kit && standalone.theme, 'The downloaded page must include the page kit and resolved theme.');
+    assert(standalone.photo && standalone.png, 'The original validated data-image sources must survive byte-for-byte.');
+    assert(standalone.noAuthority && standalone.noGrant && standalone.noPrivateData, 'The standalone document must contain no live SDK authority or private state.');
+    assert.deepEqual(standalone.external, [], 'Standalone document must not reference external resources.');
+    console.log('Task 7 smoke: downloaded page inspected');
+    const standaloneTarget = await call('Target.createTarget', { url: 'about:blank' });
+    const standaloneAttached = await call('Target.attachToTarget', { targetId: standaloneTarget.targetId, flatten: true });
+    const standaloneCommand = (method, params) => call(method, params, standaloneAttached.sessionId);
+    kitSessionId = standaloneAttached.sessionId;
+    kitRequests.length = kitConsoleErrors.length = kitExceptions.length = kitCspViolations.length = 0;
+    await standaloneCommand('Page.enable');
+    await standaloneCommand('Network.enable');
+    await standaloneCommand('Runtime.enable');
+    await standaloneCommand('Log.enable');
+    const standaloneEvaluate = async expression => evaluate(expression, undefined, standaloneCommand);
+    const standaloneUntil = async expression => until(expression, undefined, standaloneCommand);
+    await standaloneCommand('Page.navigate', { url: `data:text/html;charset=utf-8,${encodeURIComponent(downloadedPage)}` });
+    await standaloneUntil('typeof window.artefacts==="undefined" && !!window.__a67PageKit');
+    console.log('Task 7 smoke: standalone page loaded without SDK authority');
+    await runAxeThemeMatrix('download', standaloneCommand, standaloneEvaluate);
+    for (const width of [320, 390, 1440]) {
+      await standaloneCommand('Emulation.setDeviceMetricsOverride', { width, height: 900, deviceScaleFactor: 1, mobile: false });
+      await standaloneUntil(`document.readyState==="complete" && document.images[0]?.complete && document.images[0]?.naturalWidth>0`);
+      const layout = await standaloneEvaluate(`(() => ({ viewport:innerWidth, page:document.documentElement.scrollWidth, images:[...document.images].map(image=>({src:image.getAttribute('src'),width:image.getBoundingClientRect().width,container:image.parentElement.getBoundingClientRect().width,loaded:image.complete&&image.naturalWidth>0})) }))()`);
+      assert.equal(layout.viewport, width);
+      assert(layout.page <= width, `Downloaded page overflows at ${width}px: ${layout.page}px.`);
+      assert(layout.images.every(image=>image.width<=image.container&&image.loaded), `Downloaded images must render inside their containers at ${width}px.`);
+    }
+    const externalPageRequests = kitRequests.filter(url => !url.startsWith('data:') && new URL(url).origin !== viewer.origin);
+    assert.deepEqual(externalPageRequests, [], 'Gallery and downloaded page must not request external resources.');
+    assert.deepEqual(kitConsoleErrors, [], 'Gallery and downloaded page must not log console errors.');
+    assert.deepEqual(kitExceptions, [], 'Gallery and downloaded page must not throw runtime exceptions.');
+    assert.deepEqual(kitCspViolations, [], 'Gallery and downloaded page must not trigger CSP failures.');
+    console.log('themes gallery/download smoke: report/editorial/launch share one image sample; page download preserves JPEG+PNG; standalone, no SDK authority/private data/external resources; 320/390/1440 render with no overflow, console or CSP failures');
+    await call('Target.closeTarget', { targetId: standaloneTarget.targetId });
+  } finally {
+    await call('Target.closeTarget', { targetId: galleryTarget.targetId });
+  }
+  console.log('page reader controls: report/editorial/launch swaps, light/dark, S/M/L, persisted preferences, stale nonce/source/version rejection, frame state retained and brand lock enforced');
   } finally {
     for (const stop of stops) stop();
     const failures = [];
@@ -739,6 +1844,14 @@ $('probe-upload').addEventListener('click', () => {
     await rm(work, { recursive: true, force: true });
     if (failures.length) throw new Error(`Project files cleanup failed: ${failures.join('; ')}`);
   }
+  const expectedAxePages = ['download', 'gallery', 'interactive-and-data-bound', 'static-and-data-bound', ...PLATFORM_THEMES.map(theme => `gallery-preview-${theme.slug}`)];
+  const expectedAxeRows = expectedAxePages.length * PLATFORM_THEMES.length * 2 * 2;
+  assert.equal(axeRows.length, expectedAxeRows, 'Every static/data-bound, interactive, live gallery, gallery preview and download matrix row must run.');
+  assert.equal(new Set(axeRows.map(row => `${row.page}/${row.theme}/${row.scheme}/${row.width}`)).size, expectedAxeRows, 'Every axe matrix row must be unique.');
+  assert.deepEqual([...new Set(axeRows.map(row => row.page))].sort(), expectedAxePages.sort());
+  assert(axeRows.every(row => row.violations.length === 0), 'Every matrix row must have zero axe violations.');
+  console.log(`axe-core matrix passed: ${axeRows.length} rows; tags=${axeTags.join(',')}; themes=${PLATFORM_THEMES.map(theme => theme.slug).join(',')}; schemes=light,dark; viewports=390,1440; violations=0`);
+  console.log(`axe-core incomplete findings (not counted as passes): ${JSON.stringify(axeIncomplete)}`);
   console.log('Solid reader smoke passed: modal focus, Preview/Code, dynamic rename, stable frame/sidebar, opaque sandbox, validation/tab/GET-URL continuity, pending-GET/same-URL/away-back POST ownership, restore GET-URL continuity, account/API-key navigation, unchecked content-read checkbox default, authorized HTTP content read and denied-capability 403, stale ifVersion publish conflict with unchanged fixture, native form submission through the SDK and MCP, project files (API upload, in-frame display, viewer download, multipart form upload with reload-and-resume, abort, signed-out visitor upload).');
 } finally {
   let revokeError;

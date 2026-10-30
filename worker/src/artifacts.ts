@@ -35,6 +35,7 @@ import {
 import { artifactObject } from "./r2keys.js";
 import { mintPathId, normalizePath, pathTaken } from "./paths.js";
 import { FONT_LIMITS, openArtifactService, prepareArtifactHtml } from "./fonts.js";
+import { validatePageFragment, type PageDocument } from "./page-validation.js";
 
 const enc = new TextEncoder();
 const nowIso = () => new Date().toISOString();
@@ -71,23 +72,32 @@ export interface Artifact {
 export interface ArtifactVersionRow {
   artifact_id: string; version: number; r2_key: string; size: number; sha256: string;
   author_type: AuthorType; author_id: string; note: string | null; created_at: string;
+  type: "site" | "page"; theme_scope: "platform" | "project" | null; theme_id: string | null;
+  theme_slug: string | null; theme_overrides_sealed: string | null; brand_lock: number;
 }
 export interface ArtifactVersion {
   artifactId: string; version: number; r2Key: string; size: number; sha256: string;
   authorType: AuthorType; authorId: string; note: string | null; createdAt: string;
+  type: "site" | "page"; themeScope: "platform" | "project" | null; themeId: string | null;
+  themeSlug: string | null; themeOverridesSealed: string | null; brandLock: boolean;
 }
 export interface ArtifactCiphertext { v: 1; iv: string; ct: string }
 export interface GatePayload { wrap: PasswordWrap; content: ArtifactCiphertext }
+export interface ThemeReference { scope: "platform"; slug: string }
 export interface CreateArtifact {
   ownerId: string; folderId?: string | null; title?: unknown; lang?: unknown; html: unknown;
   password?: unknown; slug?: string | null; authorType?: AuthorType; authorId: string;
-  note?: string | null; prepared?: unknown;
+  note?: string | null; prepared?: unknown; type?: "site" | "page"; theme?: ThemeReference | null;
+  themeId?: string | null; themeOverrides?: unknown; themeOverridesSealed?: string | null; brandLock?: boolean;
+  validatedPage?: PageDocument;
 }
 export interface PublishArtifact {
   artifactId: string; html: unknown; authorType?: AuthorType; authorId: string;
   note?: string | null; password?: unknown; title?: unknown; lang?: unknown; prepared?: unknown; ifVersion?: number;
+  type?: "site" | "page"; theme?: ThemeReference | null; themeId?: string | null;
+  themeOverrides?: unknown; themeOverridesSealed?: string | null; brandLock?: boolean; validatedPage?: PageDocument;
 }
-export interface DuplicateArtifact extends Omit<CreateArtifact, "html" | "prepared"> { artifactId: string }
+export interface DuplicateArtifact extends Omit<CreateArtifact, "html" | "prepared" | "validatedPage"> { artifactId: string }
 export interface RestoreArtifact {
   artifactId: string; version: unknown; authorType?: AuthorType; authorId: string; note?: string | null; ifVersion?: number;
 }
@@ -137,6 +147,8 @@ interface Provenance { size: number; sha256: string }
 interface WriteVersion {
   keyHex: string; authorType: AuthorType; authorId: string; note: string | null;
   captured?: Capture; provenance?: Provenance | null; changes?: D1Statement[]; ifVersion?: number;
+  type?: "site" | "page"; theme?: ThemeReference | null; themeId?: string | null;
+  themeOverrides?: unknown; themeOverridesSealed?: string | null; brandLock?: boolean;
 }
 
 function toArtifact(row: ArtifactRow): Artifact;
@@ -209,6 +221,13 @@ export function openArtifacts({ db, bucket, masterKeyHex, settings, iterations =
     }
     return { html, warnings: [], exact: true };
   };
+  const pageCapture = (html: unknown, validatedPage?: PageDocument): Effect.Effect<Capture, CodeError> =>
+    Effect.try({ try: () => {
+      if (typeof html !== "string") throw coded("invalid-content", "Page source must be a string");
+      if (validatedPage && validatedPage.source !== html) throw coded("invalid-content", "Validated page does not match the published source");
+      if (!validatedPage) validatePageFragment(html);
+      return storedCapture(html);
+    }, catch: asCodeError });
 
   /** Maintenance failures must not turn a committed publish into a failed publication. */
   const prune = (artifactId: string, versions: ArtifactVersion[]): Effect.Effect<void> => Effect.gen(function* () {
@@ -241,33 +260,36 @@ export function openArtifacts({ db, bucket, masterKeyHex, settings, iterations =
 
   /** R2 first, then the atomic rows/trigger that decide the winning publication. */
   const writeVersion = Effect.fn(function* (artifact: Artifact, html: unknown,
-    { keyHex, authorType, authorId, note, captured, provenance = null, changes = [], ifVersion }: WriteVersion) {
+    { keyHex, authorType, authorId, note, captured, provenance = null, changes = [], ifVersion,
+      type = "site", theme = null, themeId = null, themeOverrides, themeOverridesSealed = null, brandLock = false }: WriteVersion) {
     if (ifVersion !== undefined && artifact.currentVersion !== ifVersion) {
       return yield* Effect.fail(versionConflict(ifVersion, artifact.currentVersion));
     }
     if (typeof html !== "string") return yield* Effect.fail(coded("invalid-content", "artefact content must be a string"));
     const authored = enc.encode(html);
-    const ready: Capture = captured ?? (yield* prepareArtifactHtml(html, { fetcher: fontFetch }));
+    const ready: Capture = captured ?? (yield* (type === "page"
+      ? pageCapture(html)
+      : prepareArtifactHtml(html, { fetcher: fontFetch })));
     const prepared = ready.exact === true ? ready.html : prepareDocument ? String(prepareDocument(ready.html)) : ready.html;
     const bytes = enc.encode(prepared);
     if (bytes.byteLength > FONT_LIMITS.documentBytes) return yield* Effect.fail(coded("font-limit", "Expanded document exceeds its stored byte limit"));
     const version = artifact.currentVersion + 1;
-    // One object per write attempt; the committed row remains the authoritative key.
     const key = `${artifactObject(artifact.id, version).slice(0, -".enc".length)}-${yield* randomHex(8)}.enc`;
     const sealed = yield* sealBlob(keyHex, bytes);
     const written = yield* io(() => bucket.put(key, sealed, { onlyIf: { etagDoesNotMatch: "*" } }));
     if (written === null) return yield* Effect.fail(coded("publish-conflict", "another publication already owns this version; retry"));
     const at = nowIso(), size = provenance?.size ?? authored.byteLength;
     const digest = provenance?.sha256 ?? hex(yield* sha256(authored));
+    const overridesSealed = themeOverridesSealed ?? (themeOverrides == null ? null : yield* scalarSeal(masterKeyHex, { v: themeOverrides }));
     yield* io(() => db.batch([
       db.prepare(
-        "INSERT INTO artifact_versions (artifact_id, version, r2_key, size, sha256, author_type, author_id, note, created_at) VALUES (?,?,?,?,?,?,?,?,?)",
-      ).bind(artifact.id, version, key, size, digest, authorType, authorId, note ?? null, at),
+        "INSERT INTO artifact_versions (artifact_id, version, r2_key, size, sha256, author_type, author_id, note, created_at, type, theme_scope, theme_id, theme_slug, theme_overrides_sealed, brand_lock) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+      ).bind(artifact.id, version, key, size, digest, authorType, authorId, note ?? null, at, type,
+        theme?.scope ?? null, themeId, theme?.slug ?? null, overridesSealed, brandLock ? 1 : 0),
       ...changes,
       db.prepare("UPDATE artifacts SET current_version = ?, updated_at = ? WHERE id = ? AND deleted_at IS NULL")
         .bind(version, at, artifact.id),
     ])).pipe(Effect.catch((error) => Effect.gen(function* () {
-      // A failed attempt owns only its unique object; never delete the winning version.
       yield* io(() => bucket.delete(key)).pipe(Effect.catch(() => Effect.gen(function* () {
         yield* io(() => db.prepare("UPDATE artifacts SET purged_at = NULL WHERE id = ? AND deleted_at IS NOT NULL").bind(artifact.id).run());
         return yield* Effect.fail(coded("purge-failed", "Publication failed and its content could not be removed; if the artefact is withdrawn, the daily cleanup removes it"));
@@ -288,10 +310,12 @@ export function openArtifacts({ db, bucket, masterKeyHex, settings, iterations =
     return { version, size, createdAt: at, warnings: ready.warnings };
   });
 
-  const create = Effect.fn(function* ({ ownerId, folderId = null, title = "", lang = "en", html,
+  const create = Effect.fn(function* ({ ownerId, folderId = null, title = "", lang = "en", html, type = "site",
+    theme = null, themeId = null, themeOverrides, themeOverridesSealed = null, brandLock, validatedPage,
     password: rawPassword = null, slug = null, authorType = "user", authorId, note = null, prepared = null }: CreateArtifact,
     captured: Capture | null = null, provenance: Provenance | null = null) {
     if (!ownerId) return yield* Effect.fail(coded("invalid-owner", "an artefact needs an owner"));
+    if (type !== "site" && type !== "page") return yield* Effect.fail(coded("invalid-type", "artefact type must be site or page"));
     if (folderId != null) {
       const folder = yield* io(() => db.prepare("SELECT id, owner_id FROM folders WHERE id = ?")
         .bind(folderId).first<{ id: string; owner_id: string }>());
@@ -300,8 +324,10 @@ export function openArtifacts({ db, bucket, masterKeyHex, settings, iterations =
     }
     const clean = slug == null ? null : normalizePath(slug);
     if (slug != null && (!clean || clean.includes("/"))) return yield* Effect.fail(coded("invalid-slug", "slug must be one lowercase path segment"));
-    if (clean && (yield* self.pathTaken(clean))) return yield* Effect.fail(coded("slug-taken", "that slug is already in use"));
-    const ready = captured ?? (yield* resolvePrepared(html, prepared, gatePassword(rawPassword) != null));
+    if (clean && (yield* self.pathTaken(clean))) return yield* Effect.fail(coded("slug-taken", "that path is already in use"));
+    const ready = captured ?? (yield* (type === "page"
+      ? pageCapture(html, validatedPage)
+      : resolvePrepared(html, prepared, gatePassword(rawPassword) != null)));
     const id = yield* mintPathId(db), keyHex = yield* randomHex(KEY_BYTES), password = gatePassword(rawPassword);
     const verifier = password === null ? null : yield* makeVerifier(password);
     const at = nowIso(), titleSealed = yield* scalarSeal(masterKeyHex, { t: String(title ?? "") });
@@ -311,7 +337,12 @@ export function openArtifacts({ db, bucket, masterKeyHex, settings, iterations =
       "INSERT INTO artifacts (id, owner_id, folder_id, slug, lang, title_sealed, current_version, password_salt, password_verifier, key_wrap_password, key_wrap_master, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
     ).bind(id, ownerId, folderId, clean, String(lang ?? "en"), titleSealed, 0, verifier?.vsalt ?? null,
       verifier ? JSON.stringify({ viter: verifier.viter, vhash: verifier.vhash }) : null, wrapPassword, wrapMaster, at, at).run());
-    yield* writeVersion(yield* required(id), html, { keyHex, authorType, authorId, note, captured: ready, provenance });
+    const overrideTokens = themeOverrides !== null && typeof themeOverrides === "object" && "tokens" in themeOverrides
+      ? themeOverrides.tokens
+      : null;
+    const effectiveBrandLock = Boolean(brandLock || (overrideTokens !== null && typeof overrideTokens === "object" && Object.keys(overrideTokens).length > 0));
+    yield* writeVersion(yield* required(id), html, { keyHex, authorType, authorId, note, captured: ready,
+      provenance, type, theme, themeId, themeOverrides, themeOverridesSealed, brandLock: effectiveBrandLock });
     yield* changed(id);
     return yield* required(id);
   });
@@ -379,7 +410,9 @@ export function openArtifacts({ db, bucket, masterKeyHex, settings, iterations =
         "SELECT * FROM artifact_versions WHERE artifact_id = ? ORDER BY version DESC",
       ).bind(artifactId).all<ArtifactVersionRow>());
       return results.map((r) => ({ artifactId: r.artifact_id, version: Number(r.version), r2Key: r.r2_key,
-        size: Number(r.size), sha256: r.sha256, authorType: r.author_type, authorId: r.author_id, note: r.note ?? null, createdAt: r.created_at }));
+        size: Number(r.size), sha256: r.sha256, authorType: r.author_type, authorId: r.author_id, note: r.note ?? null,
+        createdAt: r.created_at, type: r.type ?? "site", themeScope: r.theme_scope ?? null, themeId: r.theme_id ?? null,
+        themeSlug: r.theme_slug ?? null, themeOverridesSealed: r.theme_overrides_sealed ?? null, brandLock: Boolean(r.brand_lock) }));
     }),
     title: Effect.fn(function* (artifact: Artifact | null | undefined) {
       return String((yield* scalarUnseal<{ t: string }>(masterKeyHex, artifact?.titleSealed))?.t ?? "");
@@ -398,9 +431,11 @@ export function openArtifacts({ db, bucket, masterKeyHex, settings, iterations =
     prepare: (html, options) => service.prepare(html, options),
     create: (input) => create(input),
     publish: Effect.fn(function* ({ artifactId, html, authorType = "user", authorId, note = null,
-      password: rawPassword, title, lang, prepared = null, ifVersion }: PublishArtifact) {
+      password: rawPassword, title, lang, prepared = null, ifVersion, type = "site", theme = null,
+      themeId = null, themeOverrides, themeOverridesSealed = null, brandLock = false, validatedPage }: PublishArtifact) {
       const artifact = yield* required(artifactId);
       if (artifact.deletedAt) return yield* Effect.fail(coded("not-found", "no such artefact"));
+      if (type !== "site" && type !== "page") return yield* Effect.fail(coded("invalid-type", "artefact type must be site or page"));
       const keyHex = yield* self.contentKey(artifact), changes: D1Statement[] = [];
       if (rawPassword !== undefined) {
         const password = gatePassword(rawPassword), verifier = password === null ? null : yield* makeVerifier(password);
@@ -412,8 +447,13 @@ export function openArtifacts({ db, bucket, masterKeyHex, settings, iterations =
         .bind(yield* scalarSeal(masterKeyHex, { t: String(title) }), artifact.id));
       if (lang != null) changes.push(db.prepare("UPDATE artifacts SET lang = ? WHERE id = ?").bind(String(lang), artifact.id));
       const gated = rawPassword !== undefined ? gatePassword(rawPassword) != null : self.gated(artifact);
-      const captured = yield* resolvePrepared(html, prepared, gated);
-      const result = yield* writeVersion(artifact, html, { keyHex, authorType, authorId, note, captured, changes, ifVersion });
+      const captured = yield* (type === "page" ? pageCapture(html, validatedPage) : resolvePrepared(html, prepared, gated));
+      const overrideTokens = themeOverrides !== null && typeof themeOverrides === "object" && "tokens" in themeOverrides
+        ? themeOverrides.tokens
+        : null;
+      const locksBrand = Boolean(brandLock || (overrideTokens !== null && typeof overrideTokens === "object" && Object.keys(overrideTokens).length > 0));
+      const result = yield* writeVersion(artifact, html, { keyHex, authorType, authorId, note, captured, changes, ifVersion,
+        type, theme, themeId, themeOverrides, themeOverridesSealed, brandLock: locksBrand });
       yield* changed(artifact.id);
       return result;
     }),
@@ -472,13 +512,20 @@ export function openArtifacts({ db, bucket, masterKeyHex, settings, iterations =
       const { row } = yield* retained(source, source.currentVersion);
       const html = yield* self.document(source);
       return yield* create({ ownerId, folderId, title: title ?? (yield* self.title(source)), slug, password,
-        lang: source.lang, html, authorType, authorId, note }, yield* Effect.try({ try: () => storedCapture(html), catch: asCodeError }), row);
+        lang: source.lang, html, authorType, authorId, note, type: row.type ?? "site",
+        theme: row.theme_scope === "platform" && row.theme_slug ? { scope: "platform", slug: row.theme_slug } : null,
+        themeId: row.theme_id ?? null, themeOverridesSealed: row.theme_overrides_sealed ?? null,
+        brandLock: Boolean(row.brand_lock) }, yield* Effect.try({ try: () => storedCapture(html), catch: asCodeError }), row);
     }),
     restore: Effect.fn(function* ({ artifactId, version, authorType = "user", authorId, note = null, ifVersion }: RestoreArtifact) {
       const { artifact, row } = yield* retained(yield* self.byId(artifactId), version);
       const html = yield* self.document(artifact, version);
       const result = yield* writeVersion(artifact, html, { keyHex: yield* self.contentKey(artifact),
-        authorType, authorId, note, ifVersion, captured: yield* Effect.try({ try: () => storedCapture(html), catch: asCodeError }), provenance: row });
+        authorType, authorId, note, ifVersion, type: row.type ?? "site",
+        theme: row.theme_scope === "platform" && row.theme_slug ? { scope: "platform", slug: row.theme_slug } : null,
+        themeId: row.theme_id ?? null, themeOverridesSealed: row.theme_overrides_sealed ?? null,
+        brandLock: Boolean(row.brand_lock),
+        captured: yield* Effect.try({ try: () => storedCapture(html), catch: asCodeError }), provenance: row });
       yield* changed(artifact.id);
       return result;
     }),
@@ -524,7 +571,9 @@ export function openArtifacts({ db, bucket, masterKeyHex, settings, iterations =
         version: {
           artifactId: row.artifact_id, version: Number(row.version), r2Key: row.r2_key, size: Number(row.size),
           sha256: row.sha256, authorType: row.author_type, authorId: row.author_id,
-          note: row.note ?? null, createdAt: row.created_at,
+          note: row.note ?? null, createdAt: row.created_at, type: row.type ?? "site",
+          themeScope: row.theme_scope ?? null, themeId: row.theme_id ?? null, themeSlug: row.theme_slug ?? null,
+          themeOverridesSealed: row.theme_overrides_sealed ?? null, brandLock: Boolean(row.brand_lock),
         },
         html: utf8(yield* openBlob(yield* self.contentKey(current), bytes)),
       };

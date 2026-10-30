@@ -17,13 +17,12 @@ import { SLUG_SEGMENT } from "./router.js";
  *  (`CONTEXT.md`, *Secret link*), so it may not be narrower than it was. */
 export const ID_BYTES = 10;
 
-/** First segments the human console owns (ADR 0024). A folder or artefact answering to one of
- *  these would shadow a system page, so the names are permanently out of the public namespace:
- *  `pathTaken` treats them as spoken for, and creation, rename and alias all inherit the rule
- *  without re-checking. The `_`-prefixed machine namespaces need no entry here — the slug
- *  charset already excludes `_`. */
+/** Site-owned first segments. A folder or artefact answering to one would shadow a route, so
+ *  creation, rename, and alias all reject these names through `pathTaken`. Existing holders are
+ *  never deleted: their id paths remain usable and owners can rename them to an unreserved slug.
+ *  The `_`-prefixed machine namespaces need no entry here — the slug charset already excludes `_`. */
 export const RESERVED_SEGMENTS = new Set([
-  "app", "admin", "settings",
+  "app", "admin", "settings", "themes",
   "login", "logout", "register", "invite", "enroll", "2fa", "passkey",
   "instructions", "assets", "api", "health",
 ]);

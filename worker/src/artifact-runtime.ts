@@ -11,6 +11,9 @@ import type { Collection, CollectionKind, ProjectData, ProjectRecord, Submission
 import type { ProjectFiles } from "./project-files.js";
 import type { RateLimiter } from "./ratelimit.js";
 import { asCodeError, type CodeError, type DatabaseLike } from "./types.js";
+import type { CompiledTheme } from "../../frontend/src/theme-compiler.js";
+import { compileThemeOverrides } from "../../frontend/src/theme-overrides.js";
+import { getPlatformTheme } from "../../frontend/src/platform-themes.js";
 
 const LIFETIME = 60 * 60 * 1000;
 const fail = (code: string, message: string): CodeError => Object.assign(new Error(message), { code });
@@ -51,6 +54,7 @@ export interface ViewerContext extends RuntimeSessionContext {
   folders: Pick<Folders, "name">;
   artifacts: Pick<Artifacts, "title" | "gated" | "versions">;
   projectData: Pick<ProjectData, "projectOf" | "collections">;
+  publicOrigin: string;
 }
 export interface DuplicateContext {
   access: ShareAccess;
@@ -66,7 +70,7 @@ export interface RuntimeReadContext extends RuntimeSessionContext {
   analytics: Pick<Analytics, "proof">;
 }
 export interface RuntimeContext extends RuntimeReadContext {
-  artifacts: Pick<Artifacts, "byId" | "byPath" | "live" | "gated" | "title" | "duplicate" | "document">;
+  artifacts: Pick<Artifacts, "byId" | "byPath" | "live" | "gated" | "title" | "duplicate" | "readContent">;
   folders: Pick<Folders, "byId">;
   shares: Pick<Shares, "resolve" | "byId">;
   store: { audit: ShareAudit };
@@ -86,7 +90,7 @@ export interface ViewerOptions {
   session?: RuntimeActiveSession | null; folders?: WritableDestination[];
 }
 export interface ViewerDescriptor {
-  title: string; lang?: string; currentVersion?: number; publicUrl: string; gated: boolean; mode?: string;
+  title: string; lang?: string; currentVersion?: number; publicUrl: string; documentOrigin: string; gated: boolean; mode?: string;
   loadUrl: string; gateUrl?: string; runtime: RuntimeSource; signedIn: boolean; csrf?: string;
   permissions: ViewerPermissions; folders: WritableDestination[]; actionBase?: string;
   artifactRef?: string; versions?: ArtifactVersion[]; protected: boolean;
@@ -115,9 +119,17 @@ export interface IssueRuntimeInput { artifact: Artifact; share?: VisitorShare | 
 export interface ArtifactRuntime {
   issue(request: Request, ctx: RuntimeReadContext, input: IssueRuntimeInput): Effect.Effect<IssuedRuntime, CodeError>;
   authorize(request: Request, ctx: RuntimeReadContext, token: unknown): Effect.Effect<AuthorizedRuntime, CodeError>;
+  presentation(version: ArtifactVersion, lang?: string): Effect.Effect<PagePresentation | null, CodeError>;
   handle(request: Request, ctx: RuntimeContext, params: { action?: string }): Effect.Effect<Response, CodeError>;
   /** Binary project file transfers (ADR 0035): part uploads and downloads under `/_runtime/files/`. */
   files(request: Request, ctx: RuntimeContext, params: { rest?: string }): Effect.Effect<Response, CodeError>;
+}
+export interface PagePresentation {
+  type: "page";
+  theme: { scope: "platform" | "project"; slug: string } | null;
+  brandLock: boolean;
+  lang: string;
+  compiledTheme?: CompiledTheme;
 }
 interface RuntimeRequestBody extends DuplicateValues {
   source?: RuntimeSource; grant?: unknown; csrf?: unknown; reason?: unknown;
@@ -172,6 +184,7 @@ export function viewerDescriptor(request: Request, ctx: ViewerContext, { artifac
     return {
       title: artifact ? yield* ctx.artifacts.title(artifact) : "Shared folder",
       ...(artifact ? { lang: artifact.lang, currentVersion: artifact.currentVersion } : {}),
+      documentOrigin: ctx.publicOrigin,
       publicUrl, gated, mode, loadUrl: "/_runtime/load",
       ...(gated ? { gateUrl: `/_gate${publicUrl}` } : {}), runtime: source,
       signedIn: Boolean(active), csrf: active?.session.csrf, permissions, folders: destinations,
@@ -240,6 +253,20 @@ export function openArtifactRuntime({ db, masterKeyHex, now = Date.now }: { db: 
     if (!artifact || artifact.deletedAt || !ctx.artifacts.live(artifact)) return yield* Effect.fail(fail("forbidden", "Artefact access has ended."));
     // Owner suspension does not withdraw live visitor shares; reader suspension ends direct access.
     return { artifact, share, active };
+  });
+  const presentation = (version: ArtifactVersion, lang = "en"): Effect.Effect<PagePresentation | null, CodeError> => Effect.gen(function* () {
+    if (version.type !== "page") return null;
+    const theme = version.themeScope && version.themeSlug ? { scope: version.themeScope, slug: version.themeSlug } : null;
+    const base = theme?.scope === "platform"
+      ? getPlatformTheme(theme.slug) ?? getPlatformTheme("report")
+      : theme === null ? getPlatformTheme("report") : null;
+    if (!base) return { type: "page", theme, brandLock: version.brandLock, lang };
+    let compiledTheme: CompiledTheme | undefined;
+    if (version.themeOverridesSealed) {
+      const sealed = yield* scalarUnseal<{ v: unknown }>(masterKeyHex, version.themeOverridesSealed);
+      compiledTheme = yield* Effect.try({ try: () => compileThemeOverrides(base, sealed?.v), catch: error => fail("invalid-theme-overrides", error instanceof Error ? error.message : "Stored page theme overrides are invalid.") });
+    }
+    return { type: "page", theme, brandLock: version.brandLock, lang, ...(compiledTheme ? { compiledTheme } : {}) };
   });
   const revision = (artifact: Artifact, share: VisitorShare | null | undefined, source: RuntimeSource) => Effect.gen(function* () {
     if (source.kind === "public") return yield* sha256hex(JSON.stringify(artifact.wrapPassword ?? null));
@@ -330,9 +357,10 @@ export function openArtifactRuntime({ db, masterKeyHex, now = Date.now }: { db: 
         field: input.field, name: input.name, type: input.type, size: input.size, lastModified: input.lastModified });
       return { upload: { ...upload, partPath: `/_runtime/files/uploads/${upload.id}/parts/` }, resumed };
     }
-    if (op !== "list" && op !== "get" && op !== "create" && op !== "update" && op !== "delete" && op !== "submit" && op !== "mine") {
+    if (op !== "schema" && op !== "list" && op !== "get" && op !== "create" && op !== "update" && op !== "delete" && op !== "submit" && op !== "mine") {
       return yield* Effect.fail(Object.assign(fail("validation", "Unknown data operation."), { issues: [{ field: "op", message: "Unknown data operation." }] }));
     }
+    if (op === "schema") return { name: collection.name, kind: collection.kind, fields: collection.fields, visitors: collection.visitors };
     if ((collection.kind === "responses") !== (op === "submit" || op === "mine")) {
       return yield* Effect.fail(fail("wrong-kind", collection.kind === "responses"
         ? "Responses are submitted with submit and read back with mine."
@@ -388,7 +416,9 @@ export function openArtifactRuntime({ db, masterKeyHex, now = Date.now }: { db: 
         const resolved = yield* resolve(request, ctx, source);
         if ((source.kind === "public" && ctx.artifacts.gated(resolved.artifact)) || resolved.share?.gated) return yield* Effect.fail(fail("password-required", "Enter the password to open this artefact."));
         const issued = yield* issue(request, ctx, { ...resolved, source });
-        return json({ html: yield* ctx.artifacts.document(resolved.artifact), runtime: issued.runtime, observation: issued.observation }, 200, issued.cookie ? { "Set-Cookie": issued.cookie } : {});
+        const content = yield* ctx.artifacts.readContent(resolved.artifact);
+        const page = yield* presentation(content.version, resolved.artifact.lang);
+        return json({ html: content.html, ...(page ? { page } : {}), runtime: issued.runtime, observation: issued.observation }, 200, issued.cookie ? { "Set-Cookie": issued.cookie } : {});
       }
       const authorized = yield* authorize(request, ctx, body.grant);
       const { artifact, active, actorKey, canWriteShared } = authorized;
@@ -449,5 +479,5 @@ export function openArtifactRuntime({ db, masterKeyHex, now = Date.now }: { db: 
       return fileResponse(found.file, found.body);   // Range is not supported: always the whole file
     }), runtimeError);
   });
-  return { issue, authorize, handle, files };
+  return { issue, authorize, presentation, handle, files };
 }

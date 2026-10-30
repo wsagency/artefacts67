@@ -40,7 +40,8 @@ An artefact is **one HTML document**, with its presentation and optional applica
 - \`lang\` is a **BCP-47 language tag**; the default is \`en\`. Client-facing artefacts are
   typically \`hr\` (house style, matching existing client artefacts — ADR 0009), while \`en\`
   marks internal and explained artefacts.
-- Total size **≤ 1,500,000 characters** (≈ 1.5 MiB).
+- Authored HTML source (complete document for \`site\`, fragment for \`page\`) ≤ 1,500,000 JavaScript
+  string characters. A composed page document is also capped at 1,500,000 characters.
 
 The platform adds its own isolated execution and observation support. Share observations are
 relayed through the trusted viewer to the same-origin \`/_ev\` endpoint; ordinary links and
@@ -143,7 +144,8 @@ can run at parse time or use normal \`DOMContentLoaded\` and \`load\` events.
 | \`not-utf8\` | The document is not valid UTF-8 (contains U+FFFD replacement characters). |
 | \`incomplete-document\` | Missing \`<!doctype html>\` or not a complete \`<html>\` document. |
 | \`external-reference\` | Unsupported external reference; supported font declarations are the only publish-time exception. |
-| \`too-large\` | Document exceeds 1,500,000 characters (≈ 1.5 MiB). |
+| \`too-large\` | Authored HTML source exceeds 1,500,000 characters (≈ 1.5 MiB); HTTP request-body overflow remains top-level \`too-large\` (413). |
+| \`composed-too-large\` | Page shell, kit, CSP, compiled theme and fragment together exceed 1,500,000 characters; returned as a \`validation\` detail issue on \`html\` (422). |
 | \`invalid-payload\` | The request body is not a JSON object. |
 | \`missing-html\` | \`html\` is absent, not a string, or empty (in rotate: an empty \`html\` string). |
 | \`invalid-html\` | Rotate only: \`html\` is present but not a string. |
@@ -240,9 +242,189 @@ unconditional publish behavior.
   \`artifact\` (the schema spelling); the metadata never includes content or a password.
 
 
-In M1, ordinary \`site\` publishes remain complete-document writes and are unchanged. M1 does
-not implement page types, themes or new viewer behavior. The optional \`ifVersion\` write guard
-does not add conditional tokens to console forms.
+Ordinary \`site\` publishes remain complete-document writes and are unchanged. M2 \`page\` artefacts
+are opt-in; existing and omitted \`type\` values remain \`site\`, with the established source bytes
+and analytics instrumentation.
+
+### Page artefacts
+
+Page artefacts use \`type: "page"\` in \`POST /_api/artifacts\`. Existing and omitted \`type\` values
+remain \`site\`.
+Page HTML is a fragment, not a complete document: it supplies body content, so do not include a
+doctype or document roots.
+
+The 1,500,000-character authored-source limit applies before composition. Publication also checks
+the complete hosted document produced from the page fragment against the same JavaScript string
+length limit, including the platform shell, runtime bridge, kit/runtime, CSP and every selectable
+M2 platform theme plus a compiled theme override. If composition would exceed the cap, publish
+returns HTTP 422 with top-level \`validation\` and a detail issue \`{ "code": "composed-too-large",
+"field": "html", "message": "…" }\`. The hosted viewer applies the same exact bridge-inclusive
+guard before creating its document; standalone downloads apply the cap to the bridge-free
+document. The HTTP JSON request-body cap remains 2 MiB and continues to answer top-level
+\`too-large\` with HTTP 413 (§4).
+Page grammar permits only these semantic HTML elements: \`body\`, \`header\`, \`footer\`, \`main\`, \`nav\`,
+\`section\`, \`article\`, \`aside\`, \`h1\`–\`h6\`, \`p\`, \`span\`, \`strong\`, \`em\`, \`b\`, \`i\`, \`small\`, \`mark\`,
+\`del\`, \`ins\`, \`sub\`, \`sup\`, \`br\`, \`hr\`, \`div\`, \`ul\`, \`ol\`, \`li\`, \`dl\`, \`dt\`, \`dd\`, \`figure\`,
+\`figcaption\`, \`img\`, \`blockquote\`, \`q\`, \`cite\`, \`time\`, \`abbr\`, \`code\`, \`pre\`, \`kbd\`, \`samp\`,
+\`var\`, \`table\`, \`caption\`, \`colgroup\`, \`col\`, \`thead\`, \`tbody\`, \`tfoot\`, \`tr\`, \`th\`, \`td\`, \`a\`,
+\`button\`, \`label\`, \`input\`, \`select\`, \`option\`, \`optgroup\`, \`fieldset\`, \`legend\`, \`details\`,
+\`summary\`, \`progress\`, \`output\`, and \`meter\`; static scriptless SVG elements: \`svg\`, \`g\`, \`path\`,
+\`circle\`, \`rect\`, \`line\`, \`polyline\`, \`polygon\`, \`ellipse\`, \`text\`, \`title\`, \`desc\`, \`defs\`, and
+\`marker\`. Its P1 kit components are \`a67-toc\`, \`a67-kpi\`, \`a67-chart\`, \`a67-tabs\`, \`a67-form\`,
+\`a67-checklist\`, \`a67-logo\`, and \`a67-records\`; \`a67-custom\` is deferred.
+Page attributes are allowlisted per element; these lists are exhaustive. Common attributes, only
+where meaningful: \`id\`, \`lang\`, \`dir\`, \`role\`, \`tabindex\`, \`title\`, \`hidden\`; \`open\` is only for
+\`details\`.
+
+| Element(s) | Allowed attributes |
+|---|---|
+| \`a\` | \`href\` only for same-document fragments |
+| \`img\` | Required \`src\` only as strict-base64 \`data:image/{png,jpeg,webp,gif,avif};base64,…\` with matching MIME/signature and decoded bytes ≤1 MiB; required \`alt\`; positive-integer intrinsic \`width\` and \`height\`; optional \`loading="lazy"\` and \`decoding="async"\` only |
+| \`button\` | \`type="button"\` only; \`disabled\`; a valid accessible label may use \`aria-label\`; cannot submit or navigate |
+| \`input\` | \`name\`, \`value\`, \`type\`, \`min\`, \`max\`, \`step\`, \`required\`, \`disabled\`, \`checked\`, \`placeholder\`, \`autocomplete\`, \`maxlength\`, \`minlength\`, \`pattern\`, \`accept\`; only where valid for generated/native controls |
+| \`select\`, \`option\`, \`optgroup\` | \`name\`, \`value\`, \`required\`, \`disabled\`, \`selected\`, \`multiple\`, \`label\` where applicable |
+| \`label\` | \`for\` |
+| \`fieldset\`, \`legend\` | Common, ARIA, registered data/style attributes; supported native semantics only |
+| \`table\`, \`colgroup\`, \`col\` | \`span\` where valid |
+| \`th\`, \`td\` | \`scope\`, \`colspan\`, \`rowspan\`, \`headers\`; \`aria-sort\` only on sortable \`th\` |
+| \`a67-toc\` | \`label\` |
+| \`a67-kpi\` | \`label\`, \`value\`, \`delta\`, \`trend\`, \`data-style\`; record binding adds \`collection\`, \`field\`, \`aggregate\` |
+| \`a67-chart\` | \`id\`, \`for\`, \`type\`, \`title\`, \`label-column\`, \`value-column\` |
+| \`a67-tabs\` | No component attributes; child tab/panel uses the ARIA attributes below |
+| \`a67-form\` | \`collection\`, \`submit-label\`; direct field descriptors use \`data-field\`, \`label\` |
+| \`a67-checklist\` | \`storage-key\`, \`storage-scope\`; direct items use \`data-item\` |
+| \`a67-logo\` | \`label\` |
+| \`a67-records\` | \`id\`, \`collection\`, \`fields\`, \`sort\`, boolean \`editable\`, accessible \`label\` |
+| SVG root | \`viewBox\`, \`width\`, \`height\`, fixed \`xmlns\` only |
+| SVG shapes/text | \`d\`, \`fill\`, \`stroke\`, \`stroke-width\`, \`stroke-linecap\`, \`stroke-linejoin\`, \`cx\`, \`cy\`, \`r\`, \`x\`, \`y\`, \`x1\`, \`x2\`, \`y1\`, \`y2\`, \`points\`, \`font-size\`, \`text-anchor\`, \`marker-end\`, \`refX\`, \`refY\`, \`markerWidth\`, \`markerHeight\`, \`orient\` — \`fill\`/\`stroke\` values are only \`none\`, \`currentColor\`, or \`var(--a67-<registered colour token>)\`; literal colours are rejected. \`stop-color\` is not an allowed attribute. |
+
+Authoring excludes the \`class\` attribute, \`<script>\` and \`<style>\` elements, authored \`<form>\` and
+\`<textarea>\` elements, \`on*\` event attributes, and external resources. Fragment-only links stay
+within the document.
+
+\`textarea\` and authored \`form\` are not allowed; \`textarea\` may be generated for a schema field.
+Allowed ARIA names are \`aria-label\`, \`aria-labelledby\`, \`aria-describedby\`, \`aria-controls\`,
+\`aria-selected\`, \`aria-sort\`, \`aria-live\`, and \`aria-current\`; target role/element semantics and
+all ID references must be valid. \`aria-label\`/\`aria-labelledby\` require native naming semantics or
+an explicit role. Unknown attributes and unrecognized \`data-*\` names are rejected.
+
+The accepted \`data-*\` vocabulary is: \`data-variant\` = \`hero|band|split|feature|grid|full-bleed|timeline|steps\`;
+\`data-tone\` = \`accent|muted|inverse|info|ok|warn|crit\`; inverse may not be nested within another inverse region or applied on/inside \`table\`, \`thead\`, \`th\`, \`pre\`, or \`code\`; \`data-style\` = registered \`aurora|glow\`;
+\`data-severity\` = \`ok|warn|crit\`; \`data-trend\` = \`up|down\`; \`data-status\` = \`ok|info|warn|crit\`;
+\`data-role\` = \`eyebrow\`; \`data-layout\` = \`hero|hero-copy|hero-metrics|kpis\`; \`data-scroll\` = \`table\`;
+\`data-badge\` and \`data-finding\` are boolean-presence flags; \`data-item\` is a unique 1–64 ASCII
+letter/digit/\`_\`/\`-\` key; \`data-field\` must match the selected collection schema. \`data-kpi-value\`,
+\`data-kpi-label\`, \`data-kpi-delta\`, \`data-mark\`, and \`data-value\` are reserved for kit output.
+
+Inline \`style\` is the only object override. It accepts declarations of exactly one registered
+custom property per declaration, \`--a67-<token>: <value>\`, with a lowercase token name from these
+sets:
+
+| Token class | Exact names |
+|---|---|
+| Color | \`bg\`, \`surface\`, \`ink\`, \`muted\`, \`line\`, \`accent\`, \`accent-ink\`, \`on-accent\`, \`ok\`, \`warn\`, \`crit\`, \`focus\`, \`c1\`, \`c2\`, \`c3\`, \`c4\`, \`c5\`, \`c6\` |
+| Font stack | \`font-heading\`, \`font-body\`, \`font-mono\` |
+| Dimension | \`radius\`, \`space\`, \`section-gap\`, \`card-pad\` |
+| Density | \`density\` |
+| Heading weight | \`heading-weight\` |
+| Shadow | \`shadow\` |
+| Border | \`card-border\`, \`section-rule\` |
+| Table head color | \`table-head-bg\` |
+| Table stripe color | \`table-stripe\` |
+
+Every token value may instead be a whole-value \`var(--a67-name)\` reference to a different
+registered token in the same domain: color references among color, table-head, and table-stripe
+tokens; font-stack references among font tokens; or references within the dimension, density,
+heading-weight, shadow, or border class. A token cannot reference itself. References cannot be
+combined with any other value text. \`var\` is case-insensitive, the \`(\` immediately follows its
+name, whitespace inside the parentheses is optional, and the referenced token name is lowercase.
+In color components described below, \`var()\` may reference only one of the 18 Color tokens (not
+\`table-head-bg\` or \`table-stripe\`).
+
+The exact literal value grammars are:
+
+- Color tokens and \`table-head-bg\`: a case-insensitive hexadecimal \`#rgb\` or \`#rrggbb\`.
+- Font tokens: one of these four stacks, case-insensitively: \`system-ui, sans-serif\`;
+  \`ui-monospace, monospace\`; \`"manrope"\` or \`'manrope'\` followed by \`, sans-serif\`; or
+  \`"ibm plex mono"\` or \`'ibm plex mono'\` followed by \`, monospace\`. The quoted family names
+  are parsed and serialized by css-tree before \`checkStyle\` compares the value, so either quote
+  delimiter is accepted; family-name case is ignored. Whitespace around each comma is ignored
+  and internal whitespace is collapsed. CSS backslash escapes are rejected before parsing.
+- Density: a nonnegative decimal number with no sign or exponent, written as digits with an
+  optional decimal fraction or as \`.digits\`; its numeric value is inclusive from \`0.75\` to \`1.25\`.
+- Heading weight: any integer from \`100\` through \`900\`, inclusive.
+- Dimension tokens: \`0\` (unitless) or a nonnegative decimal number followed by exactly one of
+  \`px\`, \`rem\`, \`em\`, \`vw\`, \`vh\`, or \`%\`. A number is digits with an optional decimal fraction,
+  or \`.digits\`; signs and exponents are not accepted. The same dimension form is used in
+  \`calc(<dimension> + <dimension>)\`, \`calc(<dimension> - <dimension>)\`, and
+  \`clamp(<dimension>, <dimension>, <dimension>)\`; whitespace around the operators and commas
+  is optional, as is whitespace just inside function parentheses. Each function argument is one
+  dimension only; nested math, multiplication, division, and other units are not accepted.
+- Shadow: \`none\`, or three or four dimensions followed by a color. A shadow dimension is the
+  dimension form above; the color is case-insensitive \`#rgb\`, \`#rrggbb\`, or \`#rrggbbaa\`, or a
+  \`var()\` reference to one of the 18 Color tokens.
+- Border (\`card-border\`, \`section-rule\`): one dimension, one of \`solid\`, \`dashed\`, \`dotted\`,
+  \`double\`, and a color. The color is \`#rgb\` or \`#rrggbb\`, or a \`var()\` reference to one of the
+  18 Color tokens.
+- Table stripe: the same \`#rgb\`/\`#rrggbb\` or Color-token reference as a border, or
+  \`color-mix(in srgb, <color> <percentage>, <color>)\`. Its name and syntax are case-insensitive;
+  there is no whitespace before \`(\`, optional CSS whitespace is accepted just inside parentheses
+  and around commas, \`in srgb\` has one space, and at least one whitespace separates the first
+  color and percentage. Each \`<color>\` is a border color. The first color's percentage uses
+  \`(?:100(?:\\.0+)?|\\d{1,2}(?:\\.\\d+)?|\\.\\d+)%\` and has a numeric value from \`0\` through \`100\`
+  inclusive; the second color has no percentage.
+
+Only \`var()\` is allowed in color, font, density, heading-weight, shadow, border, and table-head
+values. Dimension values alone may use \`calc()\`, \`clamp()\`, and \`var()\`; table-stripe values alone
+may use \`color-mix()\` and \`var()\`. Function names are case-insensitive. The validator rejects
+every \`url()\` function, including \`data:\` URLs. It also rejects any non-\`--a67-*\` property,
+unknown token, selector, at-rule, \`!important\`, backslash escape, CSS parser \`Url\`, \`Atrule\`, or
+\`Raw\` node, and every function not permitted for that token class.
+
+The inline style must parse as a CSS declaration list. Declarations must use a registered
+\`--a67-<token>\` property and a nonempty value; braces and semicolons in a value are rejected.
+
+Source attributes must be double-quoted and unique; malformed nesting, implied repair/error
+recovery, raw-text/RCDATA elements, and invalid SVG namespaces are rejected. The validator rejects
+parse errors and any tree requiring implied nodes. Character references decode exactly once; accept
+valid named and decimal/hex references to Unicode scalar values, and reject malformed, null,
+surrogate, disallowed-control, or double-encoded URL/CSS payloads. Escape literal \`&\`, \`<\` in text,
+and quote delimiters in attributes. Comments may appear between nodes as \`<!-- text -->\`, but may
+not be unclosed, contain \`--\`, or hide source tokens.
+External SVG/resource references are rejected.
+
+Theme references use \`ThemeRef\`, an object with \`scope: "platform"\` and a \`slug\` matching
+\`^[a-z][a-z0-9-]{0,47}$\`; malformed \`ThemeRef\` shapes, non-platform scopes, and invalid slug
+syntax are rejected.
+Platform themes are \`report\`, \`editorial\`, and \`launch\`; they are currently registered and shown
+together at \`/themes\`. A syntactically valid platform slug that is not registered is retained in
+metadata; viewer rendering falls back to \`report\`. Optional \`themeOverrides\` can customize only
+supported \`tokens\` and \`recipes\` within the contract's size and value constraints; they do not
+admit arbitrary CSS or a project-scoped theme. The checked compiler validates contrast,
+composition and logo data before scoped CSS or a resolved logo token reaches the page runtime.
+
+The trusted inline page kit supplies registered semantic components and CSS tokens inside the
+opaque sandbox; authored source cannot load an external kit. The composed viewer and gallery Content
+Security Policy sets \`default-src 'none'\`; it allows inline, \`data:\`, and \`blob:\` scripts (including
+\`unsafe-eval\`), inline styles, \`data:\`/\`blob:\` images, fonts and media, and same-origin \`/assets/favicon.ico\`
+and \`/assets/ws-logo.svg\` images. \`connect-src 'none'\` blocks network connections; form actions,
+base URLs, objects, frames, and workers are denied. No arbitrary external resource origins are
+allowed. Copy HTML returns the authored source exactly, which is a fragment for \`page\` artefacts
+and a complete document for \`site\` artefacts. For a page
+with a registered theme, Download HTML wraps that fragment in a standalone document with the
+trusted kit, selected compiled theme, runtime, and CSP, including the platform shell,
+\`PAGE_KIT_CSS\`, and \`PAGE_KIT_RUNTIME\`. If a valid but unregistered theme slug is stored, viewer
+rendering falls back to \`report\`, while Download HTML returns the authored fragment because no
+compiled theme is available. Download HTML preserves authored complete-document source for \`site\`.
+Composed page downloads exclude the hosted SDK, live persistence, and application data; they
+therefore do not provide hosted persistence when opened standalone.
+
+The M2 WCAG 2.2 A/AA axe gate exercises shipped page experiences across the checked platform
+themes, light/dark schemes and desktop/mobile viewports. The automated gate reports violations
+and incomplete checks separately; it does not certify arbitrary author content or replace human
+assistive-technology review. \`/instructions\` and \`/llms.txt\` continue to recommend \`site\` as the
+default publication type; Decision 9(a) reserves changing that guidance for M4 after human AT
+sign-off.
 **Rotate** — \`POST /_api/artifacts/rotate\`, body \`{ "artifact": "<slug-or-id>", "password":
 <omitted> | null | "≥ 8 characters", "html": "<optional new document>", "ifVersion": 5 }\`. An ordinary path is
 globally unique, so rotate addresses the artefact directly — there is no \`folder\` field.
@@ -489,13 +671,13 @@ const shared = await storage.get("calculator/defaults", { scope: "shared" });
 - Anonymous personal entries expire after 365 days without a successful read or write.
   Registered-user personal entries and shared entries do not expire. Anonymous identity belongs
   to that browser's cookie; clearing cookies or signing in selects a different personal namespace.
-- Runtime grants expire after one hour and are bound to the current reader/session.
-  Reopen the viewer after expiry or an access change; a grant is not a replacement for a password.
-- Runtime operations are limited to 180 requests per minute per reader/artefact. Anonymous
-  requests also share IP-derived limits of 180 requests and 30 new grants per minute, so changing
-  reader cookies does not reset the window. Reports are limited to 10 per hour per IP-derived key.
-  Counters use purpose-specific keyed hashes rather than saving IP addresses and expire after
-  their windows.
+- Runtime grants expire after one hour and are bound to the current reader/session. Reopen the viewer
+  after expiry or an access change; a grant is not a replacement for a password.
+- Runtime operations, including collection-schema reads, are limited to 180 requests per minute per
+  reader/artefact. Anonymous requests also share IP-derived limits of 180 requests and 30 new grants
+  per minute, so changing reader cookies does not reset the window. Reports are limited to 10 per
+  hour per IP-derived key. Counters use purpose-specific keyed hashes rather than saving IP
+  addresses and expire after their windows.
 
 ### Portability
 
@@ -684,6 +866,7 @@ limits and audit are identical. A tool result is
 | Method | Result |
 |---|---|
 | \`list(collection, { limit, cursor } = {})\` | \`records\`: promise of \`{ records, cursor }\` |
+| \`schema(collection)\` | \`window.artefacts.data.schema(collection)\`: \`records\` or submit-authorized \`responses\`; promise of \`{ name, kind, fields, visitors }\`, the public collection definition without record or submitter data |
 | \`get(collection, id)\` | \`records\`: promise of the record, or \`null\` |
 | \`create(collection, data, { onProgress } = {})\` | \`records\`: promise of the new record (write authority) |
 | \`update(collection, id, data, { ifVersion, onProgress } = {})\` | \`records\`: promise of the updated record (write authority) |
@@ -693,6 +876,12 @@ limits and audit are identical. A tool result is
 | \`upload(collection, field, file, { onProgress, signal } = {})\` | promise of \`{ id, name, type, size }\` for a \`File\` (§8 Files) |
 | \`file(collection, recordId, fileId)\` | promise of a \`File\` typed with the declared type, for in-frame display |
 | \`download(collection, recordId, fileId)\` | resolves once the viewer started saving the file (always saved as \`application/octet-stream\`) |
+\`schema(collection)\` uses the same live runtime grant and project-read authority as other collection
+reads. For \`responses\`, a visitor share may read the definition only when \`visitors\` is true;
+the result contains only the public definition and field names/types/constraints (including
+\`required\`, \`options\`, \`multiple\`, \`min\`, \`max\`, \`integer\`, \`maxLength\`, \`maxBytes\`, and \`accept\`),
+never record values, submitter values, identities or other record data. An unfiled artefact gets
+\`no-project\`. Schema reads count toward the existing runtime request limit.
 
 A rejection is an \`Error\` with \`code\` and, for validation, \`issues\`. Codes: \`no-project\` (the
 artefact is unfiled), \`wrong-kind\` (\`list\`/\`get\`/\`create\`/\`update\`/\`delete\` on a \`responses\`

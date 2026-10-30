@@ -9,7 +9,7 @@ import { fileResponse, json, readJson } from "./http.js";
 import { normalizePath } from "./paths.js";
 import { validateArtefactHtml, validatePublishBody, validateRotateBody, type ValidationIssue } from "./validate.js";
 import type { Access } from "./access.js";
-import type { Artifact, Artifacts, AuthorType } from "./artifacts.js";
+import type { Artifact, Artifacts, AuthorType, ThemeReference } from "./artifacts.js";
 import type { Folder, Folders } from "./folders.js";
 import type { Key, KeyAuthentication, KeyResource, Keys } from "./keys.js";
 import type { RateLimiter } from "./ratelimit.js";
@@ -17,6 +17,11 @@ import type { Audit } from "./store.js";
 import type { ProjectData } from "./project-data.js";
 import type { ProjectFiles, UploadState, UploadView } from "./project-files.js";
 import { asCodeError, type CodeError } from "./types.js";
+import { validatePageFragment, type PageDocument } from "./page-validation.js";
+import { PLATFORM_THEMES, getPlatformTheme } from "../../frontend/src/platform-themes.js";
+import { compileThemeOverrides } from "../../frontend/src/theme-overrides.js";
+import { PAGE_DOCUMENT_MAX_LENGTH, worstPageDocumentLength } from "./page-size.js";
+import type { CompiledTheme } from "../../frontend/src/theme-compiler.js";
 
 export interface ApiContext {
   keys: Pick<Keys, "authenticate" | "hasScope" | "may" | "mint" | "list" | "rotate" | "revoke">;
@@ -37,7 +42,7 @@ interface ApiBody {
   folder?: unknown; folderName?: unknown; slug?: unknown; title?: unknown; lang?: unknown;
   html?: unknown; password?: unknown; note?: unknown; allow_weak_password?: unknown; ifVersion?: unknown;
   artifact?: unknown; paths?: unknown; scopes?: unknown; label?: unknown; id?: unknown;
-  can_read_content?: unknown;
+  can_read_content?: unknown; type?: unknown; theme?: unknown; themeOverrides?: unknown;
 }
 const isApiBody = (value: unknown): value is ApiBody => value !== null && typeof value === "object";
 const objectBody = (value: unknown): ApiBody => isApiBody(value) ? value : {};
@@ -227,9 +232,18 @@ function publish(request: Request, ctx: ApiContext, who: KeyAuthentication) {
     }
     const note = typeof body.note === "string" ? body.note : null;
 
-    const doc = validateArtefactHtml(body.html, { checkReferences: false });
-    if (doc.errors.length) return envelope("validation", "Request rejected by validation.", doc.errors.map(issue => ({ ...issue, field: "html" })));
-    const warnings = doc.warnings.map(issue => ({ ...issue, field: "html" }));
+    const type: "site" | "page" = body.type === "page" ? "page" : "site";
+    let validatedPage: PageDocument | undefined;
+    let warnings: ValidationIssue[] = [];
+    if (type !== "page") {
+      const doc = validateArtefactHtml(body.html, { checkReferences: false });
+      if (doc.errors.length) return envelope("validation", "Request rejected by validation.", doc.errors.map(issue => ({ ...issue, field: "html" })));
+      warnings = doc.warnings.map(issue => ({ ...issue, field: "html" }));
+    }
+    let theme: ThemeReference | null = null;
+    if (typeof body.theme === "object" && body.theme !== null && "scope" in body.theme && "slug" in body.theme &&
+        body.theme.scope === "platform" && typeof body.theme.slug === "string")
+      theme = { scope: body.theme.scope, slug: body.theme.slug };
     const folder = yield* findFolder(ctx, who, body.folder);
     if ("error" in folder) return folder.error;
     const existing = yield* ctx.artifacts.bySlug(body.slug);
@@ -238,18 +252,48 @@ function publish(request: Request, ctx: ApiContext, who: KeyAuthentication) {
     if (existing && !(yield* may(ctx, who, { ownerId: existing.ownerId, folderId: existing.folderId, artifactId: existing.id }, "write"))) {
       return envelope("forbidden", "That artefact belongs to another user.");
     }
+    const lang = typeof body.lang === "string" ? body.lang : existing?.lang ?? "en";
+    if (type === "page") {
+      try { validatedPage = validatePageFragment(String(body.html), { lang }); }
+      catch (cause) {
+        const error = asCodeError(cause);
+        return envelope("validation", "Request rejected by validation.",
+          (error.issues ?? [{ code: error.code, message: error.message }]).map(issue => ({ ...issue, field: "html" })));
+      }
+    }
     // A conditional update cannot create a fresh artefact: there is no current version to match.
     if (ifVersion !== undefined && !existing) {
       return envelope("conflict", `Artefact has changed since version ${ifVersion}.`, { currentVersion: 0 });
     }
-    // Capture once before any write; the source-bound preparation capability is reused by
-    // create/upsert and verified by the model, never fetched a second time.
+    if (type === "page") {
+      const baseTheme = getPlatformTheme(theme?.scope === "platform" ? theme.slug : "report") ?? getPlatformTheme("report");
+      let compiledOverride: CompiledTheme | undefined;
+      if (body.themeOverrides != null) {
+        try { compiledOverride = compileThemeOverrides(baseTheme!, body.themeOverrides); }
+        catch (cause) {
+          return envelope("validation", "Request rejected by validation.", [{
+            code: "invalid-theme-overrides",
+            field: "themeOverrides",
+            message: cause instanceof Error ? cause.message : "Page theme overrides are invalid.",
+          }]);
+        }
+      }
+      if (worstPageDocumentLength(body.html as string, PLATFORM_THEMES, ctx.publicOrigin, lang, compiledOverride) > PAGE_DOCUMENT_MAX_LENGTH) {
+        return envelope("validation", "Request rejected by validation.", [{
+          code: "composed-too-large",
+          field: "html",
+          message: "The composed page document exceeds the 1,500,000-character limit.",
+        }]);
+      }
+    }
     const gated = body.password != null && body.password !== "" ? true : Boolean(existing && ctx.artifacts.gated(existing));
-    const prepared = yield* ctx.artifacts.prepare(body.html, { gated });
+    let prepared: object | null = null;
+    if (type === "site") prepared = yield* ctx.artifacts.prepare(body.html, { gated });
     const destination = folder.value ?? (yield* createFolder(ctx, who, body.folder, body.folderName));
     if (existing) {
       yield* ctx.artifacts.publish({ artifactId: existing.id, html: body.html, note, ...authorOf(who),
-        title: body.title, lang: body.lang, password: body.password ?? undefined, prepared, ifVersion });
+        title: body.title, lang: body.lang, password: body.password ?? undefined, prepared, ifVersion,
+        type, theme, themeOverrides: body.themeOverrides, validatedPage });
       const updated = yield* ctx.artifacts.byId(existing.id);
       if (!updated) return yield* Effect.fail(new Error("The published artefact could not be read."));
       yield* audit(ctx, who, "artifact.publish", updated.id, writeDetail({ version: updated.currentVersion }, weakUsed));
@@ -257,7 +301,7 @@ function publish(request: Request, ctx: ApiContext, who: KeyAuthentication) {
     }
     const created = yield* ctx.artifacts.create({ ownerId: destination.ownerId, folderId: destination.id,
       slug: body.slug, title: body.title, lang: body.lang ?? "en", html: body.html, password: body.password ?? null,
-      note, prepared, ...authorOf(who) });
+      note, prepared, type, theme, themeOverrides: body.themeOverrides, validatedPage, ...authorOf(who) });
     yield* audit(ctx, who, "artifact.create", created.id, writeDetail({ version: created.currentVersion }, weakUsed));
     return json({ artifact: yield* view(ctx, created, destination), warnings }, 201);
   });

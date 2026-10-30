@@ -78,14 +78,16 @@ test("the console's reserved names can never be artefact paths", async () => {
   const { RESERVED_SEGMENTS, pathTaken } = await import("../src/paths.js");
   const { openD1Shim } = await import("./db.js");
   const db = openD1Shim();
+  assert.ok(RESERVED_SEGMENTS.has("themes"));
   for (const segment of RESERVED_SEGMENTS) {
     assert.equal(await Effect.runPromise(pathTaken(db, segment)), true, `${segment} must be reserved`);
   }
   assert.equal(await Effect.runPromise(pathTaken(db, "quarterly-report")), false);
   // The names that ARE routed must never fall through to the viewer.
-  for (const path of ["/app", "/admin", "/settings", "/login", "/logout", "/register", "/enroll", "/2fa", "/instructions"]) {
+  for (const path of ["/app", "/admin", "/settings", "/login", "/logout", "/register", "/enroll", "/2fa", "/instructions", "/themes"]) {
     assert.notEqual(route("GET", path)?.handler, "viewer", `${path} must not reach the viewer`);
   }
+  assert.equal(route("GET", "/themes")?.handler, "themes");
 });
 
 test("viewer routes a friendly slug, with or without a trailing slash", () => {
